@@ -166,6 +166,11 @@ struct Cli {
     /// Router fee on output in bps (defaults to 10 bps)
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..))]
     router_fee: u16,
+
+    /// Disable on-chain swap execution via Tenderly (simulation only, no execution validation).
+    /// Useful for diagnosing stream latency without Tenderly congestion.
+    #[arg(long, default_value_t = false)]
+    disable_execution: bool,
 }
 
 impl Debug for Cli {
@@ -868,6 +873,10 @@ async fn process_update(
 
     if block_execution_info.is_empty() {
         warn!("No simulations were gathered for block {}", block.number());
+        return Ok(());
+    }
+
+    if cli.disable_execution {
         return Ok(());
     }
 
