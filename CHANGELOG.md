@@ -1,3 +1,11 @@
+## [0.296.1](https://github.com/propeller-heads/tycho-indexer/compare/0.296.0...0.296.1) (2026-05-18)
+
+
+### Bug Fixes
+
+* **integration-test:** Handle router fee when computing slippage ([e410366](https://github.com/propeller-heads/tycho-indexer/commit/e4103665ca49e0175c3fbae72cca34b8b04b73c2))
+* **integration-test:** Handle router fee when computing slippage ([#1023](https://github.com/propeller-heads/tycho-indexer/issues/1023)) ([0fb1b2a](https://github.com/propeller-heads/tycho-indexer/commit/0fb1b2ab5bfb433aae13ec488d462723c9320996))
+
 ## [0.296.0](https://github.com/propeller-heads/tycho-indexer/compare/0.295.0...0.296.0) (2026-05-18)
 
 
