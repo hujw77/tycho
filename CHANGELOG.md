@@ -1,3 +1,13 @@
+## [0.296.3](https://github.com/propeller-heads/tycho-indexer/compare/0.296.2...0.296.3) (2026-05-18)
+
+
+### Bug Fixes
+
+* **client:** initialization failure didn't name the failing extractor ([c68f592](https://github.com/propeller-heads/tycho-indexer/commit/c68f592b92a99ddaa0630014e9d97444ae7fc95c))
+* **integration-test:** ws retry cooldown exceeded state-sync cooldown ([fe01c0f](https://github.com/propeller-heads/tycho-indexer/commit/fe01c0f9e41d12084ad91da2e78b12054eb1fffc))
+* preserve UnknownExtractor through paginated fetch + ws retry cooldown ([#1025](https://github.com/propeller-heads/tycho-indexer/issues/1025)) ([9406bb7](https://github.com/propeller-heads/tycho-indexer/commit/9406bb7db935763bde8ae62aa08d7a2ea5f0e1d9))
+* **rpc:** unknown extractor swallowed by Fatal during paginated fetch ([9b5c600](https://github.com/propeller-heads/tycho-indexer/commit/9b5c6002a915dc18dfc8df17ce659fbf5cc790d2))
+
 ## [0.296.2](https://github.com/propeller-heads/tycho-indexer/compare/0.296.1...0.296.2) (2026-05-18)
 
 
