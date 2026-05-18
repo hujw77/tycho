@@ -893,8 +893,7 @@ pub trait RPCClient: Send + Sync {
 
                 let first_page = self
                     .get_protocol_components(base_params)
-                    .await
-                    .map_err(|err| RPCError::Fatal(err.to_string()))?;
+                    .await?;
 
                 let total_items = first_page.total();
                 let total_pages = (total_items as f64 / chunk_size as f64).ceil() as i64;
