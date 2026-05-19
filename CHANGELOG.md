@@ -1,3 +1,19 @@
+## [0.297.0](https://github.com/propeller-heads/tycho-indexer/compare/0.296.4...0.297.0) (2026-05-19)
+
+
+### Features
+
+* **simulation:** add is_partial flag to Update and propagate through decoder ([a22e6f1](https://github.com/propeller-heads/tycho-indexer/commit/a22e6f12f797473a30f2838597ab319904ebe19f))
+* **simulation:** add partial blocks flag to Update ([#1021](https://github.com/propeller-heads/tycho-indexer/issues/1021)) ([ad86e76](https://github.com/propeller-heads/tycho-indexer/commit/ad86e76699e0119f9141dbb513da26657aff76d9))
+
+
+### Bug Fixes
+
+* **gas-estimation:** Make estimate_gas_usage public ([aff6ac6](https://github.com/propeller-heads/tycho-indexer/commit/aff6ac66ba66b06b7ec058e6d4cef5009f5c96ce))
+* **gas-estimation:** Make estimate_gas_usage public ([#1028](https://github.com/propeller-heads/tycho-indexer/issues/1028)) ([cb6fe43](https://github.com/propeller-heads/tycho-indexer/commit/cb6fe439fcbd88f03c5048bc6ec9ce8778b73cce))
+* **integration-test:** add --disable-execution flag to skip Tenderly swap execution ([24cd3ea](https://github.com/propeller-heads/tycho-indexer/commit/24cd3ea89cd64c911fb3aa2d184699a0746ad505))
+* **integration-test:** use chain-specific TVL defaults ([c2f8012](https://github.com/propeller-heads/tycho-indexer/commit/c2f8012d71b01e60015e3cacb04f35533c5720ce))
+
 ## [0.296.4](https://github.com/propeller-heads/tycho-indexer/compare/0.296.3...0.296.4) (2026-05-19)
 
 
