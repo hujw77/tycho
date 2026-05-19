@@ -242,8 +242,16 @@ impl SwapEncoder for UniswapV4SwapEncoder {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct UniswapV4UserData {
+    /// When true, the V4 executor skips `poolManager.unlock()` and
+    /// assumes the caller has already unlocked the PM (used by
+    /// external-settler flows that take a PM loan around the swap).
+    /// Defaults to `false`; producers can omit the field entirely
+    /// and the field is skipped from the serialized JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) skip_unlock: bool,
+    /// Bytes forwarded as `hookData` to the V4 pool's hook on this
+    /// swap. Ignored for Angstrom hooks, where the attestation bytes
+    /// are fetched separately.
     #[serde(default)]
     pub(super) hook_data: Bytes,
 }
