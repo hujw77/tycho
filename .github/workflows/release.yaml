@@ -115,7 +115,7 @@ jobs:
       # Wave 3: crates that depend on wave 1+2
       - name: Publish tycho-storage
         run: >
-          cargo publish -p tycho-storage --locked
+          cargo publish -p tycho-storage --locked --dry-run
           --token ${{ secrets.CRATESIO_REGISTRY_TOKEN }}
 
       - name: Publish tycho-simulation
@@ -143,5 +143,5 @@ jobs:
       # Wave 5: metacrate
       - name: Publish tycho (metacrate)
         run: >
-          cargo publish -p tycho --locked
+          cargo publish -p tycho --locked --dry-run
           --token ${{ secrets.CRATESIO_REGISTRY_TOKEN }}
