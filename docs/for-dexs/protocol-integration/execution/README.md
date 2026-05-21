@@ -202,10 +202,11 @@ TychoRouter calls executors via `delegatecall`, so executor code runs within Tyc
 **Executors run with TychoRouter's full privileges.** A bug or malicious executor can steal all router assets.
 {% endhint %}
 
-* **Never call `ERC20.transfer`, `ERC20.transferFrom`, or `Permit2.transferFrom` directly.** Communicate transfer intent through `getTransferData` and `getCallbackTransferData` instead — TychoRouter performs the actual transfers with its own safeguards.
+* **Never call `ERC20.transfer`, `ERC20.transferFrom`, or `Permit2.transferFrom` directly.** Communicate transfer intent through `getTransferData` and `getCallbackTransferData` instead — TychoRouter performs the actual transfers with its own safeguards. The only exception is for native ETH transfers: this transfers must be handled inside the Executor and have a `transferType` of `TransferNativeInExecutor`.
+* **Never do ERC20 token approvals**. These are all handled by the TychoRouter.
 * **Never assign to a state variable** or perform any operation that writes to TychoRouter's storage.
 * **Do not execute `delegatecall`.** If a protocol makes it unavoidable, ensure the caller cannot control the `delegatecall` target — attacker-controlled targets enable arbitrary code execution within TychoRouter's context.
-* **Verify callback origin.** Call `verifyCallback` within `handleCallback` to confirm `msg.sender` is a valid pool from the expected protocol.
+* **Avoid trusting data sent via callback.** If necessary, call `verifyCallback` within `handleCallback` to confirm `msg.sender` is a valid pool from the expected protocol.
 * **`handleCallback`'s `data` argument** contains raw ABI-encoded calldata that the executor must decode manually.
 * **`handleCallback`'s return value** must be raw ABI-encoded return data that the executor encodes manually.
 

@@ -222,7 +222,7 @@ EIP712Domain(string name, string version, uint256 chainId, address verifyingCont
 with `name = "TychoRouter"`, `version = "1"`, and `verifyingContract` set to the TychoRouter contract address.
 
 {% hint style="warning" %}
-**Replay attack risk.** The signature contains no nonce. Once a signed `ClientFeeParams` appears on-chain, anyone who sees it can reuse it for the same swap parameters until `deadline` expires. If `maxClientContribution > 0`, the swap's `receiver` can repeatedly replay the transaction — each replay debits the client's vault balance by up to `maxClientContribution` — until the balance is exhausted or the deadline passes.
+**Replay attack risk.** The signature contains no nonce. Once a signed `ClientFeeParams` appears on-chain, anyone who sees it can reuse it for the same swap and input parameters until `deadline` expires. If `maxClientContribution > 0`, the swap's `receiver` can repeatedly replay the transaction — each replay debits the client's vault balance by up to `maxClientContribution` — until the balance is exhausted or the deadline passes.
 
 To minimise exposure:
 * Set `deadline` as close to the current block timestamp as practical (e.g., a few minutes ahead).

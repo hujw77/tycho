@@ -672,8 +672,7 @@ fn create_solution(
 
     // For native ETH we use TransferFrom (payable singleSwap);
     // for ERC20s we use Permit2.
-    let is_native = sell_token.address == *ROUTER_ETH_ADDRESS
-        || sell_token.address.is_zero();
+    let is_native = sell_token.address == *ROUTER_ETH_ADDRESS || sell_token.address.is_zero();
     let transfer_type = if is_native {
         UserTransferType::TransferFrom
     } else {
@@ -718,18 +717,12 @@ fn encode_tycho_router_call(
     let checked_token = convert_to_router_token(Address::from_slice(solution.token_out()));
     let receiver = Address::from_slice(solution.receiver());
 
-    let is_native_in = solution.token_in() == &native_address
-        || *solution.token_in() == *ROUTER_ETH_ADDRESS;
+    let is_native_in =
+        solution.token_in() == &native_address || *solution.token_in() == *ROUTER_ETH_ADDRESS;
 
     // ClientFeeParams: (clientFeeBps, clientFeeReceiver, maxClientContribution,
     // deadline, clientSignature). Pass zeros for no-fee swaps.
-    let client_fee_params = (
-        0u16,
-        Address::ZERO,
-        U256::ZERO,
-        U256::ZERO,
-        Vec::<u8>::new(),
-    );
+    let client_fee_params = (0u16, Address::ZERO, U256::ZERO, U256::ZERO, Vec::<u8>::new());
 
     let method_calldata = if is_native_in {
         // singleSwap (payable, no permit2)
@@ -771,11 +764,7 @@ fn encode_tycho_router_call(
     };
 
     let contract_interaction = encode_input(encoded_solution.function_signature(), method_calldata);
-    let value = if is_native_in {
-        solution.amount_in().clone()
-    } else {
-        BigUint::ZERO
-    };
+    let value = if is_native_in { solution.amount_in().clone() } else { BigUint::ZERO };
     Ok(Transaction {
         to: encoded_solution
             .interacting_with()
