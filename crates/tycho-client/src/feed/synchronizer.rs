@@ -702,7 +702,7 @@ where
                             }
 
                             // Drain any background snapshot tasks that have completed.
-                            let background_snapshots = self.drain_pending_snapshots();
+                            let background_snapshots = self.drain_completed_snapshots();
 
                             // Trim buffered_deltas: discard blocks no longer needed by any pending task.
                             if self.pending_snapshots.is_empty() {
@@ -981,7 +981,7 @@ where
 
     /// Drains any background snapshot tasks that have completed. Returns a `Snapshot` containing
     /// all ready results, with buffered deltas applied to bring each snapshot up to date.
-    fn drain_pending_snapshots(&mut self) -> Snapshot {
+    fn drain_completed_snapshots(&mut self) -> Snapshot {
         let mut result = Snapshot::default();
         let pending = std::mem::take(&mut self.pending_snapshots);
 
@@ -1004,24 +1004,10 @@ where
                     self.component_tracker
                         .components
                         .extend(fetch_result.components);
-                    // Mirror start_tracking → update_contracts: walk pre-existing
-                    // self.entrypoints for any entrypoints already linked to these components
-                    // and add their contracts. Without this, a component that shares an
-                    // entrypoint with an already-tracked component would miss those contracts
-                    // until the next DCI update.
-                    self.component_tracker.contracts.extend(
-                        self.component_tracker
-                            .get_contracts_by_component(&new_component_ids),
-                    );
-                    // Also add DCI contracts from this fetch that aren't in self.entrypoints yet.
-                    self.component_tracker.contracts.extend(
-                        fetch_result
-                            .contract_ids
-                            .iter()
-                            .cloned(),
-                    );
                     self.component_tracker
                         .process_entrypoints(&fetch_result.dci_update);
+                    self.component_tracker
+                        .update_contracts(new_component_ids);
                     let mut snapshot = fetch_result.snapshot;
                     self.apply_deltas_to_snapshot(
                         &mut snapshot,
@@ -2218,7 +2204,7 @@ mod test {
                 ..Default::default()
             },
             // Block 3: empty block; the background task for Component3 should have completed,
-            // so drain_pending_snapshots returns the Component3 snapshot.
+            // so drain_completed_snapshots returns the Component3 snapshot.
             BlockAggregatedChanges {
                 extractor: "uniswap-v2".to_string(),
                 chain: Chain::Ethereum,
