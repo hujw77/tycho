@@ -1,3 +1,13 @@
+## [0.297.2](https://github.com/propeller-heads/tycho-indexer/compare/0.297.1...0.297.2) (2026-05-21)
+
+
+### Bug Fixes
+
+* handle codeless Creation deltas and missing contract_code in snapshots ([#1032](https://github.com/propeller-heads/tycho-indexer/issues/1032)) ([adce46b](https://github.com/propeller-heads/tycho-indexer/commit/adce46b88081ce42b0d57f69250a8a854aa662ca))
+* **indexer:** set code=Some for Creation deltas with empty bytecode ([a4fafcd](https://github.com/propeller-heads/tycho-indexer/commit/a4fafcd72706d0a6757dd13de59019cc0d29a36d))
+* **simulation:** keep change=Creation when patching codeless Creation deltas ([bdd2bef](https://github.com/propeller-heads/tycho-indexer/commit/bdd2bef58313634517aac7b63da4433b92cc9fff))
+* **storage:** skip accounts missing contract_code in snapshot instead of erroring ([a3b65f7](https://github.com/propeller-heads/tycho-indexer/commit/a3b65f74fd34dea4fcb4bf28facabaf281b8a115))
+
 ## [0.297.1](https://github.com/propeller-heads/tycho-indexer/compare/0.297.0...0.297.1) (2026-05-21)
 
 
