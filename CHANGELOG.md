@@ -1,3 +1,11 @@
+## [0.300.1](https://github.com/propeller-heads/tycho-indexer/compare/0.300.0...0.300.1) (2026-05-21)
+
+
+### Bug Fixes
+
+* Don't push to crates tycho-storage and tycho ([22da463](https://github.com/propeller-heads/tycho-indexer/commit/22da46339e8655ead4f847b05e36a656a8580961))
+* Don't push to crates tycho-storage and tycho ([#1038](https://github.com/propeller-heads/tycho-indexer/issues/1038)) ([7fc4407](https://github.com/propeller-heads/tycho-indexer/commit/7fc440738575bcde06929dd44a9523cdbeea12b5))
+
 ## [0.300.0](https://github.com/propeller-heads/tycho-indexer/compare/0.299.0...0.300.0) (2026-05-21)
 
 
