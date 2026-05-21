@@ -211,6 +211,22 @@ impl ProtocolStreamProcessor {
                     // "vm:curve".to_string(), // Temporarily disabled due to indexing issues
                 ]
             }
+            Chain::Polygon => {
+                vec![
+                    "uniswap_v2".to_string(),
+                    "uniswap_v3".to_string(),
+                    "uniswap_v4".to_string(),
+                    "quickswap_v2".to_string(),
+                ]
+            }
+            Chain::Arbitrum => {
+                vec![
+                    "uniswap_v2".to_string(),
+                    "uniswap_v3".to_string(),
+                    "uniswap_v4".to_string(),
+                    "pancakeswap_v3".to_string(),
+                ]
+            }
             _ => vec![],
         }
     }
@@ -322,6 +338,10 @@ impl ProtocolStreamProcessor {
                     tvl_filter.clone(),
                     None,
                 );
+            }
+            "quickswap_v2" => {
+                stream =
+                    stream.exchange::<UniswapV2State>("quickswap_v2", tvl_filter.clone(), None);
             }
             _ => {
                 return Err(miette::miette!("Unknown protocol: {}", protocol));
