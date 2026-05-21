@@ -1,3 +1,12 @@
+## [0.297.1](https://github.com/propeller-heads/tycho-indexer/compare/0.297.0...0.297.1) (2026-05-21)
+
+
+### Bug Fixes
+
+* **gas-estimation:** Add logic for PROTOCOLS_OPTIMIZABLE_TRANSFER_IN ([d99d891](https://github.com/propeller-heads/tycho-indexer/commit/d99d891c9d8423c1e6664f6341eb2519713cb9fe))
+* **gas-estimation:** Add logic for PROTOCOLS_OPTIMIZABLE_TRANSFER_IN ([#1033](https://github.com/propeller-heads/tycho-indexer/issues/1033)) ([0554c73](https://github.com/propeller-heads/tycho-indexer/commit/0554c73f384dc5151ba47539f26aba46b120ff75))
+* **gas-estimations:** Fix gas calculation for split swaps ([700450c](https://github.com/propeller-heads/tycho-indexer/commit/700450c395eaad61539c9fdbca87f9c133d359a5))
+
 ## [0.297.0](https://github.com/propeller-heads/tycho-indexer/compare/0.296.4...0.297.0) (2026-05-19)
 
 
