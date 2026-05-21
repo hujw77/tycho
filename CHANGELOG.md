@@ -1,3 +1,11 @@
+## [0.300.0](https://github.com/propeller-heads/tycho-indexer/compare/0.299.0...0.300.0) (2026-05-21)
+
+
+### Features
+
+* Remove dry-run from release.yaml and push to crates! ([5014973](https://github.com/propeller-heads/tycho-indexer/commit/5014973d3d2e192ea0d5fa5902ebf2632d0892c1))
+* Remove dry-run from release.yaml and push to crates! ([#1037](https://github.com/propeller-heads/tycho-indexer/issues/1037)) ([5636f18](https://github.com/propeller-heads/tycho-indexer/commit/5636f18cb2dbf35e70fc69da0c600a05dda457e7))
+
 ## [0.299.0](https://github.com/propeller-heads/tycho-indexer/compare/0.298.0...0.299.0) (2026-05-21)
 
 
