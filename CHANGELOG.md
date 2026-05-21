@@ -1,3 +1,11 @@
+## [0.300.2](https://github.com/propeller-heads/tycho-indexer/compare/0.300.1...0.300.2) (2026-05-21)
+
+
+### Bug Fixes
+
+* Add missing readmes to simulation and execution ([92fa022](https://github.com/propeller-heads/tycho-indexer/commit/92fa02250a92601d5f5e94d9ea1af25797c8cd63))
+* Add missing readmes to simulation and execution ([#1039](https://github.com/propeller-heads/tycho-indexer/issues/1039)) ([6d7748c](https://github.com/propeller-heads/tycho-indexer/commit/6d7748c6e3be69427c00097ef8b3c9343e5f927a))
+
 ## [0.300.1](https://github.com/propeller-heads/tycho-indexer/compare/0.300.0...0.300.1) (2026-05-21)
 
 
