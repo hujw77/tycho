@@ -188,7 +188,7 @@ let token_in = native_to_router_eth(bytes_to_address(&swap.token_in().address)?)
 
 #### Executor `swap`: translate `ETH_ADDRESS` → protocol address
 
-If your protocol uses `address(0)` (e.g., UniswapV4, Ekubo) or another sentinel for native ETH in its pool keys or function calls, translate `ETH_ADDRESS` back to the protocol's expected address inside `swap()` (or `_decodeData()` / `_locked()`), right before interacting with the protocol.
+If your protocol uses `address(0)` (e.g., UniswapV4, Ekubo) or another sentinel for native ETH in its pool keys or function calls, translate `ETH_ADDRESS` back to the protocol's expected address inside `swap()`, right before interacting with the protocol.
 
 ## Fee Tokens
 
