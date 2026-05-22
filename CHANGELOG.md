@@ -1,3 +1,11 @@
+## [0.300.4](https://github.com/propeller-heads/tycho-indexer/compare/0.300.3...0.300.4) (2026-05-22)
+
+
+### Bug Fixes
+
+* **simulation:** add 0x276084 to Fluid V1 paused pools filter ([77cae93](https://github.com/propeller-heads/tycho-indexer/commit/77cae93d89a941ac7886173b126fe1ebc8f5bc55))
+* **simulation:** add 0x276084 to Fluid V1 paused pools filter ([#1042](https://github.com/propeller-heads/tycho-indexer/issues/1042)) ([f7b1bf5](https://github.com/propeller-heads/tycho-indexer/commit/f7b1bf55c5143f4c4dafffad4ef632d79f67958d))
+
 ## [0.300.3](https://github.com/propeller-heads/tycho-indexer/compare/0.300.2...0.300.3) (2026-05-22)
 
 
