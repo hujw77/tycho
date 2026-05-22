@@ -158,7 +158,7 @@ pub fn balancer_v3_pool_filter(component: &ComponentWithState) -> bool {
 }
 
 pub fn fluid_v1_paused_pools_filter(component: &ComponentWithState) -> bool {
-    const PAUSED_POOLS: [&str; 4] = [
+    const PAUSED_POOLS: [&str; 5] = [
         // The components below are properly paused by substreams but the way indexer
         // handles tracing atm wrongly paused all components due to tracing failure. The
         // failure is unrelated to any issues with the protocol itself.
@@ -168,6 +168,7 @@ pub fn fluid_v1_paused_pools_filter(component: &ComponentWithState) -> bool {
         // The substreams did not detect this component as paused. It still reports
         // a high tvl value.
         "0x2886a01a0645390872a9eb99dae1283664b0c524",
+        "0x276084527b801e00db8e4410504f9baf93f72c67",
     ];
 
     if PAUSED_POOLS.contains(
