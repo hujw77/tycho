@@ -10010,7 +10010,6 @@ dependencies = [
  "tycho-common",
  "tycho-ethereum",
  "tycho-execution",
- "tycho-test",
  "typetag",
  "unicode-width 0.1.14",
  "uuid",
