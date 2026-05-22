@@ -1,3 +1,11 @@
+## [0.300.5](https://github.com/propeller-heads/tycho-indexer/compare/0.300.4...0.300.5) (2026-05-22)
+
+
+### Bug Fixes
+
+* remove unused tycho-test dev dependency from simulation ([496a3e5](https://github.com/propeller-heads/tycho-indexer/commit/496a3e5a93e81656a4dd2da1fffc7fe713cda92f))
+* remove unused tycho-test dev dependency from simulation ([#1043](https://github.com/propeller-heads/tycho-indexer/issues/1043)) ([5c44fd4](https://github.com/propeller-heads/tycho-indexer/commit/5c44fd4db7b84f1e27743e6423cd103584af900e))
+
 ## [0.300.4](https://github.com/propeller-heads/tycho-indexer/compare/0.300.3...0.300.4) (2026-05-22)
 
 
