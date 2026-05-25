@@ -445,6 +445,13 @@ impl<S: SlotDetectionStrategy> SlotDetector<S> {
         for (token, result) in token_slots {
             match result {
                 Ok((mut all_slots, original_value)) => {
+                    // Only keep slots stored at the token's own address.
+                    // ERC-20 balances/allowances are always at the token address
+                    // (even for proxy contracts using delegatecall). This filters
+                    // out noise from chain-specific precompiles (e.g. Arbitrum
+                    // ArbOS at 0xa4b05fff...) and other contracts in the trace.
+                    all_slots.retain(|((storage_addr, _), _)| *storage_addr == token);
+
                     if all_slots.is_empty() {
                         detected_results.insert(token, Err(SlotDetectorError::TokenNotInTrace));
                     } else {
@@ -1040,16 +1047,18 @@ mod tests {
         let detector = TestFixture::create_slot_detector_without_rpc();
 
         let token = Address::from([0x11u8; 20]);
-        let precompile_addr = Address::from([0xAAu8; 20]);
         let slot_a = Bytes::from(vec![0x01u8; 32]);
         let slot_b = Bytes::from(vec![0x02u8; 32]);
 
+        // Both slots are at the token address (the upfront filter in
+        // detect_correct_slots guarantees this). A transport error on
+        // slot_a (e.g. network failure) should retry with slot_b.
         let slots_to_test = vec![SlotMetadata {
             token: token.clone(),
             original_value: U256::ZERO,
             test_value: U256::from(1_000_000_000_000_000_000u64),
             all_slots: vec![
-                ((precompile_addr.clone(), slot_a.clone()), U256::ZERO),
+                ((token.clone(), slot_a.clone()), U256::ZERO),
                 ((token.clone(), slot_b.clone()), U256::ZERO),
             ],
         }];
@@ -1057,7 +1066,7 @@ mod tests {
         let responses: Vec<TransportResult<Value>> = vec![Err(
             alloy::transports::RpcError::LocalUsageError(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "overriding address not allowed",
+                "transport error",
             ))),
         )];
 
