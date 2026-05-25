@@ -1063,12 +1063,11 @@ mod tests {
             ],
         }];
 
-        let responses: Vec<TransportResult<Value>> = vec![Err(
-            alloy::transports::RpcError::LocalUsageError(Box::new(std::io::Error::new(
+        let responses: Vec<TransportResult<Value>> =
+            vec![Err(alloy::transports::RpcError::LocalUsageError(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "transport error",
-            ))),
-        )];
+            ))))];
 
         let mut results = HashMap::new();
         let retry_data =
@@ -1094,12 +1093,11 @@ mod tests {
             all_slots: vec![((token.clone(), slot_a.clone()), U256::ZERO)],
         }];
 
-        let responses: Vec<TransportResult<Value>> = vec![Err(
-            alloy::transports::RpcError::LocalUsageError(Box::new(std::io::Error::new(
+        let responses: Vec<TransportResult<Value>> =
+            vec![Err(alloy::transports::RpcError::LocalUsageError(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "overriding address not allowed",
-            ))),
-        )];
+            ))))];
 
         let mut results = HashMap::new();
         let retry_data =

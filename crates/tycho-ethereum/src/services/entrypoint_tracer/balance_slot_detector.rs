@@ -89,8 +89,8 @@ mod tests {
 
     use super::{BalanceStrategy, SlotDetectionStrategy, *};
     use crate::test_fixtures::{
-        TestFixture, ARB_USDC_HOLDER_ADDR, ARB_USDC_STR, ARB_WETH_STR, STETH_STR,
-        USDC_HOLDER_ADDR, USDC_STR, USDT_STR, WETH_STR,
+        TestFixture, ARB_USDC_HOLDER_ADDR, ARB_USDC_STR, ARB_WETH_STR, STETH_STR, USDC_HOLDER_ADDR,
+        USDC_STR, USDT_STR, WETH_STR,
     };
 
     const BLOCK_HASH: &str = "0x658814e4cb074359f10dd71237cc57b1ae6791fc9de59fde570e724bd884cbb0";
