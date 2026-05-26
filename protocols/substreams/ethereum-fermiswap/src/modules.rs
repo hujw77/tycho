@@ -1,215 +1,121 @@
 use crate::{
-    abi::fermi::{events as fermi_events, functions as fermi_functions},
-    pool_factories::{
-        create_component, pair_id, pair_store_key, token_store_key, vault_balance_key,
-        DeploymentConfig, PairState, ACTIVE_ATTRIBUTE, VAULT_COMPONENT_ID,
-    },
+    abi::fermi::events::{PairActiveSet, PairRegistered, PairUnregistered},
+    pb::fermiswap::v1::Pair,
+    utils::{component_id, Config, ACTIVE_ATTRIBUTE},
 };
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use ethabi::ethereum_types::Address;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use substreams::{
     pb::substreams::StoreDeltas,
     prelude::*,
     store::{
-        Appender, StoreAddBigInt, StoreAppend, StoreGet, StoreGetBigInt, StoreGetInt64,
-        StoreGetString, StoreNew, StoreSet, StoreSetIfNotExists, StoreSetIfNotExistsInt64,
-        StoreSetString,
+        Appender, StoreAddBigInt, StoreAppend, StoreGet, StoreGetInt64, StoreGetString, StoreNew,
+        StoreSetIfNotExists, StoreSetIfNotExistsInt64,
     },
 };
-use substreams_ethereum::{pb::eth, Event};
+use substreams_ethereum::{
+    pb::eth::{
+        self,
+        v2::{Block, Log, TransactionTrace},
+    },
+    Event,
+};
+use substreams_helper::event_handler::EventHandler;
 use tycho_substreams::{
     abi::erc20, balances::aggregate_balances_changes, contract::extract_contract_changes_builder,
     prelude::*,
 };
 
-const END_ORDINAL: u64 = i64::MAX as u64;
-
 #[substreams::handlers::map]
-fn map_pair_changes(params: String, block: eth::v2::Block) -> Result<BlockChanges> {
-    let config: DeploymentConfig = serde_qs::from_str(params.as_str())?;
-    let mut transaction_changes: HashMap<_, TransactionChangesBuilder> = HashMap::new();
+fn map_protocol_components(params: String, block: Block) -> Result<BlockEntityChanges> {
+    let config: Config = serde_qs::from_str(params.as_str())?;
+    let mut new_pair_changes: Vec<TransactionEntityChanges> = vec![];
+    get_new_pairs(&config, &block, &mut new_pair_changes);
+    Ok(BlockEntityChanges { block: Some((&block).into()), changes: new_pair_changes })
+}
 
-    if block.number == config.start_block {
-        if let Some(tx) = initialization_transaction(&block, &config) {
-            if let Some(pairs) = (fermi_functions::GetPairs {}).call(config.engine_address.clone())
-            {
-                for (base_asset, quote_asset, active) in pairs {
-                    add_pair_change(
-                        &mut transaction_changes,
-                        &tx,
-                        PairState::new(base_asset, quote_asset, active),
-                        &config,
-                        ChangeType::Creation,
-                    );
-                }
-            }
-        }
-    }
+fn get_new_pairs(
+    config: &Config,
+    block: &Block,
+    new_pair_changes: &mut Vec<TransactionEntityChanges>,
+) {
+    let mut on_pair_registered = |event: PairRegistered, _tx: &TransactionTrace, _log: &Log| {
+        let tycho_tx: Transaction = _tx.into();
+        let component_id = component_id(&event.base_asset, &event.quote_asset);
+        let new_component = ProtocolComponent::new(component_id.as_str())
+            .with_tokens(&[event.base_asset.as_slice(), event.quote_asset.as_slice()])
+            .with_contracts(&[config.engine_address.as_slice(), config.trader_vault.as_slice()])
+            .as_swap_type("fermiswap_pool", ImplementationType::Vm);
 
-    if block.number > config.start_block {
-        for eth_tx in block.transactions() {
-            let tx: Transaction = eth_tx.into();
-            for log in eth_tx
-                .calls
-                .iter()
-                .filter(|call| !call.state_reverted)
-                .flat_map(|call| &call.logs)
-                .filter(|log| log.address == config.engine_address)
-            {
-                if let Some(event) = fermi_events::PairRegistered::match_and_decode(log) {
-                    add_pair_change(
-                        &mut transaction_changes,
-                        &tx,
-                        PairState::new(event.base_asset, event.quote_asset, true),
-                        &config,
-                        ChangeType::Creation,
-                    );
-                } else if let Some(event) = fermi_events::PairUnregistered::match_and_decode(log) {
-                    add_pair_change(
-                        &mut transaction_changes,
-                        &tx,
-                        PairState::new(event.base_asset, event.quote_asset, false),
-                        &config,
-                        ChangeType::Update,
-                    );
-                } else if let Some(event) = fermi_events::PairActiveSet::match_and_decode(log) {
-                    add_pair_change(
-                        &mut transaction_changes,
-                        &tx,
-                        PairState::new(event.base_asset, event.quote_asset, event.active),
-                        &config,
-                        ChangeType::Update,
-                    );
-                }
-            }
-        }
-    }
+        new_pair_changes.push(TransactionEntityChanges {
+            tx: Some(tycho_tx.clone()),
+            entity_changes: vec![EntityChanges {
+                component_id: component_id.clone(),
+                attributes: vec![Attribute {
+                    name: ACTIVE_ATTRIBUTE.to_string(),
+                    value: vec![{ 0u8 }], // default false at creation
+                    change: ChangeType::Creation.into(),
+                }],
+            }],
+            component_changes: vec![new_component],
+            balance_changes: vec![],
+        });
+    };
 
-    Ok(BlockChanges {
-        block: Some((&block).into()),
-        changes: transaction_changes
-            .drain()
-            .sorted_unstable_by_key(|(index, _)| *index)
-            .filter_map(|(_, builder)| builder.build())
-            .collect(),
-        storage_changes: vec![],
-    })
+    let mut eh = EventHandler::new(block);
+
+    eh.filter_by_address(vec![Address::from_slice(&config.engine_address)]);
+
+    eh.on::<PairRegistered, _>(&mut on_pair_registered);
+    eh.handle_events();
 }
 
 #[substreams::handlers::store]
-fn store_pairs(pair_changes: BlockChanges, store: StoreSetString) {
+fn store_pairs(pair_changes: BlockEntityChanges, store: StoreSetIfNotExistsProto<Pair>) {
     for tx_changes in pair_changes.changes {
-        let active_by_id = active_by_component_id(&tx_changes.entity_changes);
         for component in tx_changes.component_changes {
-            if component.tokens.len() < 2 {
-                continue;
-            }
-
-            let active = active_by_id
-                .get(&component.id)
-                .copied()
-                .unwrap_or(true);
-            let pair =
-                PairState::new(component.tokens[0].clone(), component.tokens[1].clone(), active);
-            store.set(
-                tx_changes
-                    .tx
-                    .as_ref()
-                    .map(|tx| tx.index)
-                    .unwrap_or_default(),
-                pair_store_key(&component.id),
-                &pair.encode(),
-            );
+            let pair = Pair {
+                base_asset: component.tokens[0].clone(),
+                quote_asset: component.tokens[1].clone(),
+            };
+            store.set_if_not_exists(0, &component.id, &pair);
         }
     }
 }
 
-#[substreams::handlers::map]
-fn map_protocol_components(
-    pair_changes: BlockChanges,
-    pair_store_deltas: StoreDeltas,
-) -> Result<BlockTransactionProtocolComponents> {
-    let created_pairs = pair_store_deltas
-        .deltas
-        .into_iter()
-        .filter(|delta| delta.old_value.is_empty())
-        .filter_map(|delta| {
-            delta
-                .key
-                .strip_prefix("pair:")
-                .map(str::to_string)
-        })
-        .collect::<HashSet<_>>();
-
-    Ok(BlockTransactionProtocolComponents {
-        tx_components: pair_changes
-            .changes
-            .into_iter()
-            .filter_map(|tx_changes| {
-                let components = tx_changes
-                    .component_changes
-                    .into_iter()
-                    .filter(|component| created_pairs.contains(&component.id))
-                    .collect::<Vec<_>>();
-
-                if components.is_empty() {
-                    None
-                } else {
-                    Some(TransactionProtocolComponents { tx: tx_changes.tx, components })
-                }
-            })
-            .collect(),
-    })
-}
-
 #[substreams::handlers::store]
-fn store_protocol_tokens(
-    map_protocol_components: BlockTransactionProtocolComponents,
-    store: StoreSetIfNotExistsInt64,
-) {
-    for tx_pc in map_protocol_components.tx_components {
-        let ordinal = tx_pc
-            .tx
-            .as_ref()
-            .map(|tx| tx.index)
-            .unwrap_or_default();
-        for component in tx_pc.components {
+fn store_pair_tokens(pair_changes: BlockEntityChanges, store: StoreSetIfNotExistsInt64) {
+    for tx_changes in pair_changes.changes {
+        for component in tx_changes.component_changes {
             for token in component.tokens {
-                store.set_if_not_exists(ordinal, token_store_key(&token), &1);
+                store.set_if_not_exists(0, hex::encode(&token), &1);
             }
         }
     }
 }
 
 #[substreams::handlers::store]
-fn store_token_pairs(
-    map_protocol_components: BlockTransactionProtocolComponents,
-    store: StoreAppend<String>,
-) {
-    for tx_pc in map_protocol_components.tx_components {
-        let ordinal = tx_pc
-            .tx
-            .as_ref()
-            .map(|tx| tx.index)
-            .unwrap_or_default();
-        for component in tx_pc.components {
+fn store_token_pairs(pair_changes: BlockEntityChanges, store: StoreAppend<String>) {
+    for tx_changes in pair_changes.changes {
+        for component in tx_changes.component_changes {
             for token in component.tokens {
-                store.append(ordinal, token_store_key(&token), component.id.clone());
+                store.append(0, hex::encode(&token), component.id.clone());
             }
         }
     }
 }
 
 #[substreams::handlers::map]
-fn map_vault_balance_deltas(
+fn map_balance_deltas(
     params: String,
-    block: eth::v2::Block,
-    new_components: BlockTransactionProtocolComponents,
+    block: Block,
     token_deltas: StoreDeltas,
     protocol_tokens: StoreGetInt64,
+    token_pairs_store: StoreGetString,
 ) -> Result<BlockBalanceDeltas> {
-    let config: DeploymentConfig = serde_qs::from_str(params.as_str())?;
+    let config: Config = serde_qs::from_str(params.as_str())?;
     let mut balance_deltas = Vec::new();
     let new_token_keys = token_deltas
         .deltas
@@ -217,24 +123,48 @@ fn map_vault_balance_deltas(
         .filter(|delta| delta.old_value.is_empty())
         .map(|delta| delta.key)
         .collect::<HashSet<_>>();
+    let last_tx = block
+        .transaction_traces
+        .last()
+        .map(Transaction::from);
 
+    // Vault balances are shared across pairs, so fan out each token delta to every indexed
+    // component.
+    let mut fanout_balance_delta_to_components =
+        |ord: u64, tx: &Transaction, token: &[u8], delta: &[u8]| {
+            let Some(component_ids) = token_pairs_store.get_last(hex::encode(token)) else {
+                return;
+            };
+
+            for component_id in component_ids
+                .split(';')
+                .filter(|component_id| !component_id.is_empty())
+                .unique()
+            {
+                balance_deltas.push(BalanceDelta {
+                    ord,
+                    tx: Some(tx.clone()),
+                    token: token.to_vec(),
+                    delta: delta.to_vec(),
+                    component_id: component_id.as_bytes().to_vec(),
+                });
+            }
+        };
+
+    // Snapshot newly tracked token balances with balanceOf and attach the deltas to the block's
+    // last transaction.
     for token_key in &new_token_keys {
         let token = hex::decode(token_key)?;
-        let Some(tx) = tx_for_token(&new_components, &token) else {
+        let Some(tx) = &last_tx else {
             continue;
         };
         let balance = erc20::functions::BalanceOf { owner: config.trader_vault.clone() }
             .call(token.clone())
-            .unwrap_or_else(BigInt::zero);
-        balance_deltas.push(BalanceDelta {
-            ord: tx.index,
-            tx: Some(tx),
-            token,
-            delta: balance.to_signed_bytes_be(),
-            component_id: VAULT_COMPONENT_ID.as_bytes().to_vec(),
-        });
+            .unwrap_or_default();
+        fanout_balance_delta_to_components(tx.index, tx, &token, &balance.to_signed_bytes_be());
     }
 
+    // token balance deltas for protocol tokens
     for tx in block.transactions() {
         for log in tx
             .calls
@@ -245,32 +175,27 @@ fn map_vault_balance_deltas(
             let Some(transfer) = erc20::events::Transfer::match_and_decode(log) else {
                 continue;
             };
-            let token_key = token_store_key(&log.address);
-            if new_token_keys.contains(&token_key) {
-                continue;
-            }
-            if !protocol_tokens.has_last(&token_key) {
+            let token_key = hex::encode(&log.address);
+
+            // Skip newly snapshotted tokens and transfers for untracked protocol tokens.
+            if new_token_keys.contains(&token_key) || !protocol_tokens.has_last(&token_key) {
                 continue;
             }
 
-            let mut delta = BigInt::zero();
-            if transfer.from == config.trader_vault {
-                delta = delta - transfer.value.clone();
-            }
-            if transfer.to == config.trader_vault {
-                delta = delta + transfer.value;
-            }
-            if delta.is_zero() {
-                continue;
-            }
+            let delta =
+                match (transfer.from == config.trader_vault, transfer.to == config.trader_vault) {
+                    (true, false) => BigInt::zero() - transfer.value,
+                    (false, true) => transfer.value,
+                    _ => continue,
+                };
 
-            balance_deltas.push(BalanceDelta {
-                ord: log.ordinal,
-                tx: Some(tx.into()),
-                token: log.address.clone(),
-                delta: delta.to_signed_bytes_be(),
-                component_id: VAULT_COMPONENT_ID.as_bytes().to_vec(),
-            });
+            let tx: Transaction = tx.into();
+            fanout_balance_delta_to_components(
+                log.ordinal,
+                &tx,
+                &log.address,
+                &delta.to_signed_bytes_be(),
+            );
         }
     }
 
@@ -279,7 +204,7 @@ fn map_vault_balance_deltas(
 }
 
 #[substreams::handlers::store]
-pub fn store_vault_token_balances(deltas: BlockBalanceDeltas, store: StoreAddBigInt) {
+pub fn store_balances(deltas: BlockBalanceDeltas, store: StoreAddBigInt) {
     tycho_substreams::balances::store_balance_changes(deltas, store);
 }
 
@@ -287,60 +212,77 @@ pub fn store_vault_token_balances(deltas: BlockBalanceDeltas, store: StoreAddBig
 fn map_protocol_changes(
     params: String,
     block: eth::v2::Block,
-    pair_changes: BlockChanges,
-    new_components: BlockTransactionProtocolComponents,
+    pair_changes: BlockEntityChanges,
+    pair_store: StoreGetProto<Pair>,
     vault_balance_deltas: BlockBalanceDeltas,
-    vault_balance_store: StoreGetBigInt,
     vault_balance_store_deltas: StoreDeltas,
-    pairs_store: StoreGetString,
-    token_pairs_store: StoreGetString,
 ) -> Result<BlockChanges, substreams::errors::Error> {
-    let config: DeploymentConfig = serde_qs::from_str(params.as_str())?;
+    let config: Config = serde_qs::from_str(params.as_str())?;
     let mut transaction_changes: HashMap<_, TransactionChangesBuilder> = HashMap::new();
-    let mut new_component_ids = HashSet::new();
 
-    for tx_component in new_components.tx_components {
-        let tx = tx_component
-            .tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("component change without transaction"))?;
+    for tx_changes in pair_changes.changes {
+        let Some(tycho_tx) = tx_changes.tx else {
+            continue;
+        };
         let builder = transaction_changes
-            .entry(tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(tx));
-        for component in tx_component.components {
-            new_component_ids.insert(component.id.clone());
-            builder.add_protocol_component(&component);
+            .entry(tycho_tx.index)
+            .or_insert_with(|| TransactionChangesBuilder::new(&tycho_tx));
+
+        for component in &tx_changes.component_changes {
+            builder.add_protocol_component(component);
+        }
+
+        for entity_change in &tx_changes.entity_changes {
+            builder.add_entity_change(entity_change);
         }
     }
 
-    for tx_changes in pair_changes.changes {
-        let tx = tx_changes
-            .tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("pair change without transaction"))?;
+    for trx in block.transactions() {
+        let tx = Transaction {
+            to: trx.to.clone(),
+            from: trx.from.clone(),
+            hash: trx.hash.clone(),
+            index: trx.index.into(),
+        };
         let builder = transaction_changes
             .entry(tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(tx));
-        let active_by_id = active_by_component_id(&tx_changes.entity_changes);
+            .or_insert_with(|| TransactionChangesBuilder::new(&tx));
 
-        for entity_change in &tx_changes.entity_changes {
-            let mut entity_change = entity_change.clone();
-            if !new_component_ids.contains(&entity_change.component_id) {
-                for attribute in &mut entity_change.attributes {
-                    attribute.change = ChangeType::Update.into();
+        for (log, _) in trx.logs_with_calls() {
+            if log.address != config.engine_address {
+                continue;
+            }
+            if let Some(ev) = PairActiveSet::match_and_decode(log) {
+                let component_id = component_id(&ev.base_asset, &ev.quote_asset);
+                if pair_store
+                    .get_last(&component_id)
+                    .is_some()
+                {
+                    builder.add_entity_change(&EntityChanges {
+                        component_id,
+                        attributes: vec![Attribute {
+                            name: ACTIVE_ATTRIBUTE.to_string(),
+                            value: vec![if ev.active { 1u8 } else { 0u8 }],
+                            change: ChangeType::Creation.into(),
+                        }],
+                    });
+                }
+            } else if let Some(ev) = PairUnregistered::match_and_decode(log) {
+                let component_id = component_id(&ev.base_asset, &ev.quote_asset);
+                if pair_store
+                    .get_last(&component_id)
+                    .is_some()
+                {
+                    builder.add_entity_change(&EntityChanges {
+                        component_id,
+                        attributes: vec![Attribute {
+                            name: ACTIVE_ATTRIBUTE.to_string(),
+                            value: vec![{ 0u8 }],
+                            change: ChangeType::Creation.into(),
+                        }],
+                    });
                 }
             }
-            builder.add_entity_change(&entity_change);
-        }
-
-        for component in tx_changes.component_changes {
-            let Some(active) = active_by_id.get(&component.id).copied() else {
-                continue;
-            };
-            let Some(pair) = pair_from_component(&component, active) else {
-                continue;
-            };
-            add_pair_balance_snapshot(builder, &pair, &vault_balance_store);
         }
     }
 
@@ -362,13 +304,7 @@ fn map_protocol_changes(
                                 &balance_change.token,
                                 &balance_change.balance,
                             );
-                            add_component_balances_for_token(
-                                builder,
-                                &balance_change.token,
-                                &balance_change.balance,
-                                &pairs_store,
-                                &token_pairs_store,
-                            );
+                            builder.add_balance_change(balance_change);
                         });
                 });
 
@@ -381,26 +317,6 @@ fn map_protocol_changes(
         &mut transaction_changes,
     );
 
-    for tx in block.transactions() {
-        for call in tx
-            .calls
-            .iter()
-            .filter(|call| !call.state_reverted && call.address == config.engine_address)
-        {
-            let updated_pair_ids = updated_pair_ids_from_call(call);
-            if updated_pair_ids.is_empty() {
-                continue;
-            }
-            let tx: Transaction = tx.into();
-            let builder = transaction_changes
-                .entry(tx.index)
-                .or_insert_with(|| TransactionChangesBuilder::new(&tx));
-            for pair_id in updated_pair_ids {
-                builder.mark_component_as_updated(&pair_id);
-            }
-        }
-    }
-
     Ok(BlockChanges {
         block: Some((&block).into()),
         changes: transaction_changes
@@ -410,226 +326,4 @@ fn map_protocol_changes(
             .collect::<Vec<_>>(),
         storage_changes: vec![],
     })
-}
-
-fn initialization_transaction(
-    block: &eth::v2::Block,
-    config: &DeploymentConfig,
-) -> Option<Transaction> {
-    let configured_hash = config
-        .init_tx_hash
-        .as_ref()
-        .and_then(|hash| hex::decode(hash.trim_start_matches("0x")).ok());
-
-    if let Some(hash) = configured_hash {
-        return block
-            .transactions()
-            .find(|tx| tx.hash == hash)
-            .map(|tx| tx.into());
-    }
-
-    block
-        .transactions()
-        .next()
-        .map(|tx| tx.into())
-}
-
-fn add_pair_change(
-    transaction_changes: &mut HashMap<u64, TransactionChangesBuilder>,
-    tx: &Transaction,
-    pair: PairState,
-    config: &DeploymentConfig,
-    change: ChangeType,
-) {
-    let builder = transaction_changes
-        .entry(tx.index)
-        .or_insert_with(|| TransactionChangesBuilder::new(tx));
-    let mut component = create_component(&pair, config);
-    component.change = change.into();
-    builder.add_protocol_component(&component);
-    builder.add_entity_change(&EntityChanges {
-        component_id: component.id,
-        attributes: vec![Attribute {
-            name: ACTIVE_ATTRIBUTE.to_string(),
-            value: vec![if pair.active { 1u8 } else { 0u8 }],
-            change: change.into(),
-        }],
-    });
-}
-
-fn decode_register_pair(call: &eth::v2::Call) -> Option<PairState> {
-    if !fermi_functions::RegisterPair::match_call(call) {
-        return None;
-    }
-    fermi_functions::RegisterPair::decode(call)
-        .ok()
-        .map(|call| PairState::new(call.base_asset, call.quote_asset, true))
-}
-
-fn decode_unregister_pair(call: &eth::v2::Call) -> Option<PairState> {
-    if !fermi_functions::UnregisterPair::match_call(call) {
-        return None;
-    }
-    fermi_functions::UnregisterPair::decode(call)
-        .ok()
-        .map(|call| PairState::new(call.base_asset, call.quote_asset, false))
-}
-
-fn decode_set_pair_active(call: &eth::v2::Call) -> Option<PairState> {
-    if !fermi_functions::SetPairActive::match_call(call) {
-        return None;
-    }
-    fermi_functions::SetPairActive::decode(call)
-        .ok()
-        .map(|call| PairState::new(call.base_asset, call.quote_asset, call.active))
-}
-
-fn active_by_component_id(entity_changes: &[EntityChanges]) -> HashMap<String, bool> {
-    entity_changes
-        .iter()
-        .filter_map(|entity_change| {
-            entity_change
-                .attributes
-                .iter()
-                .find(|attribute| attribute.name == ACTIVE_ATTRIBUTE)
-                .and_then(|attribute| attribute.value.first())
-                .map(|value| (entity_change.component_id.clone(), *value != 0))
-        })
-        .collect()
-}
-
-fn pair_from_component(component: &ProtocolComponent, active: bool) -> Option<PairState> {
-    if component.tokens.len() < 2 {
-        return None;
-    }
-    Some(PairState::new(component.tokens[0].clone(), component.tokens[1].clone(), active))
-}
-
-fn tx_for_token(
-    new_components: &BlockTransactionProtocolComponents,
-    token: &[u8],
-) -> Option<Transaction> {
-    new_components
-        .tx_components
-        .iter()
-        .find_map(|tx_components| {
-            if tx_components
-                .components
-                .iter()
-                .any(|component| {
-                    component
-                        .tokens
-                        .iter()
-                        .any(|component_token| component_token == token)
-                })
-            {
-                tx_components.tx.clone()
-            } else {
-                None
-            }
-        })
-}
-
-fn add_pair_balance_snapshot(
-    builder: &mut TransactionChangesBuilder,
-    pair: &PairState,
-    vault_balance_store: &StoreGetBigInt,
-) {
-    if !pair.active {
-        add_component_balance(builder, &pair.id(), &pair.base_asset, BigInt::zero());
-        add_component_balance(builder, &pair.id(), &pair.quote_asset, BigInt::zero());
-        return;
-    }
-
-    for token in [&pair.base_asset, &pair.quote_asset] {
-        let balance = vault_balance_store
-            .get_at(END_ORDINAL, vault_balance_key(token))
-            .unwrap_or_else(BigInt::zero);
-        add_component_balance(builder, &pair.id(), token, balance);
-    }
-}
-
-fn add_component_balances_for_token(
-    builder: &mut TransactionChangesBuilder,
-    token: &[u8],
-    balance: &[u8],
-    pairs_store: &StoreGetString,
-    token_pairs_store: &StoreGetString,
-) {
-    let Some(pair_ids) = token_pairs_store.get_at(END_ORDINAL, token_store_key(token)) else {
-        return;
-    };
-
-    let mut seen = HashSet::new();
-    for pair_id in pair_ids
-        .split(';')
-        .filter(|pair_id| !pair_id.is_empty())
-    {
-        if !seen.insert(pair_id.to_string()) {
-            continue;
-        }
-        let Some(encoded_pair) = pairs_store.get_at(END_ORDINAL, pair_store_key(pair_id)) else {
-            continue;
-        };
-        let Some(pair) = PairState::decode(&encoded_pair) else {
-            continue;
-        };
-        if pair.active {
-            builder.add_balance_change(&BalanceChange {
-                token: token.to_vec(),
-                balance: balance.to_vec(),
-                component_id: pair_id.as_bytes().to_vec(),
-            });
-        }
-    }
-}
-
-fn add_component_balance(
-    builder: &mut TransactionChangesBuilder,
-    pair_id: &str,
-    token: &[u8],
-    balance: BigInt,
-) {
-    let balance = if balance < BigInt::zero() { BigInt::zero() } else { balance };
-    builder.add_balance_change(&BalanceChange {
-        token: token.to_vec(),
-        balance: balance.to_bytes_be().1,
-        component_id: pair_id.as_bytes().to_vec(),
-    });
-}
-
-fn updated_pair_ids_from_call(call: &eth::v2::Call) -> Vec<String> {
-    if let Some(pair) = decode_register_pair(call)
-        .or_else(|| decode_unregister_pair(call))
-        .or_else(|| decode_set_pair_active(call))
-    {
-        return vec![pair.id()];
-    }
-
-    if fermi_functions::SetPairParams::match_call(call) {
-        return fermi_functions::SetPairParams::decode(call)
-            .ok()
-            .map(|call| vec![pair_id(&call.base_asset, &call.quote_asset)])
-            .unwrap_or_default();
-    }
-
-    if fermi_functions::SetFairPriceE8::match_call(call) {
-        return fermi_functions::SetFairPriceE8::decode(call)
-            .ok()
-            .map(|call| vec![format!("0x{}", hex::encode(call.k))])
-            .unwrap_or_default();
-    }
-
-    if fermi_functions::SetFairPricesE8::match_call(call) {
-        return fermi_functions::SetFairPricesE8::decode(call)
-            .map(|call| {
-                call.u
-                    .into_iter()
-                    .map(|(key, _)| format!("0x{}", hex::encode(key)))
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-
-    Vec::new()
 }

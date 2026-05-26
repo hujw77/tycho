@@ -878,12 +878,14 @@ dependencies = [
  "itertools 0.10.5",
  "num-bigint",
  "proc-macro-crate",
+ "prost 0.11.9",
  "serde",
  "serde_qs 0.13.0",
  "substreams 0.5.22",
  "substreams-ethereum 0.9.13",
+ "substreams-helper 0.0.2",
  "tiny-keccak",
- "tycho-substreams 0.6.0",
+ "tycho-substreams 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
