@@ -1,3 +1,11 @@
+## [0.302.0](https://github.com/propeller-heads/tycho-indexer/compare/0.301.1...0.302.0) (2026-05-26)
+
+
+### Features
+
+* **encoding:** add client fee signature offset to EncodedSolution ([24e7a38](https://github.com/propeller-heads/tycho-indexer/commit/24e7a387cee281486518d49b6faa1fe4cbde7291))
+* **encoding:** add client fee signature offset to EncodedSolution ([#1046](https://github.com/propeller-heads/tycho-indexer/issues/1046)) ([89e2e47](https://github.com/propeller-heads/tycho-indexer/commit/89e2e470a01664a00fe41b0fba0f359b83c0e926))
+
 ## [0.301.1](https://github.com/propeller-heads/tycho-indexer/compare/0.301.0...0.301.1) (2026-05-26)
 
 
