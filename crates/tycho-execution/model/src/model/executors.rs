@@ -39,7 +39,7 @@ pub enum Executor {
     Slipstreams,
     UniswapV2,
     UniswapV3,
-    Weth,
+    Wrap,
     AerodromeV1,
     LiquidityParty,
 }
@@ -70,7 +70,7 @@ impl Executor {
         Executor::Slipstreams,
         Executor::UniswapV2,
         Executor::UniswapV3,
-        Executor::Weth,
+        Executor::Wrap,
         Executor::AerodromeV1,
         Executor::LiquidityParty,
     ];
@@ -244,7 +244,7 @@ impl Executor {
                 output_to_router: false,
             }),
             // https://github.com/propeller-heads/tycho-execution/blob/0454514f4f6ccff55dcaa8e3abbb4ac494d89eba/foundry/src/executors/WethExecutor.sol#L76
-            Self::Weth => {
+            Self::Wrap => {
                 let is_wrapping = params.request(
                     ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
                     [true, false],
@@ -498,7 +498,7 @@ impl Executor {
                 }
             }
             // https://github.com/propeller-heads/tycho-execution/blob/0454514f4f6ccff55dcaa8e3abbb4ac494d89eba/foundry/src/executors/WethExecutor.sol#L44
-            Self::Weth => {
+            Self::Wrap => {
                 let is_wrapping = params.request(
                     ParamKey::ProtocolData { swap_index, start: 0, end: 1 },
                     [true, false],
@@ -591,7 +591,7 @@ impl Executor {
                 // called via delegatecall. therefore not the router
                 receiver: state.msg_sender(),
             }),
-            Self::Weth => unimplemented!(),
+            Self::Wrap => unimplemented!(),
             Self::AerodromeV1 => unimplemented!(),
             Self::LiquidityParty => unimplemented!(),
         }
@@ -617,7 +617,7 @@ impl Executor {
             // https://github.com/propeller-heads/tycho-execution/blob/0454514f4f6ccff55dcaa8e3abbb4ac494d89eba/foundry/src/executors/UniswapV3Executor.sol#L60
             // not worth modeling as it has no reverts or side effects
             Self::UniswapV3 => Ok(()),
-            Self::Weth => unimplemented!("Weth doesn't use callbacks"),
+            Self::Wrap => unimplemented!("Wrap doesn't use callbacks"),
             Self::AerodromeV1 => unimplemented!("AerodromeV1 doesn't use callbacks"),
             Self::LiquidityParty => unimplemented!("LiquidityParty doesn't use callbacks"),
         }
@@ -661,7 +661,7 @@ impl Executor {
             // https://github.com/propeller-heads/tycho-execution/blob/0454514f4f6ccff55dcaa8e3abbb4ac494d89eba/foundry/src/executors/UniswapV3Executor.sol#L26
             Self::UniswapV3 => Address::Router,
             // https://github.com/propeller-heads/tycho-execution/blob/0454514f4f6ccff55dcaa8e3abbb4ac494d89eba/foundry/src/executors/WethExecutor.sol#L33
-            Self::Weth => Address::Router,
+            Self::Wrap => Address::Router,
             // https://github.com/propeller-heads/tycho-indexer/blob/0d9b01ddbe72c5518fdc79a423ffd19dc7226709/crates/tycho-execution/contracts/src/executors/AerodromeV1Executor.sol#L23
             Self::AerodromeV1 => params.request(
                 ParamKey::ProtocolData { swap_index, start: 0, end: 20 },
