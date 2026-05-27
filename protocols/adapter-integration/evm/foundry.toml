@@ -26,4 +26,3 @@ mainnet = { key = "${ETHERSCAN_MAINNET_KEY}" }
 [[profile.default.fs_permissions]]
 access = "read-write"
 path = "out"
-

@@ -1,61 +1,57 @@
-# Name of the substreams config file in your substreams module. Usually "./substreams.yaml"
 substreams_yaml_path: ./substreams.yaml
-# Name of the adapter contract, usually: ProtocolSwapAdapter"
-adapter_contract: "SwapAdapter"
-# Constructor signature of the Adapter contract"
+protocol_system: "vm:fermiswap"
+adapter_contract: "FermiSwapAdapter"
 adapter_build_signature: "constructor(address)"
-# A comma separated list of args to be passed to the contructor of the Adapter contract"
-adapter_build_args: "0x0000000000000000000000000000000000000000"
-# Whether the testing script should skip checking balances of the protocol components.
-# If set to `true` please always add a reason why it's skipped.
+adapter_build_args: "0xb1076fE3AB5e28005C7c323Bac5AC06a680d452e"
 skip_balance_check: false
-# A list of accounts that need to be indexed to run the tests properly.
-# Usually used when there is a global component required by all pools and created before the tested range of blocks. For example a factory or a vault.
-# Please note that this component needs to be indexed by your substreams module, this feature is only for testing purpose.
-# Also please always add a reason why this account is needed for your tests.
-# This will be applied to each test.
+
 initialized_accounts:
-  - "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84" # Needed for ....
-# A list of protocol types names created by your Substreams module.
+  - "0xb1076fE3AB5e28005C7c323Bac5AC06a680d452e" # FermiSwapper used by the adapter.
+  - "0x0bA5665583A4593A86cdC935ea2c8FF378c11317" # Current Fermi engine.
+  - "0x585d44727129B9C69791B10238Ca605932938B4F" # Shared trader vault.
+
 protocol_type_names:
-  - "type_name_1"
-  - "type_name_2"
-# The name of the protocol system
-protocol_system: "protocol_name"
-# A list of tests.
+  - "fermiswap_pool"
+
 tests:
-  # Name of the test
-  - name: test_pool_creation
-    # Indexed block range
-    start_block: 123
-    stop_block: 456
-    # Same as global `initialized_accounts` but only scoped to this test.
-    initialized_accounts:
-      - "0x0c0e5f2fF0ff18a3be9b835635039256dC4B4963" # Needed for ....
-    # A list of expected component indexed in the block range. Each component must match perfectly the `ProtocolComponent` indexed by your subtreams module.
+  - name: test_weth_usdt_pair_creation
+    start_block: 25139132
+    stop_block: 25143790
     expected_components:
-      - id: "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7"
+      - id: "0x7c85004568584fbf3665f41ebe85146ee0483587d65d9ea5a56c79816bb720d0"
         tokens:
-          - "0xdac17f958d2ee523a2206206994597c13d831ec7"
-          - "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-          - "0x6b175474e89094c44da98b954eedeac495271d0f"
-        static_attributes: { }
-        creation_tx: "0x20793bbf260912aae189d5d261ff003c9b9166da8191d8f9d63ff1c7722f3ac6"
-        # Whether the script should skip trying to simulate a swap on this component.
-        # If set to `true` please always add a reason why it's skipped.
+          - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" # WETH
+          - "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" # USDC
+        static_attributes: {}
+        creation_tx: "0x80209c915476d7233096f32c5c033b7d724de9377bde670ce74f7afc265b6244"
+        skip_simulation: true # Fair price for this pair is stale at this test's stop block.
+        skip_execution: true
+      - id: "0x2b2f5776e38002e0c013d0d89828fdb06fee595ea2d5ed4b194e3883e823e350"
+        tokens:
+          - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" # WETH
+          - "0xdAC17F958D2ee523a2206206994597C13D831ec7" # USDT
+        static_attributes: {}
+        creation_tx: "0x302c444da6c3793939bb10965cbfb9c8ecbcc42a3cd51dd4c52b6a3343c8aa60"
         skip_simulation: false
-        # Whether the script should skip trying to simulate execution of a swap on this component.
-        # If set to `true` please always add a reason why it's skipped.
-        skip_execution: false
-  - name: test_something_else
-    start_block: 123
-    stop_block: 456
+        skip_execution: true
+
+  - name: test_weth_usdc_pair_creation
+    start_block: 25139132
+    stop_block: 25143884
     expected_components:
-      - id: "0xdc24316b9ae028f1497c275eb9192a3ea0f67022"
+      - id: "0x7c85004568584fbf3665f41ebe85146ee0483587d65d9ea5a56c79816bb720d0"
         tokens:
-          - "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
-          - "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
-        static_attributes: { }
-        creation_tx: "0xfac67ecbd423a5b915deff06045ec9343568edaec34ae95c43d35f2c018afdaa"
-        skip_simulation: true # If true, always add a reason
-        skip_execution: true # If true, always add a reason
+          - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" # WETH
+          - "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" # USDC
+        static_attributes: {}
+        creation_tx: "0x80209c915476d7233096f32c5c033b7d724de9377bde670ce74f7afc265b6244"
+        skip_simulation: false
+        skip_execution: true # No vm:fermiswap executor is registered yet.
+      - id: "0x2b2f5776e38002e0c013d0d89828fdb06fee595ea2d5ed4b194e3883e823e350"
+        tokens:
+          - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" # WETH
+          - "0xdAC17F958D2ee523a2206206994597C13D831ec7" # USDT
+        static_attributes: {}
+        creation_tx: "0x302c444da6c3793939bb10965cbfb9c8ecbcc42a3cd51dd4c52b6a3343c8aa60"
+        skip_simulation: true # Fair price for this pair is stale at this test's stop block.
+        skip_execution: true # No vm:fermiswap executor is registered yet.
