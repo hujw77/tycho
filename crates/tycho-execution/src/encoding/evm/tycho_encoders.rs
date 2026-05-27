@@ -128,21 +128,15 @@ impl TychoRouterEncoder {
     fn _wrapping_bridge(&self, token_a: &Bytes, token_b: &Bytes, chain: &Chain) -> Option<Swap> {
         let eth = chain.native_token();
         let weth = chain.wrapped_native_token();
+        let wrap_component =
+            ProtocolComponent { protocol_system: "wrap".to_string(), ..Default::default() };
 
         if token_a == &weth.address && token_b == &eth.address {
-            Some(Swap::new(
-                ProtocolComponent { protocol_system: "wrap".to_string(), ..Default::default() },
-                weth,
-                eth,
-                BigUint::ZERO,
-            ))
+            // Unwrap: WETH → ETH
+            Some(Swap::new(wrap_component, weth, eth, BigUint::from(14_000u64)))
         } else if token_a == &eth.address && token_b == &weth.address {
-            Some(Swap::new(
-                ProtocolComponent { protocol_system: "wrap".to_string(), ..Default::default() },
-                eth,
-                weth,
-                BigUint::ZERO,
-            ))
+            // Wrap: ETH → WETH
+            Some(Swap::new(wrap_component, eth, weth, BigUint::from(7_000u64)))
         } else {
             None
         }

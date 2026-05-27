@@ -662,7 +662,7 @@ impl Executor {
             Self::UniswapV3 => Address::Router,
             // https://github.com/propeller-heads/tycho-execution/blob/0454514f4f6ccff55dcaa8e3abbb4ac494d89eba/foundry/src/executors/WethExecutor.sol#L33
             Self::Wrap => Address::Router,
-            // https://github.com/propeller-heads/tycho-indexer/blob/0d9b01ddbe72c5518fdc79a423ffd19dc7226709/crates/tycho-execution/contracts/src/executors/AerodromeV1Executor.sol#L23
+            // https://github.com/propeller-heads/tycho-indexer/blob/b4c4278032871672d39c1175f6efd651a0a7fa7a/crates/tycho-execution/contracts/src/executors/WrapExecutor.sol
             Self::AerodromeV1 => params.request(
                 ParamKey::ProtocolData { swap_index, start: 0, end: 20 },
                 // trying more variants might find some very obscure bugs

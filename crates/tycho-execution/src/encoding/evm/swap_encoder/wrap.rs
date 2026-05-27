@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn test_encode_wrap_unwrapping() {
-        // WETH -> (wrap) -> ETH
+        // WETH -> (unwrap) -> ETH
         let pool = ProtocolComponent {
             id: String::from(""),
             protocol_system: String::from(""),

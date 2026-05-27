@@ -1,16 +1,16 @@
 use std::{any::Any, collections::HashMap};
 
 use chrono::NaiveDateTime;
-use num_bigint::{BigUint, ToBigUint};
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use tycho_common::{
+    Bytes,
     dto::ProtocolStateDelta,
-    models::{token::Token, Chain},
+    models::{Chain, token::Token},
     simulation::{
         errors::{SimulationError, TransitionError},
         protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
     },
-    Bytes,
 };
 
 use crate::protocol::models::ProtocolComponent;
@@ -18,7 +18,8 @@ use crate::protocol::models::ProtocolComponent;
 pub const NATIVE_WRAPPER_ID: &str = "native_wrapper";
 const NATIVE_WRAPPER_PROTOCOL_SYSTEM: &str = "wrap";
 const NATIVE_WRAPPER_PROTOCOL_TYPE: &str = "NativeWrapper";
-const WRAP_GAS: u64 = 25_000;
+const WRAP_GAS: u64 = 7_000;
+const UNWRAP_GAS: u64 = 14_000;
 
 /// Stateless 1:1 bridge between a chain's native token and its wrapped
 /// counterpart (e.g. ETH ↔ WETH).
@@ -53,19 +54,15 @@ impl WrapperState {
         )
     }
 
-    fn validate_tokens(&self, token_in: &Token, token_out: &Token) -> Result<(), SimulationError> {
-        let valid_pair = (token_in.address == self.native_token.address &&
-            token_out.address == self.wrapped_token.address) ||
-            (token_in.address == self.wrapped_token.address &&
-                token_out.address == self.native_token.address);
+    fn validate_tokens(&self, token_in: &Bytes, token_out: &Bytes) -> Result<(), SimulationError> {
+        let valid_pair = (*token_in == self.native_token.address &&
+            *token_out == self.wrapped_token.address) ||
+            (*token_in == self.wrapped_token.address && *token_out == self.native_token.address);
         if !valid_pair {
             return Err(SimulationError::InvalidInput(
                 format!(
                     "NativeWrapper only supports {} ↔ {}, got {} → {}",
-                    self.native_token.address,
-                    self.wrapped_token.address,
-                    token_in.address,
-                    token_out.address,
+                    self.native_token.address, self.wrapped_token.address, token_in, token_out,
                 ),
                 None,
             ));
@@ -81,7 +78,7 @@ impl ProtocolSim for WrapperState {
     }
 
     fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
-        self.validate_tokens(base, quote)?;
+        self.validate_tokens(&base.address, &quote.address)?;
         Ok(1.0)
     }
 
@@ -91,14 +88,10 @@ impl ProtocolSim for WrapperState {
         token_in: &Token,
         token_out: &Token,
     ) -> Result<GetAmountOutResult, SimulationError> {
-        self.validate_tokens(token_in, token_out)?;
-        Ok(GetAmountOutResult::new(
-            amount_in,
-            WRAP_GAS
-                .to_biguint()
-                .expect("infallible"),
-            self.clone_box(),
-        ))
+        self.validate_tokens(&token_in.address, &token_out.address)?;
+        let is_wrapping = token_in.address == self.native_token.address;
+        let gas = if is_wrapping { WRAP_GAS } else { UNWRAP_GAS };
+        Ok(GetAmountOutResult::new(amount_in, BigUint::from(gas), self.clone_box()))
     }
 
     fn get_limits(
@@ -106,18 +99,7 @@ impl ProtocolSim for WrapperState {
         sell_token: Bytes,
         buy_token: Bytes,
     ) -> Result<(BigUint, BigUint), SimulationError> {
-        let valid_pair = (sell_token == self.native_token.address &&
-            buy_token == self.wrapped_token.address) ||
-            (sell_token == self.wrapped_token.address && buy_token == self.native_token.address);
-        if !valid_pair {
-            return Err(SimulationError::InvalidInput(
-                format!(
-                    "NativeWrapper only supports {} ↔ {}, got {} → {}",
-                    self.native_token.address, self.wrapped_token.address, sell_token, buy_token,
-                ),
-                None,
-            ));
-        }
+        self.validate_tokens(&sell_token, &buy_token)?;
         Ok((BigUint::from(u128::MAX), BigUint::from(u128::MAX)))
     }
 
