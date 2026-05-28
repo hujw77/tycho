@@ -9,6 +9,8 @@ pub struct Config {
     pub engine_address: Vec<u8>,
     #[serde(with = "hex::serde")]
     pub trader_vault: Vec<u8>,
+    #[serde(with = "hex::serde")]
+    pub swapper_address: Vec<u8>,
 }
 
 pub fn component_id(base_asset: &[u8], quote_asset: &[u8]) -> String {

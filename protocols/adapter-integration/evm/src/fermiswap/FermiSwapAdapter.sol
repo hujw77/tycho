@@ -136,6 +136,10 @@ contract FermiSwapAdapter is ISwapAdapter, IFermiSwapCallback {
 
         uint256 buyLimit =
             IERC20(buyToken).balanceOf(fermiSwapper.traderVault());
+
+        if (buyLimit == 0) {
+            return limits;
+        }
         if (buyLimit > uint256(type(int256).max)) {
             buyLimit = uint256(type(int256).max);
         }

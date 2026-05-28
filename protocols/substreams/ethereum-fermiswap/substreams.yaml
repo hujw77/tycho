@@ -35,14 +35,14 @@ networks:
       store_balances: 24950669
       map_protocol_changes: 24950669
     params:
-      map_protocol_components: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F"
-      map_balance_deltas: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F"
-      map_protocol_changes: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F"
+      map_protocol_components: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F&swapper_address=b1076fE3AB5e28005C7c323Bac5AC06a680d452e"
+      map_balance_deltas: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F&swapper_address=b1076fE3AB5e28005C7c323Bac5AC06a680d452e"
+      map_protocol_changes: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F&swapper_address=b1076fE3AB5e28005C7c323Bac5AC06a680d452e"
 
 params:
-  map_protocol_components: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F"
-  map_balance_deltas: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F"
-  map_protocol_changes: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F"
+  map_protocol_components: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F&swapper_address=b1076fE3AB5e28005C7c323Bac5AC06a680d452e"
+  map_balance_deltas: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F&swapper_address=b1076fE3AB5e28005C7c323Bac5AC06a680d452e"
+  map_protocol_changes: "engine_address=0ba5665583a4593a86cdc935ea2c8ff378c11317&trader_vault=585d44727129B9C69791B10238Ca605932938B4F&swapper_address=b1076fE3AB5e28005C7c323Bac5AC06a680d452e"
 
 modules:
   - name: map_protocol_components

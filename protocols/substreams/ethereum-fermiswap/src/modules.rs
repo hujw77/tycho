@@ -46,7 +46,11 @@ fn get_new_pairs(
         let component_id = component_id(&event.base_asset, &event.quote_asset);
         let new_component = ProtocolComponent::new(component_id.as_str())
             .with_tokens(&[event.base_asset.as_slice(), event.quote_asset.as_slice()])
-            .with_contracts(&[config.engine_address.as_slice(), config.trader_vault.as_slice()])
+            .with_contracts(&[
+                config.swapper_address.as_slice(),
+                config.engine_address.as_slice(),
+                config.trader_vault.as_slice(),
+            ])
             .as_swap_type("fermiswap_pool", ImplementationType::Vm);
 
         new_pair_changes.push(TransactionEntityChanges {
@@ -313,7 +317,7 @@ fn map_protocol_changes(
 
     extract_contract_changes_builder(
         &block,
-        |addr| addr == config.engine_address,
+        |addr| addr == config.engine_address || addr == config.swapper_address,
         &mut transaction_changes,
     );
 

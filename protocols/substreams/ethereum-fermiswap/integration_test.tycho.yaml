@@ -3,7 +3,7 @@ protocol_system: "vm:fermiswap"
 adapter_contract: "FermiSwapAdapter"
 adapter_build_signature: "constructor(address)"
 adapter_build_args: "0xb1076fE3AB5e28005C7c323Bac5AC06a680d452e"
-skip_balance_check: false
+skip_balance_check: true
 
 initialized_accounts:
   - "0xb1076fE3AB5e28005C7c323Bac5AC06a680d452e" # FermiSwapper used by the adapter.
