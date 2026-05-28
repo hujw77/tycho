@@ -82,7 +82,7 @@
 //!     .await
 //!     .expect("Failed loading tokens");
 //!
-//!     let mut protocol_stream =
+//!     let protocol_stream =
 //!         ProtocolStreamBuilder::new("tycho-beta.propellerheads.xyz", Chain::Ethereum)
 //!             .auth_key(Some("sampletoken".to_string()))
 //!             .skip_state_decode_failures(true)
@@ -95,6 +95,7 @@
 //!             .build()
 //!             .await
 //!             .expect("Failed building protocol stream");
+//!     tokio::pin!(protocol_stream);
 //!
 //!     // Loop through block updates
 //!     while let Some(msg) = protocol_stream.next().await {
@@ -108,7 +109,7 @@ use std::{
     time,
 };
 
-use futures::{Stream, StreamExt};
+use futures::{future::Either, stream, Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 use tycho_client::{
@@ -617,28 +618,37 @@ impl ProtocolStreamBuilder {
 /// Skips injection for chains where the native and wrapped-native tokens share
 /// the same address (e.g. Starknet).
 fn inject_native_wrapper(
-    stream: impl Stream<Item = Result<Update, StreamDecodeError>>,
+    inner: impl Stream<Item = Result<Update, StreamDecodeError>> + Unpin + Send + 'static,
     chain: Chain,
-) -> impl Stream<Item = Result<Update, StreamDecodeError>> {
+) -> impl Stream<Item = Result<Update, StreamDecodeError>> + Send {
     let has_distinct_wrapper = chain.native_token().address != chain.wrapped_native_token().address;
-    let mut injected = false;
 
-    stream.map(move |result| {
-        if !has_distinct_wrapper || injected {
-            return result;
-        }
-        result.map(|mut update| {
-            injected = true;
-            update
-                .new_pairs
-                .insert(NATIVE_WRAPPER_ID.to_string(), NativeWrapperState::component(chain));
-            update
-                .states
-                .insert(NATIVE_WRAPPER_ID.to_string(), Box::new(NativeWrapperState::new(chain)));
-            debug!("Injected native_wrapper component for {chain}");
-            update
+    if !has_distinct_wrapper {
+        return Either::Left(inner);
+    }
+
+    Either::Right(
+        stream::once(async move {
+            let mut inner = inner;
+            let first = inner.next().await;
+            let modified = first.into_iter().map(move |result| {
+                result.map(|mut update| {
+                    update.new_pairs.insert(
+                        NATIVE_WRAPPER_ID.to_string(),
+                        NativeWrapperState::component(chain),
+                    );
+                    update.states.insert(
+                        NATIVE_WRAPPER_ID.to_string(),
+                        Box::new(NativeWrapperState::new(chain)),
+                    );
+                    debug!("Injected native_wrapper component for {chain}");
+                    update
+                })
+            });
+            stream::iter(modified).chain(inner)
         })
-    })
+        .flatten(),
+    )
 }
 
 #[cfg(test)]
