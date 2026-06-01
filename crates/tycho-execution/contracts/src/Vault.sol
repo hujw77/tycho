@@ -137,6 +137,7 @@ abstract contract Vault is ERC6909, ReentrancyGuard, Pausable {
             require(msg.value == amount, "Value mismatch");
             _mint(msg.sender, id, amount);
         } else {
+            require(msg.value == 0, "ETH not accepted for ERC20 deposit");
             // ERC20 deposit - transfer to this contract and measure actual received
             // amount to handle  fee-on-transfer and rebasing tokens
             uint256 balanceBefore = IERC20(token).balanceOf(address(this));
