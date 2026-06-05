@@ -50,6 +50,7 @@ fn get_new_pairs(
                 config.swapper_address.as_slice(),
                 config.engine_address.as_slice(),
                 config.trader_vault.as_slice(),
+                config.registry_address.as_slice(),
             ])
             .as_swap_type("fermiswap_pool", ImplementationType::Vm);
 
@@ -100,6 +101,10 @@ fn store_token_pairs(pair_changes: BlockEntityChanges, store: StoreAppend<String
     }
 }
 
+/// Emits global trader-vault token balance deltas, not component-scoped balance deltas.
+///
+/// Newly tracked tokens are snapshotted once with `balanceOf`. Existing tokens are updated from
+/// ERC20 `Transfer` events involving the trader vault.
 #[substreams::handlers::map]
 fn map_token_balance_deltas(
     params: String,
@@ -137,8 +142,10 @@ fn map_token_balance_deltas(
         });
     }
 
-    for tx in block.transactions() {
-        for log in tx
+    let mut transfers = Vec::new();
+    for raw_tx in block.transactions() {
+        let tycho_tx: Transaction = raw_tx.into();
+        for log in raw_tx
             .calls
             .iter()
             .filter(|call| !call.state_reverted)
@@ -147,31 +154,45 @@ fn map_token_balance_deltas(
             let Some(transfer) = erc20::events::Transfer::match_and_decode(log) else {
                 continue;
             };
-            let token_key = hex::encode(&log.address);
-            if new_token_keys.contains(&token_key) ||
-                token_pairs_store
-                    .get_last(&token_key)
-                    .is_none()
-            {
-                continue;
-            }
-
-            let delta =
-                match (transfer.from == config.trader_vault, transfer.to == config.trader_vault) {
-                    (true, false) => BigInt::zero() - transfer.value,
-                    (false, true) => transfer.value,
-                    _ => continue,
-                };
-
-            let tx: Transaction = tx.into();
-            balance_deltas.push(BalanceDelta {
-                ord: log.ordinal,
-                tx: Some(tx),
-                token: log.address.clone(),
-                delta: delta.to_signed_bytes_be(),
-                component_id: vec![],
-            });
+            transfers.push((tycho_tx.clone(), log.ordinal, log.address.clone(), transfer));
         }
+    }
+
+    let trader_vault = config.trader_vault.as_slice();
+    let vault_transfers = transfers
+        .into_iter()
+        .filter(|(_, _, _, transfer)| {
+            transfer.from.as_slice() == trader_vault || transfer.to.as_slice() == trader_vault
+        })
+        .collect::<Vec<_>>();
+    if vault_transfers.is_empty() {
+        balance_deltas.sort_unstable_by_key(|delta| delta.ord);
+        return Ok(BlockBalanceDeltas { balance_deltas });
+    }
+
+    for (tx, ord, token, transfer) in vault_transfers {
+        let token_key = hex::encode(&token);
+        if new_token_keys.contains(&token_key) ||
+            token_pairs_store
+                .get_last(&token_key)
+                .is_none()
+        {
+            continue;
+        }
+
+        let delta = if transfer.from.as_slice() == trader_vault {
+            BigInt::zero() - transfer.value
+        } else {
+            transfer.value
+        };
+
+        balance_deltas.push(BalanceDelta {
+            ord,
+            tx: Some(tx),
+            token,
+            delta: delta.to_signed_bytes_be(),
+            component_id: vec![],
+        });
     }
 
     balance_deltas.sort_unstable_by_key(|delta| delta.ord);
@@ -200,6 +221,10 @@ fn store_token_balances(token_balance_deltas: BlockBalanceDeltas, store: StoreAd
     }
 }
 
+/// Converts global trader-vault token balance deltas into component-scoped balance deltas.
+///
+/// FermiSwap pairs share the same trader vault, so token balances are tracked globally first and
+/// then projected onto every component that references the changed token.
 #[substreams::handlers::map]
 fn map_balance_deltas(
     pair_changes: BlockEntityChanges,
@@ -210,6 +235,8 @@ fn map_balance_deltas(
     let mut balance_deltas = Vec::new();
     let mut new_component_ids_by_token = HashMap::<Vec<u8>, HashSet<String>>::new();
 
+    // New components have no component balance entry yet, so seed them from the latest global
+    // trader-vault balance for each token they reference.
     for tx_changes in pair_changes.changes {
         let Some(tx) = tx_changes.tx else {
             continue;
@@ -236,6 +263,8 @@ fn map_balance_deltas(
         }
     }
 
+    // Fan out global token movements to every existing component that uses the token. Components
+    // created in this block are skipped because they already received an initial snapshot above.
     for token_delta in token_balance_deltas.balance_deltas {
         let token_key = hex::encode(&token_delta.token);
         let Some(component_ids) = token_pairs_store.get_last(&token_key) else {
@@ -372,7 +401,11 @@ fn map_protocol_changes(
 
     extract_contract_changes_builder(
         &block,
-        |addr| addr == config.engine_address || addr == config.swapper_address,
+        |addr| {
+            addr == config.engine_address ||
+                addr == config.swapper_address ||
+                addr == config.registry_address
+        },
         &mut transaction_changes,
     );
 

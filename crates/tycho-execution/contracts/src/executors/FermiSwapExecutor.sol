@@ -5,12 +5,6 @@ import {IExecutor} from "@interfaces/IExecutor.sol";
 import {TransferManager} from "../TransferManager.sol";
 
 interface IFermiSwapper {
-    function quoteAmounts(
-        address tokenIn,
-        address tokenOut,
-        int256 amountSpecified
-    ) external view returns (uint256 amountIn, uint256 amountOut);
-
     function fermiSwapWithAllowances(
         address tokenIn,
         address tokenOut,

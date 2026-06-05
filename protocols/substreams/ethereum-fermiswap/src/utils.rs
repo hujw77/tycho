@@ -11,6 +11,8 @@ pub struct Config {
     pub trader_vault: Vec<u8>,
     #[serde(with = "hex::serde")]
     pub swapper_address: Vec<u8>,
+    #[serde(with = "hex::serde")]
+    pub registry_address: Vec<u8>,
 }
 
 pub fn component_id(base_asset: &[u8], quote_asset: &[u8]) -> String {
