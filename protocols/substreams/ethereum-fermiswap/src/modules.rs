@@ -1,7 +1,7 @@
 use crate::{
     abi::fermi::events::{PairActiveSet, PairRegistered, PairUnregistered},
     pb::fermiswap::v1::Pair,
-    utils::{component_id, Config, ACTIVE_ATTRIBUTE},
+    utils::{component_id, Config, PAUSED_ATTRIBUTE},
 };
 use anyhow::Result;
 use ethabi::ethereum_types::Address;
@@ -60,8 +60,8 @@ fn get_new_pairs(
             entity_changes: vec![EntityChanges {
                 component_id: component_id.clone(),
                 attributes: vec![Attribute {
-                    name: ACTIVE_ATTRIBUTE.to_string(),
-                    value: vec![{ 0u8 }], // default false at creation
+                    name: PAUSED_ATTRIBUTE.to_string(),
+                    value: vec![{ 0u8 }], // default true at creation
                     change: ChangeType::Creation.into(),
                 }],
             }],
@@ -146,12 +146,7 @@ fn map_token_balance_deltas(
     let mut transfers = Vec::new();
     for raw_tx in block.transactions() {
         let tycho_tx: Transaction = raw_tx.into();
-        for log in raw_tx
-            .calls
-            .iter()
-            .filter(|call| !call.state_reverted)
-            .flat_map(|call| &call.logs)
-        {
+        for (log, _) in raw_tx.logs_with_calls() {
             let Some(transfer) = erc20::events::Transfer::match_and_decode(log) else {
                 continue;
             };
@@ -173,10 +168,17 @@ fn map_token_balance_deltas(
 
     for (tx, ord, token, transfer) in vault_transfers {
         let token_key = hex::encode(&token);
-        if new_token_keys.contains(&token_key) ||
-            token_pairs_store
-                .get_last(&token_key)
-                .is_none()
+        // Newly tracked tokens were already snapshotted with `balanceOf` above. Applying their
+        // transfer deltas in the same block would double-count the trader-vault balance.
+        if new_token_keys.contains(&token_key) {
+            continue;
+        }
+
+        // The trader vault may move tokens unrelated to indexed FermiSwap pairs. Only emit global
+        // token deltas for tokens that are already mapped to at least one component.
+        if token_pairs_store
+            .get_last(&token_key)
+            .is_none()
         {
             continue;
         }
@@ -192,6 +194,8 @@ fn map_token_balance_deltas(
             tx: Some(tx),
             token,
             delta: delta.to_signed_bytes_be(),
+            // Global trader-vault token deltas are not tied to a component yet.
+            // `map_balance_deltas` fans them out to component-scoped balances later.
             component_id: vec![],
         });
     }
@@ -201,23 +205,13 @@ fn map_token_balance_deltas(
 }
 
 #[substreams::handlers::store]
-fn store_token_balances(token_balance_deltas: BlockBalanceDeltas, store: StoreAddBigInt) {
-    let mut previous_ordinal = HashMap::<String, u64>::new();
+fn store_token_balances(mut token_balance_deltas: BlockBalanceDeltas, store: StoreAddBigInt) {
+    token_balance_deltas
+        .balance_deltas
+        .sort_unstable_by_key(|delta| delta.ord);
+
     for delta in token_balance_deltas.balance_deltas {
         let token_key = hex::encode(&delta.token);
-        previous_ordinal
-            .entry(token_key.clone())
-            .and_modify(|ord| {
-                if *ord >= delta.ord {
-                    panic!(
-                        "Invalid ordinal sequence for token balance {token_key}: {} >= {}",
-                        *ord, delta.ord
-                    );
-                }
-                *ord = delta.ord;
-            })
-            .or_insert(delta.ord);
-
         store.add(delta.ord, token_key, BigInt::from_signed_bytes_be(&delta.delta));
     }
 }
@@ -236,8 +230,10 @@ fn map_balance_deltas(
     let mut balance_deltas = Vec::new();
     let mut new_component_ids_by_token = HashMap::<Vec<u8>, HashSet<String>>::new();
 
-    // New components have no component balance entry yet, so seed them from the latest global
-    // trader-vault balance for each token they reference.
+    // Component balance deltas are keyed by component id, so every newly created component needs
+    // an initial balance entry for all of its tokens. `token_balance_deltas` only contains tokens
+    // that moved in this block and would miss unchanged tokens, so seed new components from the
+    // accumulated global trader-vault token balance store instead.
     for tx_changes in pair_changes.changes {
         let Some(tx) = tx_changes.tx else {
             continue;
@@ -265,7 +261,8 @@ fn map_balance_deltas(
     }
 
     // Fan out global token movements to every existing component that uses the token. Components
-    // created in this block are skipped because they already received an initial snapshot above.
+    // created in this block are skipped because the snapshot above already includes this block's
+    // token movements; applying the delta again would double-count their initial balance.
     for token_delta in token_balance_deltas.balance_deltas {
         let token_key = hex::encode(&token_delta.token);
         let Some(component_ids) = token_pairs_store.get_last(&token_key) else {
@@ -334,12 +331,7 @@ fn map_protocol_changes(
     }
 
     for trx in block.transactions() {
-        let tx = Transaction {
-            to: trx.to.clone(),
-            from: trx.from.clone(),
-            hash: trx.hash.clone(),
-            index: trx.index.into(),
-        };
+        let tx: Transaction = trx.into();
         let builder = transaction_changes
             .entry(tx.index)
             .or_insert_with(|| TransactionChangesBuilder::new(&tx));
@@ -354,14 +346,7 @@ fn map_protocol_changes(
                     .get_last(&component_id)
                     .is_some()
                 {
-                    builder.add_entity_change(&EntityChanges {
-                        component_id,
-                        attributes: vec![Attribute {
-                            name: ACTIVE_ATTRIBUTE.to_string(),
-                            value: vec![if ev.active { 1u8 } else { 0u8 }],
-                            change: ChangeType::Creation.into(),
-                        }],
-                    });
+                    builder.change_component_pause_state(&component_id, !ev.active);
                 }
             } else if let Some(ev) = PairUnregistered::match_and_decode(log) {
                 let component_id = component_id(&ev.base_asset, &ev.quote_asset);
@@ -369,14 +354,7 @@ fn map_protocol_changes(
                     .get_last(&component_id)
                     .is_some()
                 {
-                    builder.add_entity_change(&EntityChanges {
-                        component_id,
-                        attributes: vec![Attribute {
-                            name: ACTIVE_ATTRIBUTE.to_string(),
-                            value: vec![{ 0u8 }],
-                            change: ChangeType::Creation.into(),
-                        }],
-                    });
+                    builder.change_component_pause_state(&component_id, true);
                 }
             }
         }

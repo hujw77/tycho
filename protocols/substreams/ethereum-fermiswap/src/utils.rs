@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use tiny_keccak::{Hasher, Keccak};
 
-pub const ACTIVE_ATTRIBUTE: &str = "active";
+pub const PAUSED_ATTRIBUTE: &str = "paused";
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
