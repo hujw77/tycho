@@ -13,6 +13,7 @@ use crate::{
     evm::{
         engine_db::{tycho_db::PreCachedDB, SHARED_TYCHO_DB},
         protocol::vm::{constants::get_adapter_file, utils::json_deserialize_address_list},
+        simulation::BlockEnvOverrides,
     },
     protocol::{
         errors::InvalidSnapshotError,
@@ -163,6 +164,36 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for EVMPoolState<PreCache
         if let Some(trace) = &decoder_context.vm_traces {
             vm_traces = *trace;
         }
+        let block_overrides = if let (Some(block_number), Some(block_timestamp)) = (
+            snapshot
+                .state
+                .attributes
+                .get("override_block_number"),
+            snapshot
+                .state
+                .attributes
+                .get("override_block_timestamp"),
+        ) {
+            let number = <[u8; 8]>::try_from(block_number.as_ref())
+                .map(u64::from_be_bytes)
+                .map_err(|_| {
+                    InvalidSnapshotError::ValueError(
+                        "override_block_number attribute must be an 8-byte big-endian u64"
+                            .to_string(),
+                    )
+                })?;
+            let timestamp = <[u8; 8]>::try_from(block_timestamp.as_ref())
+                .map(u64::from_be_bytes)
+                .map_err(|_| {
+                    InvalidSnapshotError::ValueError(
+                        "override_block_timestamp attribute must be an 8-byte big-endian u64"
+                            .to_string(),
+                    )
+                })?;
+            Some(BlockEnvOverrides { number: Some(number), timestamp: Some(timestamp) })
+        } else {
+            None
+        };
         let mut pool_state_builder =
             EVMPoolStateBuilder::new(id.clone(), tokens.clone(), adapter_contract_address)
                 .balances(component_balances)
@@ -172,7 +203,8 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for EVMPoolState<PreCache
                 .involved_contracts(involved_contracts)
                 .stateless_contracts(stateless_contracts)
                 .manual_updates(manual_updates)
-                .trace(vm_traces);
+                .trace(vm_traces)
+                .block_overrides(block_overrides);
 
         if let Some(balance_owner) = balance_owner {
             pool_state_builder = pool_state_builder.balance_owner(balance_owner)
@@ -261,6 +293,8 @@ mod tests {
                 "balance_owner".to_string(),
                 Bytes::from_str("0xBA12222222228d8Ba445958a75a0704d566BF2C8").unwrap(),
             ),
+            ("override_block_number".to_string(), Bytes::from(123_u64.to_be_bytes().to_vec())),
+            ("override_block_timestamp".to_string(), Bytes::from(456_u64.to_be_bytes().to_vec())),
             ("reserve1".to_string(), Bytes::from(200_u64.to_le_bytes().to_vec())),
         ]
         .into_iter()
@@ -361,5 +395,9 @@ mod tests {
             .insert(Address::from_str("0xBA12222222228d8Ba445958a75a0704d566BF2C8").unwrap());
         assert_eq!(res_pool.get_involved_contracts(), exp_involved_contracts);
         assert!(res_pool.get_manual_updates());
+        assert_eq!(
+            res_pool.get_block_overrides(),
+            Some(BlockEnvOverrides { number: Some(123), timestamp: Some(456) })
+        );
     }
 }

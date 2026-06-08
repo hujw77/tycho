@@ -999,14 +999,13 @@ where
         Ok(Update::new(block_number_or_timestamp, updated_states, HashMap::new()))
     }
 
-    /// Add block information (number and timestamp) to a ProtocolStateDelta
+    /// Add current block information (number and timestamp) to a ProtocolStateDelta.
     fn add_block_info_to_delta(
         mut delta: ProtocolStateDelta,
         block_header_opt: Option<BlockHeader>,
     ) -> ProtocolStateDelta {
         if let Some(header) = block_header_opt {
-            // Add block_number and block_timestamp attributes to ensure pool states
-            // receive current block information during delta_transition
+            // These are current block attributes for native protocols, not VM block env overrides.
             delta.updated_attributes.insert(
                 "block_number".to_string(),
                 Bytes::from(header.number.to_be_bytes().to_vec()),
