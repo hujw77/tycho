@@ -1312,6 +1312,36 @@ where
                 });
 
         // Handle reverted protocol state
+
+        // First pass: collect attributes first introduced with ChangeType::Creation across the
+        // entire reverted range. These have no prior state and must be deleted on revert — no
+        // buffer or DB lookup is needed or possible for them.
+        let reverted_created_attrs: HashMap<String, HashSet<String>> = reverted_state
+            .iter()
+            .flat_map(|block_msg| {
+                block_msg
+                    .block_update()
+                    .txs_with_update
+                    .iter()
+                    .flat_map(|update| {
+                        update
+                            .state_updates
+                            .iter()
+                            .filter(|(c_id, _)| !reverted_components_creations.contains_key(*c_id))
+                            .flat_map(|(c_id, delta)| {
+                                delta
+                                    .created_attributes
+                                    .iter()
+                                    .map(move |attr| (c_id.clone(), attr.clone()))
+                            })
+                    })
+            })
+            .fold(HashMap::new(), |mut acc, (c_id, attr)| {
+                acc.entry(c_id).or_default().insert(attr);
+                acc
+            });
+
+        // Second pass: build the lookup key set, excluding creation attributes (no prior state).
         let reverted_protocol_state_keys: HashSet<_> = reverted_state
             .iter()
             .flat_map(|block_msg| {
@@ -1328,6 +1358,11 @@ where
                                 delta
                                     .updated_attributes
                                     .keys()
+                                    .filter(|attr| {
+                                        !reverted_created_attrs
+                                            .get(c_id.as_str())
+                                            .is_some_and(|created| created.contains(*attr))
+                                    })
                                     .chain(delta.deleted_attributes.iter())
                                     .map(move |key| (c_id, key))
                             })
@@ -1369,20 +1404,21 @@ where
             .await
             .map_err(ExtractionError::Storage)?;
 
-        // Then merge the two and cast it to the expected struct
-        let missing_components_states_map = missing_map
-            .into_iter()
-            .map(|(component_id, keys)| {
-                missing_components_states
-                    .iter()
-                    .find(|comp| comp.component_id == component_id)
-                    .map(|state| (state.clone(), keys))
-                    .ok_or(ExtractionError::Storage(StorageError::NotFound(
-                        "Component".to_owned(),
-                        component_id.to_string(),
-                    )))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let missing_components_states_map: Vec<(ProtocolComponentState, Vec<String>)> =
+            missing_map
+                .into_iter()
+                .map(|(component_id, keys)| {
+                    let state = missing_components_states
+                        .iter()
+                        .find(|comp| comp.component_id == component_id)
+                        .cloned()
+                        .ok_or(ExtractionError::Storage(StorageError::NotFound(
+                            "Component".to_owned(),
+                            component_id.to_string(),
+                        )))?;
+                    Ok((state, keys))
+                })
+                .collect::<Result<Vec<_>, ExtractionError>>()?;
 
         let mut not_found: HashMap<_, HashSet<_>> = HashMap::new();
         let mut db_states: HashMap<(String, String), Bytes> = HashMap::new();
@@ -1402,7 +1438,7 @@ where
 
         let empty = HashSet::<String>::new();
 
-        let state_deltas: HashMap<String, ProtocolComponentStateDelta> = db_states
+        let mut state_deltas: HashMap<String, ProtocolComponentStateDelta> = db_states
             .into_iter()
             .chain(buffered_state)
             .fold(HashMap::new(), |mut acc, ((c_id, key), value)| {
@@ -1414,11 +1450,28 @@ where
                             .get(&c_id)
                             .unwrap_or(&empty)
                             .clone(),
+                        ..Default::default()
                     })
                     .updated_attributes
                     .insert(key.clone(), value);
                 acc
             });
+
+        // Safety net: components with attrs absent from both buffer and DB still need a delta.
+        for (c_id, deleted_keys) in &not_found {
+            state_deltas
+                .entry(c_id.clone())
+                .or_insert_with(|| ProtocolComponentStateDelta::new(c_id, HashMap::new(), deleted_keys.clone()));
+        }
+
+        // Revert ChangeType::Creation attributes by emitting deletions — they had no prior state.
+        for (c_id, created_keys) in reverted_created_attrs {
+            state_deltas
+                .entry(c_id.clone())
+                .or_insert_with(|| ProtocolComponentStateDelta::new(&c_id, HashMap::new(), HashSet::new()))
+                .deleted_attributes
+                .extend(created_keys);
+        }
 
         // Handle component balance changes
         let reverted_component_balances_keys: HashSet<(&String, Bytes)> = reverted_state
@@ -3166,6 +3219,161 @@ mod test {
             );
         }
     }
+
+    // Tests that reverting a partial block containing a brand-new attribute on a non-finalized
+    // component does not crash. Prior to the fix, the code errored with "Could not find Component"
+    // because the component was non-finalized (absent from DB) and the attribute had no prior
+    // value in the remaining buffer. The expected behavior is to emit a deletion for the attribute.
+    #[tokio::test]
+    async fn test_revert_new_attribute_on_non_finalized_component() {
+        use ::tycho_substreams::pb::tycho::evm::v1::{
+            Attribute, BlockChanges as PbBlockChanges, ChangeType as PbChangeType, EntityChanges,
+            ProtocolComponent as PbProtocolComponent, ProtocolType, TransactionChanges,
+        };
+
+        let mut gw = MockExtractorGateway::new();
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| ());
+        gw.expect_get_cursor()
+            .times(1)
+            .returning(|| Ok(("cursor".into(), Bytes::default())));
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+        gw.expect_advance()
+            .times(0)
+            .returning(|_, _, _| Ok(()));
+        gw.expect_get_contracts()
+            .returning(|_| Ok(Vec::new()));
+        // Component is non-finalized: not in DB.
+        gw.expect_get_protocol_states()
+            .returning(|_| Ok(Vec::new()));
+        gw.expect_get_components_balances()
+            .returning(|_| Ok(HashMap::new()));
+        gw.expect_get_account_balances()
+            .returning(|_| Ok(HashMap::new()));
+
+        let extractor = create_extractor(gw).await;
+
+        // Block 1: empty anchor.
+        extractor
+            .handle_tick_scoped_data(pb_fixtures::pb_block_scoped_data(
+                PbBlockChanges {
+                    block: Some(pb_fixtures::pb_blocks(1)),
+                    ..Default::default()
+                },
+                Some("cursor@1"),
+                Some(1),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Block 2: create `pool_x` with initial attributes. Non-finalized (stays in buffer).
+        extractor
+            .handle_tick_scoped_data(pb_fixtures::pb_block_scoped_data(
+                PbBlockChanges {
+                    block: Some(pb_fixtures::pb_blocks(2)),
+                    changes: vec![TransactionChanges {
+                        tx: Some(pb_fixtures::pb_transactions(2, 0)),
+                        component_changes: vec![PbProtocolComponent {
+                            id: "pool_x".to_string(),
+                            change: PbChangeType::Creation.into(),
+                            protocol_type: Some(ProtocolType {
+                                name: "pt_1".to_string(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        entity_changes: vec![EntityChanges {
+                            component_id: "pool_x".to_string(),
+                            attributes: vec![
+                                Attribute {
+                                    name: "sqrt_price_x96".to_string(),
+                                    value: Bytes::from(1000_u64).lpad(32, 0).to_vec(),
+                                    change: PbChangeType::Creation.into(),
+                                },
+                                Attribute {
+                                    name: "tick".to_string(),
+                                    value: Bytes::from(100_u64).lpad(32, 0).to_vec(),
+                                    change: PbChangeType::Creation.into(),
+                                },
+                            ],
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                Some("cursor@2"),
+                Some(1),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Partial block 3: first-ever tick attribute on `pool_x` (ChangeType::Creation).
+        let mut partial = pb_fixtures::pb_block_scoped_data(
+            PbBlockChanges {
+                block: Some(pb_fixtures::pb_blocks(3)),
+                changes: vec![TransactionChanges {
+                    tx: Some(pb_fixtures::pb_transactions(3, 0)),
+                    entity_changes: vec![EntityChanges {
+                        component_id: "pool_x".to_string(),
+                        attributes: vec![Attribute {
+                            name: "ticks/100/net-liquidity".to_string(),
+                            value: Bytes::from(5000_u64).lpad(32, 0).to_vec(),
+                            change: PbChangeType::Creation.into(),
+                        }],
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Some("cursor@3_p0"),
+            Some(1),
+        );
+        partial.partial_index = Some(0);
+        partial.is_partial = true;
+        extractor
+            .handle_tick_scoped_data(partial)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Revert to block 2 — partial block 3 is reverted.
+        let revert_msg = extractor
+            .handle_revert(BlockUndoSignal {
+                last_valid_block: Some(BlockRef {
+                    id: format!("0x{:0>64x}", 2_u64),
+                    number: 2,
+                }),
+                last_valid_cursor: "cursor@2".into(),
+            })
+            .await
+            .expect("handle_revert should not error for non-finalized component with new attr")
+            .expect("handle_revert should return a revert message");
+
+        assert!(revert_msg.revert);
+
+        // The revert delta for pool_x must tell consumers to delete the new tick attribute.
+        let pool_x_delta = revert_msg
+            .state_deltas
+            .get("pool_x")
+            .expect("state_deltas should contain pool_x");
+        assert!(
+            pool_x_delta
+                .deleted_attributes
+                .contains("ticks/100/net-liquidity"),
+            "Expected ticks/100/net-liquidity in deleted_attributes, got: {:?}",
+            pool_x_delta.deleted_attributes
+        );
+        assert!(
+            pool_x_delta.updated_attributes.is_empty(),
+            "Expected no updated_attributes for pool_x, got: {:?}",
+            pool_x_delta.updated_attributes
+        );
+    }
 }
 
 /// It is notoriously hard to mock postgres here, we would need to have traits and abstractions
@@ -3813,6 +4021,7 @@ mod test_serial_db {
                             ("attr_1".to_string(), Bytes::from(1000_u64).lpad(32, 0)),
                         ]),
                         deleted_attributes: HashSet::new(),
+                        ..Default::default()
                     }),
                 ]),
                 new_protocol_components: HashMap::from([
