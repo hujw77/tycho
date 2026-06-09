@@ -5,13 +5,15 @@ import {FeeRecipient} from "../lib/FeeStructs.sol";
 
 /**
  * @notice Per-client custom fee configuration
- * @dev All fields pack into a single storage slot (6 bytes total)
+ * @dev All fields pack into a single storage slot (10 bytes total).
+ *      Fee values use 8-decimal precision: 1 unit = 0.0001 BPS = 0.000001%.
+ *      100% = 100_000_000 units.
  */
 struct CustomFees {
     bool hasCustomFeeOnOutput; // 1 byte
-    uint16 feeBpsOnOutput; // 2 bytes
+    uint32 feeBpsOnOutput; // 4 bytes
     bool hasCustomFeeOnClientFee; // 1 byte
-    uint16 feeBpsOnClientFee; // 2 bytes
+    uint32 feeBpsOnClientFee; // 4 bytes
 }
 
 interface IFeeCalculator {
@@ -26,11 +28,7 @@ interface IFeeCalculator {
      * @return amountOut The amount remaining after all fee deductions
      * @return feeRecipients Array of (address, feeAmount) tuples for fee distribution
      */
-    function calculateFee(
-        uint256 amountIn,
-        address client,
-        uint16 clientFeeBps
-    )
+    function calculateFee(uint256 amountIn, address client, uint16 clientFeeBps)
         external
         view
         returns (uint256 amountOut, FeeRecipient[] memory feeRecipients);
@@ -44,6 +42,17 @@ interface IFeeCalculator {
         external
         view
         returns (uint16);
+
+    /**
+     * @dev Returns the effective router fee on output for a specific client in the internal
+     *      8-decimal fee unit scale (100_000_000 = 100%).
+     * @param client The client address to check
+     * @return The fee in fee units (custom if set, otherwise default)
+     */
+    function getEffectiveRouterFeeOnOutputScaled(address client)
+        external
+        view
+        returns (uint32);
 
     /**
      * @notice Returns all clients with custom fee overrides and their current settings
