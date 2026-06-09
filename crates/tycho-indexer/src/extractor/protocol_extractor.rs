@@ -196,7 +196,7 @@ where
             Err(err) => return Err(ExtractionError::Setup(err.to_string())),
         };
 
-        res.ensure_protocol_types().await;
+        res.ensure_protocol_types().await?;
         Ok(res)
     }
 
@@ -867,7 +867,7 @@ where
     }
 
     /// Make sure that the protocol types are present in the database.
-    async fn ensure_protocol_types(&self) {
+    async fn ensure_protocol_types(&self) -> Result<(), ExtractionError> {
         let protocol_types: Vec<ProtocolType> = self
             .protocol_types
             .values()
@@ -876,7 +876,8 @@ where
         self.gateway
             .inner
             .ensure_protocol_types(&protocol_types)
-            .await;
+            .await?;
+        Ok(())
     }
 
     async fn get_cursor(&self) -> String {
@@ -1337,7 +1338,9 @@ where
                     })
             })
             .fold(HashMap::new(), |mut acc, (c_id, attr)| {
-                acc.entry(c_id).or_default().insert(attr);
+                acc.entry(c_id)
+                    .or_default()
+                    .insert(attr);
                 acc
             });
 
@@ -1404,21 +1407,20 @@ where
             .await
             .map_err(ExtractionError::Storage)?;
 
-        let missing_components_states_map: Vec<(ProtocolComponentState, Vec<String>)> =
-            missing_map
-                .into_iter()
-                .map(|(component_id, keys)| {
-                    let state = missing_components_states
-                        .iter()
-                        .find(|comp| comp.component_id == component_id)
-                        .cloned()
-                        .ok_or(ExtractionError::Storage(StorageError::NotFound(
-                            "Component".to_owned(),
-                            component_id.to_string(),
-                        )))?;
-                    Ok((state, keys))
-                })
-                .collect::<Result<Vec<_>, ExtractionError>>()?;
+        let missing_components_states_map: Vec<(ProtocolComponentState, Vec<String>)> = missing_map
+            .into_iter()
+            .map(|(component_id, keys)| {
+                let state = missing_components_states
+                    .iter()
+                    .find(|comp| comp.component_id == component_id)
+                    .cloned()
+                    .ok_or(ExtractionError::Storage(StorageError::NotFound(
+                        "Component".to_owned(),
+                        component_id.to_string(),
+                    )))?;
+                Ok((state, keys))
+            })
+            .collect::<Result<Vec<_>, ExtractionError>>()?;
 
         let mut not_found: HashMap<_, HashSet<_>> = HashMap::new();
         let mut db_states: HashMap<(String, String), Bytes> = HashMap::new();
@@ -1461,14 +1463,18 @@ where
         for (c_id, deleted_keys) in &not_found {
             state_deltas
                 .entry(c_id.clone())
-                .or_insert_with(|| ProtocolComponentStateDelta::new(c_id, HashMap::new(), deleted_keys.clone()));
+                .or_insert_with(|| {
+                    ProtocolComponentStateDelta::new(c_id, HashMap::new(), deleted_keys.clone())
+                });
         }
 
         // Revert ChangeType::Creation attributes by emitting deletions — they had no prior state.
         for (c_id, created_keys) in reverted_created_attrs {
             state_deltas
                 .entry(c_id.clone())
-                .or_insert_with(|| ProtocolComponentStateDelta::new(&c_id, HashMap::new(), HashSet::new()))
+                .or_insert_with(|| {
+                    ProtocolComponentStateDelta::new(&c_id, HashMap::new(), HashSet::new())
+                })
                 .deleted_attributes
                 .extend(created_keys);
         }
@@ -1607,10 +1613,12 @@ pub trait ExtractorGateway: Send + Sync {
     /// Idempotently registers `new_protocol_types`, inserting any that do not yet exist and
     /// leaving already-present types untouched.
     ///
-    /// This call returns no result: a failure to write is treated as unrecoverable (the extractor
-    /// cannot operate without its protocol types) and therefore panics rather than surfacing an
-    /// error.
-    async fn ensure_protocol_types(&self, new_protocol_types: &[ProtocolType]); //TODO make it not panic, it should return an error instead.
+    /// # Errors
+    /// Returns a [`StorageError`] if the protocol types could not be persisted.
+    async fn ensure_protocol_types(
+        &self,
+        new_protocol_types: &[ProtocolType],
+    ) -> Result<(), StorageError>;
 
     /// Persists every change in `changes` for a single block and records `new_cursor` as the
     /// latest processed position.
@@ -1668,13 +1676,10 @@ pub trait ExtractorGateway: Send + Sync {
 
     /// Returns the block identified by the given hash.
     ///
-    /// Note: despite the `block_number` parameter name, the value is interpreted as a block
-    /// **hash**, not a number.
-    ///
     /// # Errors
     /// Returns [`StorageError::NotFound`] when no block with that hash exists in the store. Unlike
     /// the collection getters, a missing block is an error because a single value is expected.
-    async fn get_block(&self, block_number: Bytes) -> Result<Block, StorageError>;
+    async fn get_block(&self, block_hash: Bytes) -> Result<Block, StorageError>;
 
     /// Returns account balances keyed by account address and then by token address.
     ///
@@ -1743,11 +1748,13 @@ impl ExtractorGateway for ExtractorPgGateway {
         }
     }
 
-    async fn ensure_protocol_types(&self, new_protocol_types: &[ProtocolType]) {
+    async fn ensure_protocol_types(
+        &self,
+        new_protocol_types: &[ProtocolType],
+    ) -> Result<(), StorageError> {
         self.state_gateway
             .add_protocol_types(new_protocol_types)
             .await
-            .expect("Couldn't insert protocol types");
     }
 
     async fn advance(
@@ -2090,7 +2097,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -2109,7 +2116,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -2159,7 +2166,7 @@ mod test {
 
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -2306,7 +2313,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -2358,7 +2365,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -2391,7 +2398,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -2624,7 +2631,7 @@ mod test {
         extractor_gw
             .expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         extractor_gw
             .expect_get_cursor()
             .times(1)
@@ -2756,7 +2763,7 @@ mod test {
         extractor_gw
             .expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         extractor_gw
             .expect_get_cursor()
             .times(1)
@@ -2873,7 +2880,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -2989,7 +2996,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -3017,7 +3024,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -3061,7 +3068,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -3172,7 +3179,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -3298,7 +3305,7 @@ mod test {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
             .times(1)
-            .returning(|_| ());
+            .returning(|_| Ok(()));
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
@@ -3323,10 +3330,7 @@ mod test {
         // Block 1: empty anchor.
         extractor
             .handle_tick_scoped_data(pb_fixtures::pb_block_scoped_data(
-                PbBlockChanges {
-                    block: Some(pb_fixtures::pb_blocks(1)),
-                    ..Default::default()
-                },
+                PbBlockChanges { block: Some(pb_fixtures::pb_blocks(1)), ..Default::default() },
                 Some("cursor@1"),
                 Some(1),
             ))
@@ -3355,12 +3359,16 @@ mod test {
                             attributes: vec![
                                 Attribute {
                                     name: "sqrt_price_x96".to_string(),
-                                    value: Bytes::from(1000_u64).lpad(32, 0).to_vec(),
+                                    value: Bytes::from(1000_u64)
+                                        .lpad(32, 0)
+                                        .to_vec(),
                                     change: PbChangeType::Creation.into(),
                                 },
                                 Attribute {
                                     name: "tick".to_string(),
-                                    value: Bytes::from(100_u64).lpad(32, 0).to_vec(),
+                                    value: Bytes::from(100_u64)
+                                        .lpad(32, 0)
+                                        .to_vec(),
                                     change: PbChangeType::Creation.into(),
                                 },
                             ],
@@ -3386,7 +3394,9 @@ mod test {
                         component_id: "pool_x".to_string(),
                         attributes: vec![Attribute {
                             name: "ticks/100/net-liquidity".to_string(),
-                            value: Bytes::from(5000_u64).lpad(32, 0).to_vec(),
+                            value: Bytes::from(5000_u64)
+                                .lpad(32, 0)
+                                .to_vec(),
                             change: PbChangeType::Creation.into(),
                         }],
                     }],
@@ -3408,10 +3418,7 @@ mod test {
         // Revert to block 2 — partial block 3 is reverted.
         let revert_msg = extractor
             .handle_revert(BlockUndoSignal {
-                last_valid_block: Some(BlockRef {
-                    id: format!("0x{:0>64x}", 2_u64),
-                    number: 2,
-                }),
+                last_valid_block: Some(BlockRef { id: format!("0x{:0>64x}", 2_u64), number: 2 }),
                 last_valid_cursor: "cursor@2".into(),
             })
             .await
@@ -3433,7 +3440,9 @@ mod test {
             pool_x_delta.deleted_attributes
         );
         assert!(
-            pool_x_delta.updated_attributes.is_empty(),
+            pool_x_delta
+                .updated_attributes
+                .is_empty(),
             "Expected no updated_attributes for pool_x, got: {:?}",
             pool_x_delta.updated_attributes
         );
