@@ -215,6 +215,14 @@ contract TychoRouterTestSetup is
             WEETH_ADDR,
             REDEMPTION_MANAGER_ADDR
         );
+        // Etch placeholder bytecode if Liquorice contracts are not yet
+        // deployed at this fork block.
+        if (LIQUORICE_SETTLEMENT.code.length == 0) {
+            vm.etch(LIQUORICE_SETTLEMENT, bytes("1"));
+        }
+        if (LIQUORICE_BALANCE_MANAGER.code.length == 0) {
+            vm.etch(LIQUORICE_BALANCE_MANAGER, bytes("1"));
+        }
         liquoriceExecutor = new LiquoriceExecutor(
             LIQUORICE_SETTLEMENT, LIQUORICE_BALANCE_MANAGER
         );
