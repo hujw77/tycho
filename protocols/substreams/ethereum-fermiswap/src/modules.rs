@@ -5,8 +5,8 @@ use crate::{
     },
     pb::fermiswap::v1::Pair,
     utils::{
-        component_id, lane_index, lane_index_store_key, Config, OVERRIDE_BLOCK_NUMBER_ATTRIBUTE,
-        OVERRIDE_BLOCK_TIMESTAMP_ATTRIBUTE, PAUSED_ATTRIBUTE,
+        component_id, lane_index, lane_index_store_key, Config, OVERRIDE_BLOCK_TIMESTAMP_ATTRIBUTE,
+        PAUSED_ATTRIBUTE,
     },
 };
 use anyhow::Result;
@@ -35,8 +35,6 @@ use tycho_substreams::{
     contract::extract_contract_changes_builder,
     prelude::*,
 };
-
-const BLOCK_TIME_SECONDS: u64 = 12;
 
 #[substreams::handlers::map]
 fn map_protocol_components(params: String, block: Block) -> Result<BlockEntityChanges> {
@@ -359,22 +357,6 @@ fn map_protocol_changes(
 ) -> Result<BlockChanges, substreams::errors::Error> {
     let config: Config = serde_qs::from_str(params.as_str())?;
     let mut transaction_changes: HashMap<_, TransactionChangesBuilder> = HashMap::new();
-    let block_number = block.number;
-    let block_timestamp = block.timestamp_seconds();
-    let estimate_block_number_for_timestamp = |update_timestamp: u64| {
-        if update_timestamp == block_timestamp {
-            return Some(block_number);
-        }
-
-        let timestamp_delta = block_timestamp.abs_diff(update_timestamp);
-        let block_delta =
-            (timestamp_delta.saturating_add(BLOCK_TIME_SECONDS - 1) / BLOCK_TIME_SECONDS) as u64;
-        if update_timestamp <= block_timestamp {
-            return block_number.checked_sub(block_delta);
-        }
-
-        block_number.checked_add(block_delta)
-    };
 
     for tx_changes in pair_changes.changes {
         let Some(tycho_tx) = tx_changes.tx else {
@@ -436,63 +418,35 @@ fn map_protocol_changes(
                     // one-way lookup through the lane store populated when the
                     // pair was created.
                     let update_timestamp = update.update_timestamp.to_u64();
-                    if let Some(block_override) =
-                        estimate_block_number_for_timestamp(update_timestamp)
+                    if let Some(component_id) = lane_index_store_key(&update.lane_index)
+                        .and_then(|lane_key| lane_component_store.get_last(lane_key))
                     {
-                        if let Some(component_id) = lane_index_store_key(&update.lane_index)
-                            .and_then(|lane_key| lane_component_store.get_last(lane_key))
-                        {
-                            builder.add_entity_change(&EntityChanges {
-                                component_id,
-                                attributes: vec![
-                                    Attribute {
-                                        name: OVERRIDE_BLOCK_NUMBER_ATTRIBUTE.to_string(),
-                                        value: block_override.to_be_bytes().to_vec(),
-                                        change: ChangeType::Update.into(),
-                                    },
-                                    Attribute {
-                                        name: OVERRIDE_BLOCK_TIMESTAMP_ATTRIBUTE.to_string(),
-                                        value: update_timestamp.to_be_bytes().to_vec(),
-                                        change: ChangeType::Update.into(),
-                                    },
-                                ],
-                            });
-                        }
+                        builder.add_entity_change(&EntityChanges {
+                            component_id,
+                            attributes: vec![Attribute {
+                                name: OVERRIDE_BLOCK_TIMESTAMP_ATTRIBUTE.to_string(),
+                                value: update_timestamp.to_be_bytes().to_vec(),
+                                change: ChangeType::Update.into(),
+                            }],
+                        });
                     }
                 }
             } else if let Some(batch) = BatchUpdateStateWithSignature::match_and_decode(call) {
                 for (target, _signer, lane_index, update_timestamp, _slots, _signature) in
                     batch.updates
                 {
-                    // Registry calldata only contains `laneIndex`, not the token pair. `laneIndex`
-                    // is keccak256(abi.encode(tokenA, tokenB)), so this is a
-                    // one-way lookup through the lane store populated when the
-                    // pair was created.
                     if target == config.engine_address.as_slice() {
                         let update_timestamp = update_timestamp.to_u64();
-                        let Some(block_override) =
-                            estimate_block_number_for_timestamp(update_timestamp)
-                        else {
-                            continue;
-                        };
-
                         if let Some(component_id) = lane_index_store_key(&lane_index)
                             .and_then(|lane_key| lane_component_store.get_last(lane_key))
                         {
                             builder.add_entity_change(&EntityChanges {
                                 component_id,
-                                attributes: vec![
-                                    Attribute {
-                                        name: OVERRIDE_BLOCK_NUMBER_ATTRIBUTE.to_string(),
-                                        value: block_override.to_be_bytes().to_vec(),
-                                        change: ChangeType::Update.into(),
-                                    },
-                                    Attribute {
-                                        name: OVERRIDE_BLOCK_TIMESTAMP_ATTRIBUTE.to_string(),
-                                        value: update_timestamp.to_be_bytes().to_vec(),
-                                        change: ChangeType::Update.into(),
-                                    },
-                                ],
+                                attributes: vec![Attribute {
+                                    name: OVERRIDE_BLOCK_TIMESTAMP_ATTRIBUTE.to_string(),
+                                    value: update_timestamp.to_be_bytes().to_vec(),
+                                    change: ChangeType::Update.into(),
+                                }],
                             });
                         }
                     }

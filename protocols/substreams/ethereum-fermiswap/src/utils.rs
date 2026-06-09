@@ -5,7 +5,6 @@ use tiny_keccak::{Hasher, Keccak};
 use num_bigint::Sign;
 
 pub const PAUSED_ATTRIBUTE: &str = "paused";
-pub const OVERRIDE_BLOCK_NUMBER_ATTRIBUTE: &str = "override_block_number";
 pub const OVERRIDE_BLOCK_TIMESTAMP_ATTRIBUTE: &str = "override_block_timestamp";
 
 #[derive(Debug, Deserialize)]
