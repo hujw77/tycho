@@ -617,4 +617,78 @@ contract FeeCalculatorConfigTest is Constants {
             DEFAULT_ADMIN_ROLE
         );
     }
+
+    function testGetAllClientFeesEmpty() public view {
+        (address[] memory clients, CustomFees[] memory fees) =
+            feeCalculator.getAllClientFees();
+        assertEq(clients.length, 0);
+        assertEq(fees.length, 0);
+    }
+
+    function testGetAllClientFees() public {
+        vm.startPrank(FEE_SETTER);
+        feeCalculator.setCustomRouterFeeOnOutput(ALICE, 50); // 0.5%
+        feeCalculator.setCustomRouterFeeOnOutput(BOB, 100); // 1%
+        feeCalculator.setCustomRouterFeeOnClientFee(BOB, 500); // 5%
+        vm.stopPrank();
+
+        (address[] memory clients, CustomFees[] memory fees) =
+            feeCalculator.getAllClientFees();
+
+        assertEq(clients.length, 2);
+
+        bool foundAlice = false;
+        bool foundBob = false;
+        for (uint256 i = 0; i < clients.length; i++) {
+            if (clients[i] == ALICE) {
+                foundAlice = true;
+                assertTrue(fees[i].hasCustomFeeOnOutput);
+                assertEq(fees[i].feeBpsOnOutput, 50);
+                assertFalse(fees[i].hasCustomFeeOnClientFee);
+                assertEq(fees[i].feeBpsOnClientFee, 0);
+            } else if (clients[i] == BOB) {
+                foundBob = true;
+                assertTrue(fees[i].hasCustomFeeOnOutput);
+                assertEq(fees[i].feeBpsOnOutput, 100);
+                assertTrue(fees[i].hasCustomFeeOnClientFee);
+                assertEq(fees[i].feeBpsOnClientFee, 500);
+            }
+        }
+        assertTrue(foundAlice);
+        assertTrue(foundBob);
+    }
+
+    function testGetAllClientFeesAfterRemovingClient() public {
+        vm.startPrank(FEE_SETTER);
+        feeCalculator.setCustomRouterFeeOnOutput(ALICE, 50);
+        feeCalculator.setCustomRouterFeeOnOutput(BOB, 100);
+        vm.stopPrank();
+
+        vm.prank(FEE_SETTER);
+        feeCalculator.removeCustomRouterFeeOnOutput(ALICE);
+
+        (address[] memory clients,) = feeCalculator.getAllClientFees();
+
+        assertEq(clients.length, 1);
+        assertEq(clients[0], BOB);
+    }
+
+    function testGetAllClientFeesClientStaysWhenOneFeeRemoved() public {
+        vm.startPrank(FEE_SETTER);
+        feeCalculator.setCustomRouterFeeOnOutput(BOB, 100);
+        feeCalculator.setCustomRouterFeeOnClientFee(BOB, 500);
+        vm.stopPrank();
+
+        vm.prank(FEE_SETTER);
+        feeCalculator.removeCustomRouterFeeOnOutput(BOB);
+
+        (address[] memory clients, CustomFees[] memory fees) =
+            feeCalculator.getAllClientFees();
+
+        assertEq(clients.length, 1);
+        assertEq(clients[0], BOB);
+        assertFalse(fees[0].hasCustomFeeOnOutput);
+        assertTrue(fees[0].hasCustomFeeOnClientFee);
+        assertEq(fees[0].feeBpsOnClientFee, 500);
+    }
 }

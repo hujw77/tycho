@@ -3,6 +3,17 @@ pragma solidity ^0.8.26;
 
 import {FeeRecipient} from "../lib/FeeStructs.sol";
 
+/**
+ * @notice Per-client custom fee configuration
+ * @dev All fields pack into a single storage slot (6 bytes total)
+ */
+struct CustomFees {
+    bool hasCustomFeeOnOutput; // 1 byte
+    uint16 feeBpsOnOutput; // 2 bytes
+    bool hasCustomFeeOnClientFee; // 1 byte
+    uint16 feeBpsOnClientFee; // 2 bytes
+}
+
 interface IFeeCalculator {
     /**
      * @notice Calculates fees from the swap output amount
@@ -30,7 +41,17 @@ interface IFeeCalculator {
      * @return The fee in basis points (custom if set, otherwise default)
      */
     function getEffectiveRouterFeeOnOutput(address client)
-    external
-    view
-    returns (uint16);
+        external
+        view
+        returns (uint16);
+
+    /**
+     * @notice Returns all clients with custom fee overrides and their current settings
+     * @return clients Addresses of all clients with at least one custom fee
+     * @return fees Custom fee configuration for each client (parallel array)
+     */
+    function getAllClientFees()
+        external
+        view
+        returns (address[] memory clients, CustomFees[] memory fees);
 }

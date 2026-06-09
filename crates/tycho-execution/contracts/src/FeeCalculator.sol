@@ -2,22 +2,14 @@
 pragma solidity ^0.8.26;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {
+    EnumerableSet
+} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {FeeRecipient} from "../lib/FeeStructs.sol";
-import {IFeeCalculator} from "@interfaces/IFeeCalculator.sol";
+import {IFeeCalculator, CustomFees} from "@interfaces/IFeeCalculator.sol";
 
 error FeeCalculator__FeeTooHigh();
 error FeeCalculator__AddressZero();
-
-/**
- * @notice Storage-optimized struct for per-client custom fee configuration
- * @dev All fields pack into a single storage slot (6 bytes total)
- */
-struct CustomFees {
-    bool hasCustomFeeOnOutput; // 1 byte
-    uint16 feeBpsOnOutput; // 2 bytes
-    bool hasCustomFeeOnClientFee; // 1 byte
-    uint16 feeBpsOnClientFee; // 2 bytes
-}
 
 /**
  * @title FeeCalculator
@@ -27,6 +19,8 @@ struct CustomFees {
  *      It also stores all fee-related configuration.
  */
 contract FeeCalculator is AccessControl, IFeeCalculator {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
     uint16 private constant _MAX_FEE_BPS = 10000; // 100% max
 
     uint16 private _routerFeeOnOutputBps; // Router fee on output amount in basis points
@@ -37,6 +31,9 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
     // If set, custom values will override the default router fees for the client
     // Storage-optimized: all custom fee data for a client fits in a single slot
     mapping(address => CustomFees) private _customRouterFees;
+
+    // Tracks all clients that currently have at least one custom fee override
+    EnumerableSet.AddressSet private _customFeeClients;
 
     //keccak256("ROUTER_FEE_SETTER_ROLE")
     bytes32 public constant ROUTER_FEE_SETTER_ROLE =
@@ -197,12 +194,15 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         customFees.feeBpsOnOutput = feeBps;
         customFees.hasCustomFeeOnOutput = true;
         _customRouterFees[client] = customFees;
+        // slither-disable-next-line unused-return
+        _customFeeClients.add(client);
 
         emit CustomRouterFeeOnOutputUpdated(client, oldFeeBps, feeBps);
     }
 
     /**
-     * @dev Removes the custom router fee on output amount for a specific client, reverting to default
+     * @dev Removes the custom router fee on output amount for a specific client, reverting to
+     *      default
      * @param client The client address to remove the custom fee from
      */
     function removeCustomRouterFeeOnOutput(address client)
@@ -213,6 +213,11 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         customFees.hasCustomFeeOnOutput = false;
         customFees.feeBpsOnOutput = 0;
         _customRouterFees[client] = customFees;
+
+        if (!customFees.hasCustomFeeOnClientFee) {
+            // slither-disable-next-line unused-return
+            _customFeeClients.remove(client);
+        }
 
         emit CustomRouterFeeOnOutputRemoved(client);
     }
@@ -273,6 +278,8 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         customFees.feeBpsOnClientFee = feeBps;
         customFees.hasCustomFeeOnClientFee = true;
         _customRouterFees[client] = customFees;
+        // slither-disable-next-line unused-return
+        _customFeeClients.add(client);
 
         emit CustomRouterFeeOnClientFeeUpdated(client, oldFeeBps, feeBps);
     }
@@ -289,6 +296,11 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         customFees.hasCustomFeeOnClientFee = false;
         customFees.feeBpsOnClientFee = 0;
         _customRouterFees[client] = customFees;
+
+        if (!customFees.hasCustomFeeOnOutput) {
+            // slither-disable-next-line unused-return
+            _customFeeClients.remove(client);
+        }
 
         emit CustomRouterFeeOnClientFeeRemoved(client);
     }
@@ -307,6 +319,26 @@ contract FeeCalculator is AccessControl, IFeeCalculator {
         return customFees.hasCustomFeeOnClientFee
             ? customFees.feeBpsOnClientFee
             : _routerFeeOnClientFeeBps;
+    }
+
+    /**
+     * @notice Returns all clients with custom fee overrides and their current settings
+     * @return clients Addresses of all clients with at least one custom fee
+     * @return fees Custom fee configuration for each client (parallel array)
+     */
+    function getAllClientFees()
+        external
+        view
+        returns (address[] memory clients, CustomFees[] memory fees)
+    {
+        uint256 count = _customFeeClients.length();
+        clients = new address[](count);
+        fees = new CustomFees[](count);
+        for (uint256 i = 0; i < count; i++) {
+            address client = _customFeeClients.at(i);
+            clients[i] = client;
+            fees[i] = _customRouterFees[client];
+        }
     }
 
     /**
