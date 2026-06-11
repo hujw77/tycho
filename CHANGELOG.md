@@ -1,3 +1,17 @@
+## [0.308.0](https://github.com/propeller-heads/tycho/compare/0.307.0...0.308.0) (2026-06-11)
+
+
+### Features
+
+* **fee-calculator:** Add getAllClientFees view method ([eef9d96](https://github.com/propeller-heads/tycho/commit/eef9d96587c3a85d50e04d037dd7dfdc843323a5))
+* **fee-calculator:** Add getAllClientFees view method and sub-BPS fee precision support ([#1079](https://github.com/propeller-heads/tycho/issues/1079)) ([57d574b](https://github.com/propeller-heads/tycho/commit/57d574baab84c0f04bc12241c16e1ef0af54cde9))
+* **fee-calculator:** Add sub-BPS fee precision ([d3cd81f](https://github.com/propeller-heads/tycho/commit/d3cd81faa910b60404ce48da5748d219c06b30d9))
+
+
+### Bug Fixes
+
+* **fee-calculator:** Add pagination to getAllClientFees; expose consts ([2342f18](https://github.com/propeller-heads/tycho/commit/2342f18bda260cfaf2d403d8fdc079d56d7ea476))
+
 ## [0.307.0](https://github.com/propeller-heads/tycho/compare/0.306.1...0.307.0) (2026-06-11)
 
 
