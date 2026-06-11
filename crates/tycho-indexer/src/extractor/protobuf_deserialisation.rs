@@ -216,11 +216,16 @@ impl TryFromMessage for ProtocolComponentStateDelta {
     fn try_from_message(args: Self::Args<'_>) -> Result<Self, ExtractionError> {
         let msg = args;
 
-        let (mut updates, mut deletions) = (HashMap::new(), HashSet::new());
+        let (mut updates, mut deletions, mut created) =
+            (HashMap::new(), HashSet::new(), HashSet::new());
 
         for attribute in msg.attributes.into_iter() {
             match ChangeType::try_from_message(attribute.change())? {
-                ChangeType::Update | ChangeType::Creation => {
+                ChangeType::Creation => {
+                    created.insert(attribute.name.clone());
+                    updates.insert(attribute.name, Bytes::from(attribute.value));
+                }
+                ChangeType::Update => {
                     updates.insert(attribute.name, Bytes::from(attribute.value));
                 }
                 ChangeType::Deletion => {
@@ -233,6 +238,7 @@ impl TryFromMessage for ProtocolComponentStateDelta {
             component_id: msg.component_id,
             updated_attributes: updates,
             deleted_attributes: deletions,
+            created_attributes: created,
         })
     }
 }

@@ -208,6 +208,16 @@ contract TychoRouterTestSetup is
         erc4626Executor = new ERC4626Executor();
         nativeWrapExecutor = new NativeWrapExecutor(WETH_ADDR);
         ekuboV3Executor = new EkuboV3Executor();
+        // Etch placeholder bytecode if Etherfi contracts are not yet deployed
+        // on this chain/block (e.g. non-mainnet forks or early mainnet blocks).
+        if (EETH_ADDR.code.length == 0) vm.etch(EETH_ADDR, bytes("1"));
+        if (LIQUIDITY_POOL_ADDR.code.length == 0) {
+            vm.etch(LIQUIDITY_POOL_ADDR, bytes("1"));
+        }
+        if (WEETH_ADDR.code.length == 0) vm.etch(WEETH_ADDR, bytes("1"));
+        if (REDEMPTION_MANAGER_ADDR.code.length == 0) {
+            vm.etch(REDEMPTION_MANAGER_ADDR, bytes("1"));
+        }
         etherfiExecutor = new EtherfiExecutor(
             ETH_ADDR,
             EETH_ADDR,
@@ -215,6 +225,14 @@ contract TychoRouterTestSetup is
             WEETH_ADDR,
             REDEMPTION_MANAGER_ADDR
         );
+        // Etch placeholder bytecode if Liquorice contracts are not yet
+        // deployed at this fork block.
+        if (LIQUORICE_SETTLEMENT.code.length == 0) {
+            vm.etch(LIQUORICE_SETTLEMENT, bytes("1"));
+        }
+        if (LIQUORICE_BALANCE_MANAGER.code.length == 0) {
+            vm.etch(LIQUORICE_BALANCE_MANAGER, bytes("1"));
+        }
         liquoriceExecutor = new LiquoriceExecutor(
             LIQUORICE_SETTLEMENT, LIQUORICE_BALANCE_MANAGER
         );
