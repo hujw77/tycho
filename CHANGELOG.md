@@ -1,3 +1,11 @@
+## [0.309.0](https://github.com/propeller-heads/tycho/compare/0.308.0...0.309.0) (2026-06-11)
+
+
+### Features
+
+* Native wrapper executors on all chains ([e1d953d](https://github.com/propeller-heads/tycho/commit/e1d953db2a9bf6649aea1bd8b017a245e19658c8))
+* Native wrapper executors on all chains ([#1080](https://github.com/propeller-heads/tycho/issues/1080)) ([d3b0382](https://github.com/propeller-heads/tycho/commit/d3b03824abb555bce0aef525179671b251fefe20))
+
 ## [0.308.0](https://github.com/propeller-heads/tycho/compare/0.307.0...0.308.0) (2026-06-11)
 
 
