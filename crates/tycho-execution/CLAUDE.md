@@ -295,6 +295,7 @@ Executors run via `delegatecall` inside TychoRouter — they have full access to
 - **Never write to state variables.** Any storage write in an executor writes to TychoRouter's storage.
 - **Do not execute `delegatecall`.** If unavoidable, ensure the caller cannot control the target address.
 - **Verify callback origin.** Call `verifyCallback` inside `handleCallback` to confirm `msg.sender` is a valid pool.
+- **Allowlist selectors when the caller controls calldata.** If `swap()` forwards caller-supplied calldata to an external contract (e.g. RFQ settlement), validate the first 4 bytes against an explicit allowlist of safe function selectors before making the call. An unrestricted selector lets an attacker invoke arbitrary functions on that contract — including ones that could drain TychoRouter's balance at the settlement contract. See `LiquoriceExecutor` for the pattern.
 - `handleCallback`'s `data` argument is raw ABI-encoded calldata the executor must decode manually.
 - `handleCallback`'s return value must be raw ABI-encoded data the executor encodes manually.
 

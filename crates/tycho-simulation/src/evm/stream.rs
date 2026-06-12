@@ -784,10 +784,7 @@ fn inject_native_wrapper(
     chain: Chain,
 ) -> impl Stream<Item = Result<Update, StreamDecodeError>> + Send {
     let has_distinct_wrapper = chain.native_token().address != chain.wrapped_native_token().address;
-    // TODO: enable for all chains once native_wrapper executors are deployed
-    let has_executor = chain == Chain::Ethereum;
-
-    if !has_distinct_wrapper || !has_executor {
+    if !has_distinct_wrapper {
         return Either::Left(inner);
     }
 

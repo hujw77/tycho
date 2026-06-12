@@ -1,3 +1,56 @@
+## [0.309.0](https://github.com/propeller-heads/tycho/compare/0.308.0...0.309.0) (2026-06-11)
+
+
+### Features
+
+* Native wrapper executors on all chains ([e1d953d](https://github.com/propeller-heads/tycho/commit/e1d953db2a9bf6649aea1bd8b017a245e19658c8))
+* Native wrapper executors on all chains ([#1080](https://github.com/propeller-heads/tycho/issues/1080)) ([d3b0382](https://github.com/propeller-heads/tycho/commit/d3b03824abb555bce0aef525179671b251fefe20))
+
+## [0.308.0](https://github.com/propeller-heads/tycho/compare/0.307.0...0.308.0) (2026-06-11)
+
+
+### Features
+
+* **fee-calculator:** Add getAllClientFees view method ([eef9d96](https://github.com/propeller-heads/tycho/commit/eef9d96587c3a85d50e04d037dd7dfdc843323a5))
+* **fee-calculator:** Add getAllClientFees view method and sub-BPS fee precision support ([#1079](https://github.com/propeller-heads/tycho/issues/1079)) ([57d574b](https://github.com/propeller-heads/tycho/commit/57d574baab84c0f04bc12241c16e1ef0af54cde9))
+* **fee-calculator:** Add sub-BPS fee precision ([d3cd81f](https://github.com/propeller-heads/tycho/commit/d3cd81faa910b60404ce48da5748d219c06b30d9))
+
+
+### Bug Fixes
+
+* **fee-calculator:** Add pagination to getAllClientFees; expose consts ([2342f18](https://github.com/propeller-heads/tycho/commit/2342f18bda260cfaf2d403d8fdc079d56d7ea476))
+
+## [0.307.0](https://github.com/propeller-heads/tycho/compare/0.306.1...0.307.0) (2026-06-11)
+
+
+### Features
+
+* **LiquoriceExecutor:** Deploy it and set new address ([9d2a6dd](https://github.com/propeller-heads/tycho/commit/9d2a6dde3ecc36141e8deb1134790cd44c972475))
+
+
+### Bug Fixes
+
+* **ekubo-v3-executor:** Remove unnecessary constructor ([92320e3](https://github.com/propeller-heads/tycho/commit/92320e301db022b1c6ff44f2e7bfdf4f34b891ab))
+* **etherfi-executor:** Address small audit comments ([42bc57f](https://github.com/propeller-heads/tycho/commit/42bc57f27c952b2449a508152c2c68832d11d9e8))
+* **execution:** Address small audit comments to new executors ([#1078](https://github.com/propeller-heads/tycho/issues/1078)) ([2ba9cdb](https://github.com/propeller-heads/tycho/commit/2ba9cdbd98f6d6cb85a8bd856cda6e15e7dc79f8))
+* **liquorice-executor:** Address small audit comments ([2373d8b](https://github.com/propeller-heads/tycho/commit/2373d8bb1132b9db110fbb41e080a6e522805ebf))
+
+## [0.306.1](https://github.com/propeller-heads/tycho/compare/0.306.0...0.306.1) (2026-06-10)
+
+
+### Bug Fixes
+
+* revert ChangeType::Creation attributes without DB lookup ([941ba6e](https://github.com/propeller-heads/tycho/commit/941ba6e07593ab477bb18a45fd277cfd904a766b))
+* revert ChangeType::Creation attributes without DB lookup ([#1072](https://github.com/propeller-heads/tycho/issues/1072)) ([0e6c61d](https://github.com/propeller-heads/tycho/commit/0e6c61d96b5a2fcceecbc7c0a3ead609c8b3f6a4))
+
+## [0.306.0](https://github.com/propeller-heads/tycho/compare/0.305.1...0.306.0) (2026-06-08)
+
+
+### Features
+
+* add aerodrome v1 to integration test ([c1a2de8](https://github.com/propeller-heads/tycho/commit/c1a2de898bc5abae987a5bdde84eb4f0d67b1814))
+* add aerodrome v1 to integration test ([#1060](https://github.com/propeller-heads/tycho/issues/1060)) ([5f4f781](https://github.com/propeller-heads/tycho/commit/5f4f78128c8f3a283f266372ab9c3c94ed4456ba))
+
 ## [0.305.1](https://github.com/propeller-heads/tycho/compare/0.305.0...0.305.1) (2026-06-05)
 
 
