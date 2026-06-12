@@ -22,7 +22,7 @@ contract FermiSwapAdapterTest is AdapterTest {
     uint256 constant BUY_USDC_AMOUNT = 1_00e6;
 
     function setUp() public {
-        vm.createSelectFork(vm.rpcUrl("mainnet"));
+        vm.createSelectFork(vm.rpcUrl("mainnet"), 25295257);
         address fermiEngine = address(IFermiSwapper(FERMI_SWAPPER).fermi());
         _refreshFermiPair(fermiEngine, WETH, USDC);
 
@@ -45,17 +45,17 @@ contract FermiSwapAdapterTest is AdapterTest {
     function testGetPoolIds() public view {
         bytes32[] memory poolIds = adapter.getPoolIds(0, 10);
 
-        assertEq(poolIds.length, 3);
+        assertEq(poolIds.length, 5);
         assertEq(poolIds[0], _poolId(WETH, USDC));
         assertEq(poolIds[1], _poolId(WETH, USDT));
         assertEq(poolIds[2], _poolId(USDC, USDT));
 
         bytes32[] memory offsetPoolIds = adapter.getPoolIds(1, 10);
-        assertEq(offsetPoolIds.length, 2);
+        assertEq(offsetPoolIds.length, 4);
         assertEq(offsetPoolIds[0], _poolId(WETH, USDT));
         assertEq(offsetPoolIds[1], _poolId(USDC, USDT));
 
-        bytes32[] memory emptyPoolIds = adapter.getPoolIds(3, 10);
+        bytes32[] memory emptyPoolIds = adapter.getPoolIds(5, 10);
         assertEq(emptyPoolIds.length, 0);
     }
 
