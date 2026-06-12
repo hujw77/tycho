@@ -2581,6 +2581,7 @@ mod test {
                         ("attr_1".to_string(), Bytes::from("0x00000000000003e8")),
                     ]),
                     deleted_attributes: HashSet::new(),
+                    ..Default::default()
                 }),
             ]),
             new_protocol_components: HashMap::from([
