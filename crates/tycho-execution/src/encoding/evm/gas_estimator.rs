@@ -220,6 +220,25 @@ mod tests {
         )
     }
 
+    fn make_swap_with_tokens(protocol: &str, token_in: Bytes, token_out: Bytes, gas: u64) -> Swap {
+        Swap::new(
+            ProtocolComponent { protocol_system: protocol.to_string(), ..Default::default() },
+            default_token(token_in),
+            default_token(token_out),
+            BigUint::from(gas),
+        )
+    }
+
+    fn token_a() -> Bytes {
+        Bytes::from(vec![0x01u8; 20])
+    }
+    fn token_b() -> Bytes {
+        Bytes::from(vec![0x02u8; 20])
+    }
+    fn token_c() -> Bytes {
+        Bytes::from(vec![0x03u8; 20])
+    }
+
     #[test]
     fn test_single_optimizable_transfer_in() {
         // uniswap_v2 is in PROTOCOLS_OPTIMIZABLE_TRANSFER_IN: the router-to-pool input transfer is
@@ -300,6 +319,44 @@ mod tests {
         // hop2 input transfer                       0  ← uniswap_v2 is optimizable
         // fee output transfer (last hop)        60_000  ← uniswap_v2 not in OUTPUT_TO_ROUTER
         assert_eq!(gas, BigUint::from(445_000u64));
+    }
+
+    #[test]
+    fn test_sequential_grouped_two_hops_usv4() {
+        // Two consecutive USV4 hops get grouped: intermediate transfer is saved.
+        // A→B→C on uniswap_v4 becomes one group with flash accounting.
+        let solution = make_solution(vec![
+            make_swap_with_tokens("uniswap_v4", token_a(), token_b(), 100_000),
+            make_swap_with_tokens("uniswap_v4", token_b(), token_c(), 100_000),
+        ]);
+        let gas = estimate_gas_usage(&solution, Strategy::Sequential);
+
+        // group estimated_gas: 200_000 - token_b.gas(60k) - token_b.gas(60k) = 80_000
+        //   (first.token_out=60k + last.token_in=60k subtracted by compute_group_gas)
+        // transfer overhead: 0 (callback protocol)
+        // user transfer: 0 (callback + TransferFrom)
+        // fee output transfer: 60_000 (not in OUTPUT_TO_ROUTER)
+        assert_eq!(gas, BigUint::from(140_000u64));
+    }
+
+    #[test]
+    fn test_sequential_mixed_grouped_and_ungrouped() {
+        // A→B→C on uniswap_v4 (grouped), then C→D on uniswap_v2 (separate).
+        let token_d = Bytes::from(vec![0x04u8; 20]);
+        let solution = make_solution(vec![
+            make_swap_with_tokens("uniswap_v4", token_a(), token_b(), 100_000),
+            make_swap_with_tokens("uniswap_v4", token_b(), token_c(), 100_000),
+            make_swap_with_tokens("uniswap_v2", token_c(), token_d.clone(), 100_000),
+        ]);
+        let gas = estimate_gas_usage(&solution, Strategy::Sequential);
+
+        // group1 (usv4): 200_000 - 60k - 60k = 80_000 (intermediate B transfers saved)
+        // group1 transfer overhead: 0 (callback)
+        // group2 (usv2): 100_000
+        // group2 transfer overhead: 0 (optimizable transfer in)
+        // user transfer: 0 (first group is callback + TransferFrom)
+        // fee output transfer: 60_000 (last swap is uniswap_v2, not in OUTPUT_TO_ROUTER)
+        assert_eq!(gas, BigUint::from(240_000u64));
     }
 
     #[test]
