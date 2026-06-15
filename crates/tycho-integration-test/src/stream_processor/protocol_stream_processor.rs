@@ -354,8 +354,11 @@ impl ProtocolStreamProcessor {
                     stream.exchange::<AerodromeV1State>("aerodrome_v1", tvl_filter.clone(), None);
             }
             "vm:fermiswap" => {
-                stream =
-                    stream.exchange::<EVMPoolState<PreCachedDB>>("vm:fermiswap", tvl_filter.clone(), None);
+                stream = stream.exchange::<EVMPoolState<PreCachedDB>>(
+                    "vm:fermiswap",
+                    tvl_filter.clone(),
+                    None,
+                );
             }
             _ => {
                 return Err(miette::miette!("Unknown protocol: {}", protocol));
