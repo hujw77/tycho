@@ -70,7 +70,7 @@ pub fn estimate_gas_usage(solution: &Solution, strategy: Strategy) -> BigUint {
         let first_swap = &group.swaps[0];
         let last_swap = &group.swaps[group.swaps.len() - 1];
         let group_transfer_overhead = estimate_transfer_overhead(
-            &first_swap.component().protocol_system,
+            &group.protocol_system,
             first_swap.token_in(),
             last_swap.token_out(),
             &strategy,
@@ -81,9 +81,7 @@ pub fn estimate_gas_usage(solution: &Solution, strategy: Strategy) -> BigUint {
     // Add user transfer overhead
     if strategy != Strategy::Split {
         if let Some(first_group) = swap_groups.first() {
-            let protocol: &str = &first_group.swaps[0]
-                .component()
-                .protocol_system;
+            let protocol = first_group.protocol_system.as_str();
             // if the solution is not a split swap, the protocol gas usage for callback protocols
             // already includes a regular transfer gas usage:
             // - for the permit2 case we need to deduct the transfer usage already included
