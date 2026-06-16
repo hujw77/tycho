@@ -1,3 +1,33 @@
+## [0.312.0](https://github.com/propeller-heads/tycho/compare/0.311.0...0.312.0) (2026-06-16)
+
+
+### Features
+
+* add Fermiswap execution ([1ee2a94](https://github.com/propeller-heads/tycho/commit/1ee2a945877e43d8b98be425bd3b8f1052f78ca5))
+* add Fermiswap executor ([92b1a85](https://github.com/propeller-heads/tycho/commit/92b1a853f63be8ca08b98860e83a522da005bc08))
+* add fermiswap pair proto ([a564bc5](https://github.com/propeller-heads/tycho/commit/a564bc5cf065a2cb3df8d3f0aa7abb8c9e3a1a10))
+* add FermiSwap VM adapter ([9899932](https://github.com/propeller-heads/tycho/commit/98999321fa820b965de49fd2b33f88e7d1789c91))
+* add FermiSwap VM execution support ([fa4a581](https://github.com/propeller-heads/tycho/commit/fa4a58159f23473219a33be4d5262aae2691bf93))
+* add registry abi ([48178b9](https://github.com/propeller-heads/tycho/commit/48178b9bd267b1b754966c6ee7ffc0e131e690f7))
+* emit Fermi oracle timestamp overrides ([93c29eb](https://github.com/propeller-heads/tycho/commit/93c29ebfb59b97ff700354be567884e326a0e068))
+* fermiswap integration ([#1034](https://github.com/propeller-heads/tycho/issues/1034)) ([049fef0](https://github.com/propeller-heads/tycho/commit/049fef0aac8ad1e27d6d3f59fe2827b00dee5b0a))
+* index FermiSwap pairs with proto-backed stores ([be5010b](https://github.com/propeller-heads/tycho/commit/be5010b9b985ecfa6c88190c381ff04be6a404f2))
+* init fermiswap ([fe88350](https://github.com/propeller-heads/tycho/commit/fe883505ad52e6a2ca6c56e603a5955a64eea9de))
+* support oracle registry ([d49e4af](https://github.com/propeller-heads/tycho/commit/d49e4af6ce38fdc2f6f50cf0fa3d55a2d65c37b5))
+* track Fermi registry block overrides ([c687a46](https://github.com/propeller-heads/tycho/commit/c687a464a9a0fcb30f29289f2e3175530d11f3c4))
+* track Fermi registry block overrides ([dd4e050](https://github.com/propeller-heads/tycho/commit/dd4e05038b23c43d2a2ab7f9186e06fbc5cc4817))
+
+
+### Bug Fixes
+
+* address slither warning and adapater test failing ([d75f320](https://github.com/propeller-heads/tycho/commit/d75f3208091d8d2813bd9badc21ccb4961ff0d3b))
+* ci lint ([41d78f9](https://github.com/propeller-heads/tycho/commit/41d78f98017630d2c719e428a79e7d529e302140))
+* component id parse error ([45dd438](https://github.com/propeller-heads/tycho/commit/45dd43887fe82a0803b158087f241b1be9034951))
+* handle weth token balance deltas ([106bf66](https://github.com/propeller-heads/tycho/commit/106bf6685e1f9f2790413822dfb975de2d5c959c))
+* resolve CI failures ([4221075](https://github.com/propeller-heads/tycho/commit/4221075a5e2de1471d964f1e8d9b9833acc03054))
+* support FermiSwap VM state tracking ([bdae445](https://github.com/propeller-heads/tycho/commit/bdae445e559befb4b2813de2a2363e50c20b2290))
+* update fermiswap balance delta handling ([f3aeba6](https://github.com/propeller-heads/tycho/commit/f3aeba6ffdc3154f487623aaeeff2e9b9e0c4983))
+
 ## [0.311.0](https://github.com/propeller-heads/tycho/compare/0.310.0...0.311.0) (2026-06-16)
 
 
