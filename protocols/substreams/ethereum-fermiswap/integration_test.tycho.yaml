@@ -23,8 +23,6 @@ tests:
         tokens:
           - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" # WETH
           - "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" # USDC
-        static_attributes:
-          balance_owner: "0x585d44727129B9C69791B10238Ca605932938B4F"
         creation_tx: "0x74bfa8b999532fe15fadd2c1ead24f881e2f375abe26c1b730f71de1d8e440e5"
         skip_simulation: true # Fair price for this pair is stale at this test's stop block.
         skip_execution: true
@@ -32,8 +30,6 @@ tests:
         tokens:
           - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" # WETH
           - "0xdAC17F958D2ee523a2206206994597C13D831ec7" # USDT
-        static_attributes:
-          balance_owner: "0x585d44727129B9C69791B10238Ca605932938B4F"
         creation_tx: "0x4fc82812010c571f17fbb75f4c5c68f6bf3bc25097c06cd324070071748325c4"
         skip_simulation: false
         skip_execution: true
