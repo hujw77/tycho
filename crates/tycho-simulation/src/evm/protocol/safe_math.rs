@@ -195,10 +195,12 @@ pub fn sqrt_u256(value: U256) -> Result<U256, SimulationError> {
 /// Uses temp variable t for intermediate calculations
 /// Ref: https://hal.inria.fr/file/index/docid/72854/filename/RR-3805.pdf
 fn compute_karatsuba_sqrt(x: U256, r: &mut U256, t: &mut U256, bits: usize) -> U256 {
-    // Base case: use simple method for small numbers
+    // Base case: exact integer floor sqrt once the value fits in one 64-bit limb.
+    // `u64::isqrt` returns floor(sqrt) directly; the root is at most u32::MAX, so
+    // `result * result` cannot overflow u64.
     if bits <= 64 {
         let x_small = x.as_limbs()[0];
-        let result = (x_small as f64).sqrt() as u64;
+        let result = x_small.isqrt();
         *r = x - U256::from(result * result);
         return U256::from(result);
     }
