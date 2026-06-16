@@ -320,14 +320,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sequential_grouped_two_hops_usv4() {
+    fn test_single_grouped_two_hops_usv4() {
         // Two consecutive USV4 hops get grouped: intermediate transfer is saved.
         // A→B→C on uniswap_v4 becomes one group with flash accounting.
         let solution = make_solution(vec![
             make_swap_with_tokens("uniswap_v4", token_a(), token_b(), 100_000),
             make_swap_with_tokens("uniswap_v4", token_b(), token_c(), 100_000),
         ]);
-        let gas = estimate_gas_usage(&solution, Strategy::Sequential);
+        let gas = estimate_gas_usage(&solution, Strategy::Single);
 
         // group estimated_gas: 200_000 - token_b.gas(60k) - token_b.gas(60k) = 80_000
         //   (first.token_out=60k + last.token_in=60k subtracted by compute_group_gas)
