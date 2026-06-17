@@ -10,10 +10,11 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 extern crate pretty_assertions;
 
 use std::{
-    collections::HashMap,
-    env,
+    collections::{BTreeMap, HashMap},
+    env, fs,
     fs::File,
     io::Read,
+    path::Path,
     process, slice,
     str::FromStr,
     sync::{mpsc, Arc},
@@ -26,6 +27,7 @@ use clap::Parser;
 use futures03::future::select_all;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::Deserialize;
+use serde_yaml::Value;
 use tokio::{
     runtime::Handle,
     select,
@@ -73,6 +75,46 @@ struct ExtractorConfigs {
     extractors: std::collections::HashMap<String, ExtractorConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawExtractorConfigs {
+    extractors: std::collections::HashMap<String, RawExtractorConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawExtractorConfig {
+    name: String,
+    chain: Chain,
+    implementation_type: ImplementationType,
+    sync_batch_size: usize,
+    start_block: Option<i64>,
+    stop_block: Option<i64>,
+    protocol_types: Vec<ProtocolTypeConfig>,
+    spkg: String,
+    module_name: String,
+    #[serde(default)]
+    initialized_accounts: Vec<Bytes>,
+    #[serde(default)]
+    initialized_accounts_block: u64,
+    #[serde(default)]
+    post_processor: Option<String>,
+    #[serde(default)]
+    dci_plugin: Option<DCIType>,
+    #[serde(default)]
+    substreams_params: HashMap<String, String>,
+    #[serde(default)]
+    bootstrap: Option<RawBootstrapConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBootstrapConfig {
+    spkg: String,
+    module_name: String,
+    #[serde(default)]
+    substreams_params: HashMap<String, String>,
+    #[serde(skip)]
+    start_block: Option<i64>,
+}
+
 impl ExtractorConfigs {
     fn new(extractors: std::collections::HashMap<String, ExtractorConfig>) -> Self {
         Self { extractors }
@@ -82,8 +124,251 @@ impl ExtractorConfigs {
         let mut file = File::open(path)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
-        let config: ExtractorConfigs = serde_yaml::from_str(&contents)?;
-        Ok(config)
+        let mut config: RawExtractorConfigs = serde_yaml::from_str(&contents)?;
+        let base_dir = Path::new(path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        config.resolve_substreams_params(base_dir)?;
+        config.try_into()
+    }
+}
+
+impl RawExtractorConfigs {
+    fn resolve_substreams_params(
+        &mut self,
+        base_dir: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (extractor_name, extractor) in &mut self.extractors {
+            let mut resolved_start_block = extractor.start_block;
+            resolve_substreams_params_map(
+                extractor_name,
+                &mut resolved_start_block,
+                &mut extractor.substreams_params,
+                base_dir,
+            )?;
+
+            if let Some(bootstrap) = &mut extractor.bootstrap {
+                let mut bootstrap_start_block = None;
+                resolve_substreams_params_map(
+                    extractor_name,
+                    &mut bootstrap_start_block,
+                    &mut bootstrap.substreams_params,
+                    base_dir,
+                )?;
+                bootstrap.start_block = bootstrap_start_block;
+
+                if let Some(start_block) = bootstrap_start_block {
+                    if let Some(existing_start_block) = resolved_start_block {
+                        if existing_start_block != start_block {
+                            return Err(format!(
+                                "conflicting start_block values for extractor `{extractor_name}`: \
+                                 {existing_start_block} vs {start_block} from bootstrap config"
+                            )
+                            .into());
+                        }
+                    } else {
+                        resolved_start_block = Some(start_block);
+                    }
+                }
+            }
+            extractor.start_block = resolved_start_block;
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<RawExtractorConfigs> for ExtractorConfigs {
+    type Error = Box<dyn std::error::Error>;
+
+    fn try_from(value: RawExtractorConfigs) -> Result<Self, Self::Error> {
+        let mut extractors = HashMap::with_capacity(value.extractors.len());
+
+        for (extractor_id, extractor) in value.extractors {
+            let start_block = extractor
+                .start_block
+                .ok_or_else(|| format!("extractor `{extractor_id}` is missing `start_block`"))?;
+
+            extractors.insert(
+                extractor_id,
+                ExtractorConfig::new(
+                    extractor.name,
+                    extractor.chain,
+                    extractor.implementation_type,
+                    extractor.sync_batch_size,
+                    start_block,
+                    extractor.stop_block,
+                    extractor.protocol_types,
+                    extractor.spkg,
+                    extractor.module_name,
+                    extractor.initialized_accounts,
+                    extractor.initialized_accounts_block,
+                    extractor.post_processor,
+                    extractor.dci_plugin,
+                    extractor.substreams_params,
+                    extractor.bootstrap.map(|bootstrap| {
+                        let start_block = bootstrap.start_block.expect(
+                            "bootstrap config start_block must be resolved before conversion",
+                        );
+                        tycho_indexer::extractor::runner::BootstrapConfig {
+                            spkg: bootstrap.spkg,
+                            module_name: bootstrap.module_name,
+                            start_block,
+                            substreams_params: bootstrap.substreams_params,
+                        }
+                    }),
+                ),
+            );
+        }
+
+        Ok(ExtractorConfigs::new(extractors))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SubstreamsParamsFile {
+    #[serde(default)]
+    start_block: Option<i64>,
+    #[serde(default)]
+    params: BTreeMap<String, Value>,
+}
+
+fn parse_substreams_params_yaml(
+    contents: &str,
+) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
+    let parsed: SubstreamsParamsFile = serde_yaml::from_str(contents)?;
+    let (start_block, params) = normalize_substreams_params(parsed)?;
+    let mut substreams_params = Vec::with_capacity(params.len());
+
+    for (key, value) in params {
+        let rendered_value = render_substreams_param_value(&value)?;
+        substreams_params.push(format!("{key}={rendered_value}"));
+    }
+
+    Ok((start_block, substreams_params.join("&")))
+}
+
+fn resolve_substreams_params_map(
+    extractor_name: &str,
+    resolved_start_block: &mut Option<i64>,
+    substreams_params: &mut HashMap<String, String>,
+    base_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (module_name, value) in substreams_params {
+        let Some(path) = value.strip_prefix('@') else {
+            continue;
+        };
+
+        let params_path = base_dir.join(path);
+        let params = fs::read_to_string(&params_path).map_err(|err| {
+            format!(
+                "failed to read substreams config file for extractor `{extractor_name}` \
+                 module `{module_name}` at `{}`: {err}",
+                params_path.display()
+            )
+        })?;
+        let (start_block, resolved_params) =
+            parse_substreams_params_yaml(&params).map_err(|err| {
+                format!(
+                    "failed to parse substreams config file for extractor `{extractor_name}` \
+                 module `{module_name}` at `{}`: {err}",
+                    params_path.display()
+                )
+            })?;
+
+        if let Some(start_block) = start_block {
+            if let Some(existing_start_block) = resolved_start_block {
+                if *existing_start_block != start_block {
+                    return Err(format!(
+                        "conflicting start_block values for extractor `{extractor_name}`: \
+                         {existing_start_block} vs {start_block} from module `{module_name}`"
+                    )
+                    .into());
+                }
+            } else {
+                *resolved_start_block = Some(start_block);
+            }
+        }
+
+        *value = resolved_params;
+    }
+
+    Ok(())
+}
+
+fn normalize_substreams_params(
+    mut parsed: SubstreamsParamsFile,
+) -> Result<(Option<i64>, BTreeMap<String, Value>), Box<dyn std::error::Error>> {
+    let bootstrap_block = parsed
+        .params
+        .get("bootstrap_block")
+        .map(parse_i64_yaml_value)
+        .transpose()?;
+
+    let start_block = match (parsed.start_block, bootstrap_block) {
+        (Some(start_block), Some(bootstrap_block)) => {
+            if start_block != bootstrap_block {
+                return Err(format!(
+                    "`start_block` ({start_block}) must match `params.bootstrap_block` \
+                     ({bootstrap_block})"
+                )
+                .into());
+            }
+            start_block
+        }
+        (Some(start_block), None) => {
+            parsed.params.insert(
+                "bootstrap_block".to_string(),
+                Value::Number(serde_yaml::Number::from(start_block)),
+            );
+            start_block
+        }
+        (None, Some(bootstrap_block)) => bootstrap_block,
+        (None, None) => return Ok((None, parsed.params)),
+    };
+
+    Ok((Some(start_block), parsed.params))
+}
+
+fn render_substreams_param_value(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    match value {
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(value.clone()),
+        Value::Sequence(values) => values
+            .iter()
+            .map(render_substreams_scalar_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| values.join(",")),
+        Value::Null => Err("null is not a supported substreams param value".into()),
+        Value::Mapping(_) | Value::Tagged(_) => {
+            Err("nested YAML objects are not supported in substreams params".into())
+        }
+    }
+}
+
+fn render_substreams_scalar_value(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    match value {
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(value.clone()),
+        Value::Null => Err("null is not a supported substreams param list item".into()),
+        Value::Sequence(_) | Value::Mapping(_) | Value::Tagged(_) => {
+            Err("substreams param lists may only contain scalar values".into())
+        }
+    }
+}
+
+fn parse_i64_yaml_value(value: &Value) -> Result<i64, Box<dyn std::error::Error>> {
+    match value {
+        Value::Number(value) => value
+            .as_i64()
+            .ok_or_else(|| "numeric YAML value does not fit into i64".into()),
+        Value::String(value) => Ok(value.parse()?),
+        Value::Bool(_)
+        | Value::Null
+        | Value::Sequence(_)
+        | Value::Mapping(_)
+        | Value::Tagged(_) => Err("block parameters must be scalar integers".into()),
     }
 }
 
@@ -131,6 +416,99 @@ fn create_tracing_subscriber() {
                 .with_env_filter(EnvFilter::from_default_env())
                 .init();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn extractor_configs_load_substreams_params_from_file() {
+        let temp_root =
+            std::env::temp_dir().join(format!("tycho-indexer-substreams-params-{}", process::id()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(temp_root.join("config")).expect("create temp config dir");
+
+        fs::write(
+            temp_root.join("config/uniswap_v3_bootstrap.yaml"),
+            r#"
+start_block: 1
+params:
+  pools:
+    - "0xabc"
+"#,
+        )
+        .expect("write config file");
+        fs::write(
+            temp_root.join("extractors.yaml"),
+            r#"
+extractors:
+  uniswap_v3:
+    name: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "uniswap_v3_pool"
+        financial_type: "Swap"
+    spkg: "stream.spkg"
+    module_name: "map_protocol_changes"
+    bootstrap:
+      spkg: "bootstrap.spkg"
+      module_name: "map_protocol_changes_bootstrap"
+      substreams_params:
+        map_bootstrap_pools_created: "@config/uniswap_v3_bootstrap.yaml"
+"#,
+        )
+        .expect("write extractor config");
+
+        let config = ExtractorConfigs::from_yaml(
+            temp_root
+                .join("extractors.yaml")
+                .to_str()
+                .expect("utf8 temp path"),
+        )
+        .expect("load extractor configs");
+
+        assert_eq!(
+            config
+                .extractors
+                .get("uniswap_v3")
+                .map(ExtractorConfig::start_block),
+            Some(1)
+        );
+        assert_eq!(
+            config
+                .extractors
+                .get("uniswap_v3")
+                .and_then(|extractor| extractor.bootstrap.as_ref())
+                .and_then(|bootstrap| bootstrap
+                    .substreams_params
+                    .get("map_bootstrap_pools_created"))
+                .map(String::as_str),
+            Some("bootstrap_block=1&pools=0xabc")
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn extractor_configs_reject_mismatched_start_and_bootstrap_blocks() {
+        let err = parse_substreams_params_yaml(
+            r#"
+start_block: 1
+params:
+  bootstrap_block: 2
+  pools:
+    - "0xabc"
+"#,
+        )
+        .expect_err("mismatched config should fail");
+
+        assert!(err.to_string().contains("must match"));
     }
 }
 
@@ -267,7 +645,7 @@ fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), Ext
 
             Ok::<_, ExtractionError>((extraction_tasks, other_tasks))
         })
-        .expect("Should not fail during tasks creation");
+        ?;
 
     let extractor_ctrl_tx = control_tx.clone();
     extraction_runtime.spawn(async move {
@@ -334,6 +712,8 @@ async fn run_spkg(global_args: GlobalArgs, run_args: RunSpkgArgs) -> Result<(), 
             run_args.initialization_block,
             None,
             dci_plugin,
+            HashMap::new(),
+            None,
         ),
     )]));
 

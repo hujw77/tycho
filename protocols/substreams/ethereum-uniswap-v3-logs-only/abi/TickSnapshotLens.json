@@ -1,0 +1,45 @@
+[
+  {
+    "inputs": [
+      { "internalType": "address", "name": "pool", "type": "address" }
+    ],
+    "name": "wordBounds",
+    "outputs": [
+      { "internalType": "int24", "name": "tickSpacing", "type": "int24" },
+      { "internalType": "int16", "name": "minWord", "type": "int16" },
+      { "internalType": "int16", "name": "maxWord", "type": "int16" }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "address", "name": "pool", "type": "address" },
+      { "internalType": "int16", "name": "startWord", "type": "int16" },
+      { "internalType": "uint16", "name": "maxWordsToScan", "type": "uint16" },
+      { "internalType": "uint16", "name": "maxNonEmptyWords", "type": "uint16" }
+    ],
+    "name": "scanWordsPage",
+    "outputs": [
+      { "internalType": "int24", "name": "tickSpacing", "type": "int24" },
+      { "internalType": "int16[]", "name": "nonEmptyWords", "type": "int16[]" },
+      { "internalType": "int16", "name": "nextWord", "type": "int16" },
+      { "internalType": "bool", "name": "done", "type": "bool" }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "address", "name": "pool", "type": "address" },
+      { "internalType": "int16[]", "name": "words", "type": "int16[]" }
+    ],
+    "name": "getTicksForWords",
+    "outputs": [
+      { "internalType": "bytes", "name": "packedTicks", "type": "bytes" },
+      { "internalType": "uint32[]", "name": "counts", "type": "uint32[]" }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]

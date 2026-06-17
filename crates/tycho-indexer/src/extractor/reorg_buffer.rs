@@ -196,6 +196,11 @@ where
             .count()
     }
 
+    /// Drains every buffered block in ascending order.
+    pub fn drain_all(&mut self) -> Vec<B> {
+        self.block_messages.drain(..).collect()
+    }
+
     /// Retrieves a range of blocks from the buffer.
     ///
     /// The retrieved iterator will include both the start and end block of specified range. In case
@@ -271,8 +276,8 @@ where
 
                 if !version.greater_than(&first_block) {
                     Some(CommitStatus::Committed)
-                } else if (version.greater_than(&first_block)) &
-                    (!version.greater_than(&last_block))
+                } else if (version.greater_than(&first_block))
+                    & (!version.greater_than(&last_block))
                 {
                     Some(CommitStatus::Uncommitted)
                 } else {

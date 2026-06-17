@@ -46,7 +46,10 @@ use crate::{
         protocol_extractor::{ExtractorPgGateway, ProtocolExtractor},
         ExtractionError, Extractor, ExtractorExtension, ExtractorMsg,
     },
-    pb::sf::substreams::{rpc::v2::BlockScopedData, v1::Package},
+    pb::sf::substreams::{
+        rpc::{v2::BlockScopedData, v3::Request},
+        v1::Package,
+    },
     substreams::{
         stream::{BlockResponse, SubstreamsStream},
         SubstreamsEndpoint,
@@ -465,6 +468,15 @@ impl ProtocolTypeConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+pub struct BootstrapConfig {
+    pub spkg: String,
+    pub module_name: String,
+    pub start_block: i64,
+    #[serde(default)]
+    pub substreams_params: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ExtractorConfig {
     name: String,
     chain: Chain,
@@ -483,6 +495,10 @@ pub struct ExtractorConfig {
     pub post_processor: Option<String>,
     #[serde(default)]
     pub dci_plugin: Option<DCIType>,
+    #[serde(default)]
+    pub substreams_params: HashMap<String, String>,
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapConfig>,
 }
 
 impl ExtractorConfig {
@@ -501,6 +517,8 @@ impl ExtractorConfig {
         initialized_accounts_block: u64,
         post_processor: Option<String>,
         dci_plugin: Option<DCIType>,
+        substreams_params: HashMap<String, String>,
+        bootstrap: Option<BootstrapConfig>,
     ) -> Self {
         Self {
             name,
@@ -516,7 +534,13 @@ impl ExtractorConfig {
             initialized_accounts_block,
             post_processor,
             dci_plugin,
+            substreams_params,
+            bootstrap,
         }
+    }
+
+    pub fn start_block(&self) -> i64 {
+        self.start_block
     }
 }
 
@@ -614,27 +638,42 @@ impl ExtractorBuilder {
     }
 
     async fn ensure_spkg(&self) -> Result<(), ExtractionError> {
-        // Pull spkg from s3 and copy it at `spkg_path`
-        if !Path::new(&self.config.spkg).exists() {
-            download_file_from_s3(
-                self.s3_bucket.as_ref().ok_or_else(|| {
-                    ExtractionError::Setup(format!(
-                        "Missing spkg and s3 bucket config for {}",
-                        self.config.spkg
-                    ))
-                })?,
-                &self.config.spkg,
-                Path::new(&self.config.spkg),
-            )
-            .await
-            .map_err(|e| {
-                ExtractionError::Setup(format!(
-                    "Failed to download {} from s3. {}",
-                    self.config.spkg, e
-                ))
-            })?;
+        self.ensure_spkg_path(&self.config.spkg)
+            .await?;
+        if let Some(bootstrap) = &self.config.bootstrap {
+            self.ensure_spkg_path(&bootstrap.spkg)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn ensure_spkg_path(&self, spkg_path: &str) -> Result<(), ExtractionError> {
+        if Path::new(spkg_path).exists() {
+            return Ok(());
+        }
+
+        download_file_from_s3(
+            self.s3_bucket.as_ref().ok_or_else(|| {
+                ExtractionError::Setup(format!("Missing spkg and s3 bucket config for {spkg_path}"))
+            })?,
+            spkg_path,
+            Path::new(spkg_path),
+        )
+        .await
+        .map_err(|e| {
+            ExtractionError::Setup(format!("Failed to download {spkg_path} from s3. {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    async fn read_spkg(&self, spkg_path: &str) -> Result<Package, ExtractionError> {
+        let content = std::fs::read(spkg_path)
+            .context(format_err!("read package from file '{spkg_path}'"))
+            .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
+        Package::decode(content.as_ref())
+            .context("decode command")
+            .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))
     }
 
     /// Creates a rpc DynamicContractIndexer with account extractor and tracer configured
@@ -805,6 +844,114 @@ impl ExtractorBuilder {
         Ok(self)
     }
 
+    async fn run_bootstrap_once(
+        &self,
+        extractor: Arc<dyn Extractor>,
+        endpoint: Arc<SubstreamsEndpoint>,
+        bootstrap: &BootstrapConfig,
+        extractor_id: &ExtractorIdentity,
+    ) -> Result<(), ExtractionError> {
+        let spkg = self.read_spkg(&bootstrap.spkg).await?;
+        let stop_block = bootstrap
+            .start_block
+            .checked_add(1)
+            .ok_or_else(|| ExtractionError::Setup("bootstrap stop block overflow".to_string()))?;
+        let stop_block = u64::try_from(stop_block)
+            .map_err(|_| ExtractionError::Setup("bootstrap stop block exceeds u64".to_string()))?;
+
+        let request = Request {
+            start_block_num: bootstrap.start_block,
+            start_cursor: String::new(),
+            stop_block_num: stop_block,
+            final_blocks_only: self.final_block_only,
+            package: Some(spkg),
+            params: bootstrap.substreams_params.clone(),
+            network: String::new(),
+            output_module: bootstrap.module_name.clone(),
+            production_mode: true,
+            debug_initial_store_snapshot_for_modules: vec![],
+            dev_output_modules: vec![],
+            limit_processed_blocks: u64::MAX,
+            progress_messages_interval_ms: 30 * 1000,
+            partial_blocks: false,
+            noop_mode: false,
+        };
+
+        let stream = endpoint
+            .substreams(request)
+            .await
+            .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
+        tokio::pin!(stream);
+
+        let mut got_block = false;
+        while let Some(response) = stream.next().await {
+            let response =
+                response.map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
+
+            match response.message {
+                Some(crate::pb::sf::substreams::rpc::v2::response::Message::Session(session)) => {
+                    info!(
+                        ?session.resolved_start_block,
+                        ?session.linear_handoff_block,
+                        ?session.max_parallel_workers,
+                        ?session.trace_id,
+                        extractor_id = %extractor_id,
+                        "BootstrapSessionInit"
+                    );
+                }
+                Some(crate::pb::sf::substreams::rpc::v2::response::Message::Progress(progress)) => {
+                    extractor
+                        .handle_progress(progress)
+                        .await?;
+                }
+                Some(crate::pb::sf::substreams::rpc::v2::response::Message::BlockScopedData(
+                    data,
+                )) => {
+                    got_block = true;
+                    info!(
+                        block_number = data.clock.as_ref().map(|clock| clock.number),
+                        final_block_height = data.final_block_height,
+                        cursor = %data.cursor,
+                        "BootstrapBlockReceived"
+                    );
+                    extractor
+                        .handle_tick_scoped_data(data)
+                        .await?;
+                    info!(extractor_id = %extractor_id, "BootstrapBlockProcessed");
+                    extractor.flush().await?;
+                    info!(extractor_id = %extractor_id, "BootstrapFlushCompleted");
+                    break;
+                }
+                Some(crate::pb::sf::substreams::rpc::v2::response::Message::BlockUndoSignal(
+                    signal,
+                )) => {
+                    return Err(ExtractionError::SubstreamsError(format!(
+                        "unexpected bootstrap undo signal at block {:?}",
+                        signal
+                            .last_valid_block
+                            .as_ref()
+                            .map(|block| block.number)
+                    )));
+                }
+                Some(crate::pb::sf::substreams::rpc::v2::response::Message::FatalError(error)) => {
+                    return Err(ExtractionError::SubstreamsError(format!(
+                        "bootstrap fatal error in module {}: {}",
+                        error.module, error.reason
+                    )));
+                }
+                Some(_) | None => {}
+            }
+        }
+
+        if !got_block {
+            return Err(ExtractionError::SubstreamsError(format!(
+                "bootstrap stream for {extractor_id} ended without yielding block data"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Converts this builder into a ready-to-run ExtractorRunner and its associated handle.
     ///
     /// This method completes the extractor setup process by:
@@ -840,14 +987,11 @@ impl ExtractorBuilder {
 
         self.ensure_spkg().await?;
 
-        let content = std::fs::read(&self.config.spkg)
-            .context(format_err!("read package from file '{}'", self.config.spkg))
-            .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
-        let spkg = Package::decode(content.as_ref())
-            .context("decode command")
-            .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
+        let spkg = self
+            .read_spkg(&self.config.spkg)
+            .await?;
         let endpoint = Arc::new(
-            SubstreamsEndpoint::new(&self.endpoint_url, Some(self.token))
+            SubstreamsEndpoint::new(&self.endpoint_url, Some(self.token.clone()))
                 .await
                 .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?,
         );
@@ -858,9 +1002,48 @@ impl ExtractorBuilder {
         // resume from the block after the last one committed to DB. This is safe
         // because we only commit finalized block -1 to the DB. So we know last committed block + 1
         // is finalized.
-        let last_block = extractor
+        let mut last_block = extractor
             .get_last_processed_block()
             .await;
+        if last_block.is_none() {
+            if let Some(bootstrap) = &self.config.bootstrap {
+                info!(
+                    bootstrap_block = bootstrap.start_block,
+                    extractor_id = %extractor_id,
+                    "Running bootstrap block before starting event stream"
+                );
+                tokio::select! {
+                    res = self.run_bootstrap_once(
+                        extractor.clone(),
+                        endpoint.clone(),
+                        bootstrap,
+                        &extractor_id,
+                    ) => res?,
+                    _ = tokio::signal::ctrl_c() => {
+                        warn!(
+                            extractor_id = %extractor_id,
+                            bootstrap_block = bootstrap.start_block,
+                            "Bootstrap interrupted by SIGINT before extractor startup completed"
+                        );
+                        return Err(ExtractionError::Unknown(format!(
+                            "bootstrap interrupted for {extractor_id}"
+                        )));
+                    }
+                }
+                last_block = extractor
+                    .get_last_processed_block()
+                    .await;
+            }
+        }
+
+        let configured_stream_start = if self.config.bootstrap.is_some() {
+            self.config
+                .start_block
+                .checked_add(1)
+                .ok_or_else(|| ExtractionError::Setup("stream start block overflow".to_string()))?
+        } else {
+            self.config.start_block
+        };
         // `None` means no blocks have been committed for this protocol yet (fresh
         // indexing), so fall back to the configured start block.
         let start_block = last_block
@@ -874,7 +1057,7 @@ impl ExtractorBuilder {
                     .map_err(|_| ExtractionError::Setup("block number exceeds i64".to_string()))
             })
             .transpose()?
-            .unwrap_or(self.config.start_block);
+            .unwrap_or(configured_stream_start);
 
         if let Some(block) = &last_block {
             info!(
@@ -895,6 +1078,7 @@ impl ExtractorBuilder {
             self.final_block_only,
             extractor_id.to_string(),
             self.partial_blocks,
+            self.config.substreams_params,
         );
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
@@ -1243,6 +1427,10 @@ dci_plugin:
                 spkg: "./test/spkg/substreams-ethereum-quickstart-v1.0.0.spkg".to_owned(),
                 module_name: "test_module".to_owned(),
                 start_block: 42,
+                substreams_params: HashMap::from([(
+                    "test_module".to_owned(),
+                    "bootstrap_block=42&pool=0x1234".to_owned(),
+                )]),
                 ..Default::default()
             },
             &format!("http://{addr}"),
@@ -1260,6 +1448,10 @@ dci_plugin:
         assert_eq!(requests.len(), 1, "expected exactly one gRPC request");
         assert_eq!(requests[0].start_block_num, 42);
         assert!(requests[0].start_cursor.is_empty(), "fresh start should have no cursor");
+        assert_eq!(
+            requests[0].params.get("test_module"),
+            Some(&"bootstrap_block=42&pool=0x1234".to_owned())
+        );
     }
 
     #[tokio::test]

@@ -123,6 +123,9 @@ pub trait Extractor: Send + Sync {
         clock: Option<Clock>,
     ) -> Result<Option<ExtractorMsg>, ExtractionError>;
 
+    /// Forces all buffered finalized blocks to be committed to storage.
+    async fn flush(&self) -> Result<(), ExtractionError>;
+
     /// Processes a chain reorg signal.
     async fn handle_revert(
         &self,

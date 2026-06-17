@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -49,6 +50,7 @@ impl SubstreamsStream {
         final_blocks_only: bool,
         extractor_id: String,
         partial_blocks: bool,
+        params: HashMap<String, String>,
     ) -> Self {
         SubstreamsStream {
             stream: Box::pin(stream_blocks(
@@ -61,6 +63,7 @@ impl SubstreamsStream {
                 final_blocks_only,
                 extractor_id,
                 partial_blocks,
+                params,
             )),
         }
     }
@@ -103,6 +106,7 @@ fn stream_blocks(
     final_blocks_only: bool,
     extractor_id: String,
     partial_blocks: bool,
+    params: HashMap<String, String>,
 ) -> impl Stream<Item = Result<BlockResponse, Error>> {
     let mut latest_cursor = cursor.unwrap_or_default();
     let mut latest_block = start_block_num as u64;
@@ -121,7 +125,7 @@ fn stream_blocks(
                 stop_block_num,
                 final_blocks_only,
                 package: package.clone(),
-                params: Default::default(),
+                params: params.clone(),
                 network: String::new(), // TODO: check if we need to set the network?
                 output_module: output_module_name.clone(),
                 // There is usually no good reason for you to consume the stream development mode (so switching `true`
@@ -255,38 +259,6 @@ async fn process_substreams_response(
             BlockProcessedResult::BlockUndoSignal(block_undo_signal)
         }
         Some(Message::Progress(progress)) => {
-            // The `ModulesProgress` messages goal is to report active parallel processing happening
-            // either to fill up backward (relative to your request's start block) some missing
-            // state or pre-process forward blocks (again relative).
-            //
-            // You could log that in trace or accumulate to push as metrics. Here a snippet of code
-            // that prints progress to standard out. If your `BlockScopedData` messages seems to
-            // never arrive in production mode, it's because progresses is happening but
-            // not yet for the output module you requested.
-            //
-            // let progresses: Vec<_> = progress
-            //     .modules
-            //     .iter()
-            //     .filter_map(|module| {
-            //         use crate::pb::sf::substreams::rpc::v2::module_progress::Type;
-
-            //         if let Type::ProcessedRanges(range) = module.r#type.as_ref().unwrap() {
-            //             Some(format!(
-            //                 "{} @ [{}]",
-            //                 module.name,
-            //                 range
-            //                     .processed_ranges
-            //                     .iter()
-            //                     .map(|x| x.to_string())
-            //                     .collect::<Vec<_>>()
-            //                     .join(", ")
-            //             ))
-            //         } else {
-            //             None
-            //         }
-            //     })
-            //     .collect();
-
             trace!("Progress {:?}", progress);
 
             BlockProcessedResult::Skip()

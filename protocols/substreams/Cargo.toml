@@ -37,3 +37,7 @@ resolver = "2"
 lto = true
 opt-level = 's'
 strip = "debuginfo"
+
+[patch."https://github.com/propeller-heads/tycho-protocol-sdk.git"]
+substreams-helper = { path = "crates/substreams-helper" }
+tycho-substreams = { path = "crates/tycho-substreams" }

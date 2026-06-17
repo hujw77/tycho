@@ -731,8 +731,8 @@ where
                 .insert_block(BlockUpdateWithCursor::new(msg.clone(), cursor.clone()))
                 .map_err(ExtractionError::Storage)?;
 
-            if reorg_buffer.count_blocks_before(final_block_height) >=
-                self.gateway.commit_batch_size
+            if reorg_buffer.count_blocks_before(final_block_height)
+                >= self.gateway.commit_batch_size
             {
                 reorg_buffer
                     .drain_blocks_until(final_block_height)
@@ -853,6 +853,59 @@ where
         }
         Ok(Some(Arc::new(changes)))
     }
+
+    async fn flush_buffered_blocks(&self) -> Result<(), ExtractionError> {
+        let blocks_to_commit = {
+            let mut reorg_buffer = self.reorg_buffer.lock().await;
+            reorg_buffer.drain_all()
+        };
+
+        if blocks_to_commit.is_empty() {
+            return Ok(());
+        }
+
+        let mut commit_handle_guard = self.gateway.commit_handle.lock().await;
+        let gateway = self.gateway.inner.clone();
+        let committed_block_height = self
+            .gateway
+            .committed_block_height
+            .clone();
+
+        if let Some(db_commit_handle_to_join) = commit_handle_guard.take() {
+            let result = db_commit_handle_to_join
+                .instrument(info_span!("await_previous_commit"))
+                .await;
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(storage_err)) => return Err(storage_err),
+                Err(join_err) => {
+                    return Err(ExtractionError::Storage(StorageError::Unexpected(format!(
+                        "Failed to join database commit task: {join_err}"
+                    ))));
+                }
+            }
+        }
+
+        let last_block_height = blocks_to_commit
+            .last()
+            .map(|block| block.block_update.block.number)
+            .expect("non-empty blocks_to_commit must have a last block");
+
+        let mut it = blocks_to_commit.iter().peekable();
+        while let Some(block) = it.next() {
+            let force_db_commit = it.peek().is_none();
+            gateway
+                .advance(block.block_update(), block.cursor(), force_db_commit)
+                .await
+                .map_err(ExtractionError::Storage)?;
+        }
+
+        let mut committed_height_guard = committed_block_height.lock().await;
+        *committed_height_guard = Some(last_block_height);
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -951,8 +1004,8 @@ where
             };
 
             if let Some(last_processed_block) = self.get_last_processed_block().await {
-                if msg.block.ts.and_utc().timestamp() ==
-                    last_processed_block
+                if msg.block.ts.and_utc().timestamp()
+                    == last_processed_block
                         .ts
                         .and_utc()
                         .timestamp()
@@ -1056,6 +1109,10 @@ where
                     arc_msg
                 })
             })
+    }
+
+    async fn flush(&self) -> Result<(), ExtractionError> {
+        self.flush_buffered_blocks().await
     }
 
     #[instrument(
@@ -1169,8 +1226,8 @@ where
                                     range of blocks, we only want to remove it (so undo its creation).
                                     As here we go through the reverted state from the oldest to the newest, we just insert the first time we meet a component and ignore it if we meet it again after.
                                     */
-                                    if !reverted_deletions.contains_key(id) &&
-                                        !reverted_creations.contains_key(id)
+                                    if !reverted_deletions.contains_key(id)
+                                        && !reverted_creations.contains_key(id)
                                     {
                                         match new_component.change {
                                             ChangeType::Update => {}
@@ -1588,7 +1645,7 @@ where
 
     #[instrument(skip_all)]
     async fn handle_progress(&self, _inp: ModulesProgress) -> Result<(), ExtractionError> {
-        todo!()
+        Ok(())
     }
 }
 pub struct ExtractorPgGateway {

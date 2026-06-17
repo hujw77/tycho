@@ -1,0 +1,16 @@
+extractors:
+  uniswap_v3:
+    name: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "uniswap_v3_pool"
+        financial_type: "Swap"
+    spkg: "protocols/substreams/ethereum-uniswap-v3-logs-only/uniswap-v3-v0.1.2.spkg"
+    module_name: "map_protocol_changes"
+    bootstrap:
+      spkg: "protocols/substreams/ethereum-uniswap-v3-logs-only/uniswap-v3-bootstrap-v0.1.0.spkg"
+      module_name: "map_protocol_changes_bootstrap"
+      substreams_params:
+        map_bootstrap_pools_created: "@config/uniswap_v3_bootstrap.yaml"

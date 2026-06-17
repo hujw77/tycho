@@ -1,0 +1,51 @@
+[
+  {
+    "inputs": [
+      { "internalType": "address", "name": "pool", "type": "address" },
+      { "internalType": "int256", "name": "protocol", "type": "int256" },
+      { "internalType": "uint256", "name": "n", "type": "uint256" },
+      { "internalType": "int16", "name": "wordLimit", "type": "int16" }
+    ],
+    "name": "tryFetchPairInfo",
+    "outputs": [
+      {
+        "components": [
+          { "internalType": "address", "name": "pool", "type": "address" },
+          { "internalType": "address", "name": "token0", "type": "address" },
+          { "internalType": "address", "name": "token1", "type": "address" },
+          { "internalType": "address", "name": "factory", "type": "address" },
+          { "internalType": "uint128", "name": "liquidity", "type": "uint128" },
+          { "internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160" },
+          {
+            "components": [
+              { "internalType": "int24", "name": "tick", "type": "int24" },
+              { "internalType": "int128", "name": "liquidityNet", "type": "int128" }
+            ],
+            "internalType": "struct UniswapV3Executor.TickInfo[]",
+            "name": "leftTickInfos",
+            "type": "tuple[]"
+          },
+          {
+            "components": [
+              { "internalType": "int24", "name": "tick", "type": "int24" },
+              { "internalType": "int128", "name": "liquidityNet", "type": "int128" }
+            ],
+            "internalType": "struct UniswapV3Executor.TickInfo[]",
+            "name": "rightTickInfos",
+            "type": "tuple[]"
+          },
+          { "internalType": "int24", "name": "tick", "type": "int24" },
+          { "internalType": "uint24", "name": "fee", "type": "uint24" },
+          { "internalType": "int24", "name": "tickSpacing", "type": "int24" },
+          { "internalType": "uint256", "name": "token0Balance", "type": "uint256" },
+          { "internalType": "uint256", "name": "token1Balance", "type": "uint256" }
+        ],
+        "internalType": "struct UniswapV3Executor.PairInfo",
+        "name": "pairInfo",
+        "type": "tuple"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]
