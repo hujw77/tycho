@@ -187,6 +187,18 @@ where
         None
     }
 
+    /// Returns the oldest block currently stored in the buffer.
+    pub fn get_oldest_block(&self) -> Option<tycho_common::models::blockchain::Block> {
+        self.block_messages
+            .front()
+            .map(BlockScoped::block)
+    }
+
+    /// Returns the number of buffered blocks.
+    pub fn len(&self) -> usize {
+        self.block_messages.len()
+    }
+
     /// Returns the number of blocks in the buffer with a block number less than the specified
     /// target block number. Assumes blocks are stored in ascending order.
     pub fn count_blocks_before(&self, target_block: u64) -> usize {
