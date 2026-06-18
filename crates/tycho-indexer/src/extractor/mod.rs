@@ -41,6 +41,7 @@ pub mod protocol_extractor;
 pub mod reorg_buffer;
 pub mod runner;
 pub mod token_analysis_cron;
+pub mod uniswap_v3_bootstrap;
 mod u256_num;
 
 #[derive(Error, Debug, PartialEq)]
@@ -112,6 +113,16 @@ pub trait Extractor: Send + Sync {
     async fn handle_tick_scoped_data(
         &self,
         inp: BlockScopedData,
+    ) -> Result<Option<ExtractorMsg>, ExtractionError>;
+
+    /// Processes a fully materialized block update produced outside the Substreams stream.
+    ///
+    /// This is used for local bootstrap flows that want to reuse the normal extractor, reorg
+    /// buffer, aggregation, and persistence pipeline without fabricating a `BlockScopedData`.
+    async fn handle_block_changes(
+        &self,
+        changes: BlockChanges,
+        cursor: String,
     ) -> Result<Option<ExtractorMsg>, ExtractionError>;
 
     /// Drains the partial block buffer and processes the accumulated block as a full block.

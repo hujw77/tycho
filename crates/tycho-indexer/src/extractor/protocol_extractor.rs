@@ -206,6 +206,59 @@ where
         state.first_message_processed = true;
     }
 
+    async fn prepare_block_changes(
+        &self,
+        msg: BlockChanges,
+    ) -> Result<BlockChanges, ExtractionError> {
+        let msg = if let Some(post_process_f) = self.post_processor {
+            post_process_f(msg)
+        } else {
+            msg
+        };
+
+        let mut msg = msg;
+
+        if let Some(last_processed_block) = self.get_last_processed_block().await {
+            if msg.block.ts.and_utc().timestamp() == last_processed_block.ts.and_utc().timestamp() {
+                // Blockchains with fast block times (e.g., Arbitrum) may produce blocks with
+                // identical timestamps (measured in seconds). To ensure accurate ordering, we
+                // adjust each block's timestamp by adding a microsecond offset
+                // based on the number of blocks with the same timestamp encountered
+                // so far.
+                // Blocks have a granularity of 1 second, so by adding 1 microsecond to the
+                // timestamp of each block with the same timestamp, we ensure ordering
+                // and prevent duplicate timestamps from being processed.
+                msg.block.ts = last_processed_block.ts + Duration::microseconds(1);
+                trace!(
+                    "Block with identical timestamp detected; adjusted timestamp from {:?} to {:?}",
+                    last_processed_block.ts, msg.block.ts
+                );
+            }
+        }
+
+        if let Some(dci_plugin) = &self.dci_plugin {
+            dci_plugin
+                .lock()
+                .await
+                .process_block_update(&mut msg)
+                .await?;
+        }
+
+        msg.new_tokens = self
+            .construct_currency_tokens(&msg)
+            .await?;
+        self.protocol_cache
+            .add_tokens(msg.new_tokens.values().cloned())
+            .await?;
+        self.protocol_cache
+            .add_components(msg.protocol_components())
+            .await?;
+
+        trace!(?msg, "Processing message");
+
+        Ok(msg)
+    }
+
     /// Merges a partial block into the buffer, or initializes the buffer if empty.
     async fn buffer_partial_block(&self, msg: &BlockChanges) -> Result<(), ExtractionError> {
         let mut buffer_guard = self.partial_block_buffer.lock().await;
@@ -609,10 +662,15 @@ where
         &self,
         msg: &BlockChanges,
     ) -> Result<HashMap<Address, Token>, StorageError> {
-        let new_token_addresses = msg
+        let raw_token_addresses = msg
             .protocol_components()
             .into_iter()
             .flat_map(|pc| pc.tokens.clone().into_iter())
+            .collect::<Vec<_>>();
+        let mut seen_tokens = HashSet::with_capacity(raw_token_addresses.len());
+        let new_token_addresses = raw_token_addresses
+            .into_iter()
+            .filter(|address| seen_tokens.insert(address.clone()))
             .collect::<Vec<_>>();
 
         // Separate between known and unkown tokens
@@ -963,8 +1021,7 @@ where
                     "Missing map_output in block scoped data's output".into(),
                 )
             })?;
-        let msg = {
-            let msg = if data.type_url.ends_with("BlockChanges") {
+        let msg = if data.type_url.ends_with("BlockChanges") {
                 let raw_msg = tycho_substreams::BlockChanges::decode(data.value.as_slice())?;
                 trace!(?raw_msg, "Received BlockChanges message");
                 BlockChanges::try_from_message((
@@ -976,79 +1033,27 @@ where
                     inp.final_block_height,
                     inp.partial_index,
                 ))
-            } else {
-                return Err(ExtractionError::DecodeError(format!(
-                    "Unknown message type: {}",
-                    data.type_url
-                )));
-            };
-
-            let msg = match msg {
-                Ok(changes) => {
-                    tracing::Span::current().record("block_number", changes.block.number);
-                    tracing::Span::current().record("partial_block_index", inp.partial_index);
-                    tracing::Span::current().record("final_block_height", inp.final_block_height);
-                    changes
-                }
-                Err(ExtractionError::Empty) => {
-                    self.update_cursor(inp.cursor).await;
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            };
-
-            let mut msg = if let Some(post_process_f) = self.post_processor {
-                post_process_f(msg)
-            } else {
-                msg
-            };
-
-            if let Some(last_processed_block) = self.get_last_processed_block().await {
-                if msg.block.ts.and_utc().timestamp()
-                    == last_processed_block
-                        .ts
-                        .and_utc()
-                        .timestamp()
-                {
-                    // Blockchains with fast block times (e.g., Arbitrum) may produce blocks with
-                    // identical timestamps (measured in seconds). To ensure accurate ordering, we
-                    // adjust each block's timestamp by adding a microsecond offset
-                    // based on the number of blocks with the same timestamp encountered
-                    // so far.
-                    // Blocks have a granularity of 1 second, so by adding 1 microsecond to the
-                    // timestamp of each block with the same timestamp, we ensure ordering
-                    // and prevent duplicate timestamps from being processed.
-                    msg.block.ts = last_processed_block.ts + Duration::microseconds(1);
-                    trace!(
-                        "Block with identical timestamp detected; adjusted timestamp from {:?} to {:?}",
-                        last_processed_block.ts, msg.block.ts
-                    );
-                }
-            }
-
-            // Send message to DCI plugin
-            if let Some(dci_plugin) = &self.dci_plugin {
-                dci_plugin
-                    .lock()
-                    .await
-                    .process_block_update(&mut msg)
-                    .await?;
-            }
-
-            msg.new_tokens = self
-                .construct_currency_tokens(&msg)
-                .await?;
-            self.protocol_cache
-                .add_tokens(msg.new_tokens.values().cloned())
-                .await?;
-            self.protocol_cache
-                .add_components(msg.protocol_components())
-                .await?;
-
-            trace!(?msg, "Processing message");
-
-            msg
+        } else {
+            return Err(ExtractionError::DecodeError(format!(
+                "Unknown message type: {}",
+                data.type_url
+            )));
         };
+
+        let msg = match msg {
+            Ok(changes) => {
+                tracing::Span::current().record("block_number", changes.block.number);
+                tracing::Span::current().record("partial_block_index", inp.partial_index);
+                tracing::Span::current().record("final_block_height", inp.final_block_height);
+                changes
+            }
+            Err(ExtractionError::Empty) => {
+                self.update_cursor(inp.cursor).await;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let msg = self.prepare_block_changes(msg).await?;
 
         // Partial blocks are buffered and emitted immediately but skip reorg buffer and DB commit.
         // Those happen when the full block signal arrives.
@@ -1081,6 +1086,17 @@ where
         return self
             .process_full_block_message(msg, inp.cursor, inp.final_block_height)
             .await;
+    }
+
+    async fn handle_block_changes(
+        &self,
+        changes: BlockChanges,
+        cursor: String,
+    ) -> Result<Option<ExtractorMsg>, ExtractionError> {
+        let finalized_block_height = changes.finalized_block_height;
+        let msg = self.prepare_block_changes(changes).await?;
+        self.process_full_block_message(msg, cursor, finalized_block_height)
+            .await
     }
 
     async fn collect_and_process_full_block(
@@ -2564,6 +2580,9 @@ mod test {
                             "0x0000000000000000000000000000000000000003"
                                 .parse()
                                 .unwrap(),
+                            "0x0000000000000000000000000000000000000003"
+                                .parse()
+                                .unwrap(),
                         ],
                         change: ChangeType::Creation,
                         ..Default::default()
@@ -2645,7 +2664,11 @@ mod test {
         let ret = vec![t3.clone()];
         preprocessor
             .expect_get_tokens()
-            .return_once(|_, balance_owner_store, _| {
+            .return_once(|addresses, balance_owner_store, _| {
+                assert_eq!(
+                    addresses,
+                    vec![Bytes::from_str("0000000000000000000000000000000000000003").unwrap()]
+                );
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         assert_eq!(

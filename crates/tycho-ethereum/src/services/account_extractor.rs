@@ -43,7 +43,7 @@ impl EVMAccountExtractor {
 
         let block = self
             .rpc
-            .eth_get_block_by_number(block_id)
+            .get_block_by_number(block_id)
             .await?;
 
         Ok(Block {

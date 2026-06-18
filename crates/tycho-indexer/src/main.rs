@@ -107,10 +107,8 @@ struct RawExtractorConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawBootstrapConfig {
-    spkg: String,
-    module_name: String,
-    #[serde(default)]
-    substreams_params: HashMap<String, String>,
+    strategy: tycho_indexer::extractor::runner::BootstrapStrategy,
+    params: String,
     #[serde(skip)]
     start_block: Option<i64>,
 }
@@ -148,16 +146,13 @@ impl RawExtractorConfigs {
             )?;
 
             if let Some(bootstrap) = &mut extractor.bootstrap {
-                let mut bootstrap_start_block = None;
-                resolve_substreams_params_map(
+                bootstrap.start_block = Some(resolve_bootstrap_params(
                     extractor_name,
-                    &mut bootstrap_start_block,
-                    &mut bootstrap.substreams_params,
+                    &mut bootstrap.params,
                     base_dir,
-                )?;
-                bootstrap.start_block = bootstrap_start_block;
+                )?);
 
-                if let Some(start_block) = bootstrap_start_block {
+                if let Some(start_block) = bootstrap.start_block {
                     if let Some(existing_start_block) = resolved_start_block {
                         if existing_start_block != start_block {
                             return Err(format!(
@@ -210,10 +205,9 @@ impl TryFrom<RawExtractorConfigs> for ExtractorConfigs {
                             "bootstrap config start_block must be resolved before conversion",
                         );
                         tycho_indexer::extractor::runner::BootstrapConfig {
-                            spkg: bootstrap.spkg,
-                            module_name: bootstrap.module_name,
+                            strategy: bootstrap.strategy,
                             start_block,
-                            substreams_params: bootstrap.substreams_params,
+                            params: bootstrap.params,
                         }
                     }),
                 ),
@@ -295,6 +289,43 @@ fn resolve_substreams_params_map(
     Ok(())
 }
 
+fn resolve_bootstrap_params(
+    extractor_name: &str,
+    params_value: &mut String,
+    base_dir: &Path,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let Some(path) = params_value.strip_prefix('@') else {
+        return extract_bootstrap_block_from_query(params_value).map_err(Into::into);
+    };
+
+    let params_path = base_dir.join(path);
+    let params = fs::read_to_string(&params_path).map_err(|err| {
+        format!(
+            "failed to read bootstrap config file for extractor `{extractor_name}` at `{}`: \
+             {err}",
+            params_path.display()
+        )
+    })?;
+    let (start_block, resolved_params) = parse_substreams_params_yaml(&params).map_err(|err| {
+        format!(
+            "failed to parse bootstrap config file for extractor `{extractor_name}` at `{}`: \
+             {err}",
+            params_path.display()
+        )
+    })?;
+
+    let start_block = start_block.ok_or_else(|| {
+        format!(
+            "bootstrap config file for extractor `{extractor_name}` at `{}` is missing \
+             `start_block` or `params.bootstrap_block`",
+            params_path.display()
+        )
+    })?;
+
+    *params_value = resolved_params;
+    Ok(start_block)
+}
+
 fn normalize_substreams_params(
     mut parsed: SubstreamsParamsFile,
 ) -> Result<(Option<i64>, BTreeMap<String, Value>), Box<dyn std::error::Error>> {
@@ -370,6 +401,20 @@ fn parse_i64_yaml_value(value: &Value) -> Result<i64, Box<dyn std::error::Error>
         | Value::Mapping(_)
         | Value::Tagged(_) => Err("block parameters must be scalar integers".into()),
     }
+}
+
+fn extract_bootstrap_block_from_query(params: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    for pair in params.split('&').filter(|part| !part.is_empty()) {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(format!("invalid bootstrap param `{pair}`").into());
+        };
+
+        if key == "bootstrap_block" {
+            return Ok(value.parse()?);
+        }
+    }
+
+    Err("bootstrap params must include `bootstrap_block`".into())
 }
 
 type ExtractionTasks = Vec<JoinHandle<Result<(), ExtractionError>>>;
@@ -457,10 +502,8 @@ extractors:
     spkg: "stream.spkg"
     module_name: "map_protocol_changes"
     bootstrap:
-      spkg: "bootstrap.spkg"
-      module_name: "map_protocol_changes_bootstrap"
-      substreams_params:
-        map_bootstrap_pools_created: "@config/uniswap_v3_bootstrap.yaml"
+      strategy: "uniswap_v3_rpc"
+      params: "@config/uniswap_v3_bootstrap.yaml"
 "#,
         )
         .expect("write extractor config");
@@ -485,10 +528,15 @@ extractors:
                 .extractors
                 .get("uniswap_v3")
                 .and_then(|extractor| extractor.bootstrap.as_ref())
-                .and_then(|bootstrap| bootstrap
-                    .substreams_params
-                    .get("map_bootstrap_pools_created"))
-                .map(String::as_str),
+                .map(|bootstrap| bootstrap.strategy.clone()),
+            Some(tycho_indexer::extractor::runner::BootstrapStrategy::UniswapV3Rpc)
+        );
+        assert_eq!(
+            config
+                .extractors
+                .get("uniswap_v3")
+                .and_then(|extractor| extractor.bootstrap.as_ref())
+                .map(|bootstrap| bootstrap.params.as_str()),
             Some("bootstrap_block=1&pools=0xabc")
         );
 

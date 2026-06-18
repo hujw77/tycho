@@ -22,10 +22,8 @@ extractors:
     spkg: "protocols/substreams/ethereum-uniswap-v3-logs-only/uniswap-v3-v0.1.2.spkg"
     module_name: "map_protocol_changes"
     bootstrap:
-      spkg: "protocols/substreams/ethereum-uniswap-v3-logs-only/uniswap-v3-bootstrap-v0.1.0.spkg"
-      module_name: "map_protocol_changes_bootstrap"
-      substreams_params:
-        map_bootstrap_pools_created: "@config/uniswap_v3_bootstrap.yaml"
+      strategy: "uniswap_v3_rpc"
+      params: "@config/uniswap_v3_bootstrap.yaml"
 
   sushiswap_v2:
     name: "sushiswap_v2"
