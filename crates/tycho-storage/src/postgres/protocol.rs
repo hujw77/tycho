@@ -25,12 +25,58 @@ use tycho_common::{
 use super::{
     maybe_lookup_block_ts, maybe_lookup_version_ts, orm, schema, storage_error_from_diesel,
     truncate_to_byte_limit,
-    versioning::{apply_partitioned_versioning, VersioningEntry},
+    versioning::{apply_partitioned_versioning, PartitionedVersionedRow, VersioningEntry},
     PostgresError, PostgresGateway, WithOrdinal, WithTxHash, MAX_TS, MAX_VERSION_TS,
 };
 
 // Private methods
 impl PostgresGateway {
+    #[instrument(level = Level::DEBUG, skip(self, keys, conn))]
+    pub async fn get_protocol_state_values(
+        &self,
+        chain: &Chain,
+        keys: &[(&str, &str)],
+        conn: &mut AsyncPgConnection,
+    ) -> Result<HashMap<ComponentId, HashMap<String, Bytes>>, StorageError> {
+        let chain_db_id = self.get_chain_id(chain)?;
+        let component_ids = orm::ProtocolComponent::ids_by_external_ids(
+            keys.iter().map(|(component_id, _)| *component_id),
+            chain_db_id,
+            conn,
+        )
+        .await
+        .map_err(PostgresError::from)?;
+
+        let component_id_map: HashMap<String, i64> = component_ids
+            .into_iter()
+            .map(|(id, external_id)| (external_id, id))
+            .collect();
+        let db_id_to_component_id: HashMap<i64, String> = component_id_map
+            .iter()
+            .map(|(external_id, db_id)| (*db_id, external_id.clone()))
+            .collect();
+
+        let db_keys = keys
+            .iter()
+            .filter_map(|(component_id, attribute_name)| {
+                component_id_map
+                    .get(*component_id)
+                    .map(|db_id| (*db_id, (*attribute_name).to_string()))
+            })
+            .collect::<Vec<_>>();
+
+        let rows = orm::NewProtocolState::latest_versions_by_ids(db_keys, conn).await?;
+
+        Ok(rows.into_iter().fold(HashMap::new(), |mut acc, row| {
+            if let Some(component_id) = db_id_to_component_id.get(&row.protocol_component_id) {
+                acc.entry(component_id.clone())
+                    .or_default()
+                    .insert(row.attribute_name, row.attribute_value);
+            }
+            acc
+        }))
+    }
+
     /// # Decoding ProtocolStates from database results.
     ///
     /// This function takes as input the database result for querying protocol states and their

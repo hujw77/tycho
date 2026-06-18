@@ -1,6 +1,18 @@
 // @generated
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Block {
+    #[prost(bytes="vec", tag="1")]
+    pub hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes="vec", tag="2")]
+    pub parent_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag="3")]
+    pub number: u64,
+    #[prost(uint64, tag="4")]
+    pub ts: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Pool {
     #[prost(bytes="vec", tag="1")]
     pub address: ::prost::alloc::vec::Vec<u8>,
@@ -83,6 +95,8 @@ pub struct LiquidityChanges {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Events {
+    #[prost(message, optional, tag="1")]
+    pub block: ::core::option::Option<Block>,
     #[prost(message, repeated, tag="3")]
     pub pool_events: ::prost::alloc::vec::Vec<events::PoolEvent>,
 }
@@ -101,7 +115,7 @@ pub mod events {
         pub token1: ::prost::alloc::string::String,
         #[prost(message, optional, tag="105")]
         pub transaction: ::core::option::Option<super::Transaction>,
-        #[prost(oneof="pool_event::Type", tags="1, 2, 3, 4, 5, 6, 7, 8")]
+        #[prost(oneof="pool_event::Type", tags="1, 2, 3, 4, 5, 6, 7, 8, 9")]
         pub r#type: ::core::option::Option<pool_event::Type>,
     }
     /// Nested message and enum types in `PoolEvent`.
@@ -248,6 +262,14 @@ pub mod events {
             pub amount_1: ::prost::alloc::string::String,
         }
         #[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct PoolCreated {
+            #[prost(uint64, tag="1")]
+            pub fee: u64,
+            #[prost(int32, tag="2")]
+            pub tick_spacing: i32,
+        }
+        #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Oneof)]
         pub enum Type {
             #[prost(message, tag="1")]
@@ -266,6 +288,8 @@ pub mod events {
             SetFeeProtocol(SetFeeProtocol),
             #[prost(message, tag="8")]
             CollectProtocol(CollectProtocol),
+            #[prost(message, tag="9")]
+            PoolCreated(PoolCreated),
         }
     }
 }

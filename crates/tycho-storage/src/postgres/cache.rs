@@ -742,6 +742,21 @@ impl CachedGateway {
 
         Ok((accounts_delta, protocol_delta, balance_deltas))
     }
+
+    #[instrument(skip_all)]
+    pub async fn get_protocol_state_values(
+        &self,
+        chain: &Chain,
+        keys: &[(&str, &str)],
+    ) -> Result<HashMap<ComponentId, HashMap<String, Bytes>>, StorageError> {
+        let mut conn =
+            self.pool.get().await.map_err(|e| {
+                StorageError::Unexpected(format!("Failed to retrieve connection: {e}"))
+            })?;
+        self.state_gateway
+            .get_protocol_state_values(chain, keys, &mut conn)
+            .await
+    }
 }
 
 #[async_trait]

@@ -2,6 +2,13 @@ syntax = "proto3";
 
 package uniswap.v3;
 
+message Block {
+  bytes hash = 1;
+  bytes parent_hash = 2;
+  uint64 number = 3;
+  uint64 ts = 4;
+}
+
 message Pool {
   bytes address = 1;
   bytes token0 = 2;
@@ -64,6 +71,7 @@ enum LiquidityChangeType {
 }
 
 message Events {
+  Block block = 1;
   repeated PoolEvent pool_events = 3;
 
   message PoolEvent {
@@ -76,6 +84,7 @@ message Events {
       Flash flash = 6;
       SetFeeProtocol set_fee_protocol = 7;
       CollectProtocol collect_protocol = 8;
+      PoolCreated pool_created = 9;
     }
     uint64 log_ordinal = 100;
     string pool_address = 102;
@@ -172,6 +181,11 @@ message Events {
       string amount_0 = 3;
       // Unsigned
       string amount_1 = 4;
+    }
+
+    message PoolCreated {
+      uint64 fee = 1;
+      int32 tick_spacing = 2;
     }
   }
 }

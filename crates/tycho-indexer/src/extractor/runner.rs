@@ -912,6 +912,7 @@ impl ExtractorBuilder {
                 .await?
             }
         };
+        let bootstrap_block_hash = changes.block.hash.clone();
 
         extractor
             .handle_block_changes(
@@ -920,6 +921,9 @@ impl ExtractorBuilder {
             )
             .await?;
         extractor.flush().await?;
+        extractor
+            .mark_bootstrap_completed(parsed_params.bootstrap_block, bootstrap_block_hash)
+            .await?;
 
         info!(
             extractor_id = %extractor_id,
@@ -985,31 +989,49 @@ impl ExtractorBuilder {
             .await;
         if last_block.is_none() {
             if let Some(bootstrap) = &self.config.bootstrap {
-                info!(
-                    bootstrap_block = bootstrap.start_block,
-                    extractor_id = %extractor_id,
-                    "Running bootstrap block before starting event stream"
-                );
-                tokio::select! {
-                    res = self.run_bootstrap_once(
-                        extractor.clone(),
-                        bootstrap,
-                        &extractor_id,
-                    ) => res?,
-                    _ = tokio::signal::ctrl_c() => {
-                        warn!(
-                            extractor_id = %extractor_id,
-                            bootstrap_block = bootstrap.start_block,
-                            "Bootstrap interrupted by SIGINT before extractor startup completed"
-                        );
-                        return Err(ExtractionError::Unknown(format!(
-                            "bootstrap interrupted for {extractor_id}"
-                        )));
+                let completed_bootstrap_block = extractor
+                    .get_completed_bootstrap_block()
+                    .await?;
+                let configured_bootstrap_block = u64::try_from(bootstrap.start_block).map_err(|_| {
+                    ExtractionError::Setup(format!(
+                        "bootstrap start_block must be non-negative for extractor `{}`",
+                        self.config.name
+                    ))
+                })?;
+
+                if completed_bootstrap_block == Some(configured_bootstrap_block) {
+                    info!(
+                        extractor_id = %extractor_id,
+                        bootstrap_block = bootstrap.start_block,
+                        "Bootstrap already completed in storage; skipping bootstrap run"
+                    );
+                } else {
+                    info!(
+                        bootstrap_block = bootstrap.start_block,
+                        extractor_id = %extractor_id,
+                        "Running bootstrap block before starting event stream"
+                    );
+                    tokio::select! {
+                        res = self.run_bootstrap_once(
+                            extractor.clone(),
+                            bootstrap,
+                            &extractor_id,
+                        ) => res?,
+                        _ = tokio::signal::ctrl_c() => {
+                            warn!(
+                                extractor_id = %extractor_id,
+                                bootstrap_block = bootstrap.start_block,
+                                "Bootstrap interrupted by SIGINT before extractor startup completed"
+                            );
+                            return Err(ExtractionError::Unknown(format!(
+                                "bootstrap interrupted for {extractor_id}"
+                            )));
+                        }
                     }
+                    last_block = extractor
+                        .get_last_processed_block()
+                        .await;
                 }
-                last_block = extractor
-                    .get_last_processed_block()
-                    .await;
             }
         }
 
@@ -1486,6 +1508,64 @@ dci_plugin:
         assert_eq!(
             requests[0].start_block_num, 1001,
             "should use last_committed + 1, not config's start_block"
+        );
+        assert!(requests[0].start_cursor.is_empty(), "fresh start should have no cursor");
+    }
+
+    #[tokio::test]
+    async fn test_skip_bootstrap_when_completed_state_exists() {
+        use crate::substreams::mock::start_mock_substreams;
+
+        let (captured, addr) = start_mock_substreams().await;
+
+        let mut mock_extractor = MockExtractor::new();
+        mock_extractor
+            .expect_get_last_processed_block()
+            .returning(|| None);
+        mock_extractor
+            .expect_get_completed_bootstrap_block()
+            .returning(|| Ok(Some(42)));
+        mock_extractor
+            .expect_get_id()
+            .returning(ExtractorIdentity::default);
+
+        let extractor = Arc::new(mock_extractor);
+        let builder = ExtractorBuilder::new(
+            &ExtractorConfig {
+                name: "uniswap_v3".to_owned(),
+                implementation_type: ImplementationType::Custom,
+                protocol_types: vec![ProtocolTypeConfig {
+                    name: "uniswap_v3_pool".to_owned(),
+                    financial_type: FinancialType::Swap,
+                }],
+                spkg: "./test/spkg/substreams-ethereum-quickstart-v1.0.0.spkg".to_owned(),
+                module_name: "map_protocol_changes".to_owned(),
+                start_block: 42,
+                bootstrap: Some(BootstrapConfig {
+                    strategy: BootstrapStrategy::UniswapV3Rpc,
+                    start_block: 42,
+                    params:
+                        "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
+                            .to_owned(),
+                }),
+                ..Default::default()
+            },
+            &format!("http://{addr}"),
+            None,
+            "test_token",
+        )
+        .token("test_token")
+        .set_extractor(extractor);
+
+        let (runner, _handle) = builder.into_runner().await.unwrap();
+        let handle = runner.run();
+        handle.await.unwrap().unwrap();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly one gRPC request");
+        assert_eq!(
+            requests[0].start_block_num, 43,
+            "should start from bootstrap block + 1 when bootstrap is already completed"
         );
         assert!(requests[0].start_cursor.is_empty(), "fresh start should have no cursor");
     }

@@ -41,8 +41,8 @@ modules:
     kind: map
     initialBlock: 12369621
     inputs:
+      - params: string
       - source: sf.ethereum.type.v2.Block
-      - store: store_pools
     output:
       type: proto:uniswap.v3.Events
 
@@ -124,3 +124,4 @@ modules:
 
 params:
   map_pools_created: "1F98431c8aD98523631AE4a59f267346ea31F984"
+  map_events: "1F98431c8aD98523631AE4a59f267346ea31F984"

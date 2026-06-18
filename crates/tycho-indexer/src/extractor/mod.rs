@@ -42,6 +42,7 @@ pub mod reorg_buffer;
 pub mod runner;
 pub mod token_analysis_cron;
 pub mod uniswap_v3_bootstrap;
+pub mod uniswap_v3_stream;
 mod u256_num;
 
 #[derive(Error, Debug, PartialEq)]
@@ -124,6 +125,17 @@ pub trait Extractor: Send + Sync {
         changes: BlockChanges,
         cursor: String,
     ) -> Result<Option<ExtractorMsg>, ExtractionError>;
+
+    /// Returns the bootstrap block that has already been fully materialized and committed, if
+    /// any.
+    async fn get_completed_bootstrap_block(&self) -> Result<Option<u64>, ExtractionError>;
+
+    /// Persists that bootstrap for `bootstrap_block` has completed and is durable in storage.
+    async fn mark_bootstrap_completed(
+        &self,
+        bootstrap_block: u64,
+        block_hash: tycho_common::models::BlockHash,
+    ) -> Result<(), ExtractionError>;
 
     /// Drains the partial block buffer and processes the accumulated block as a full block.
     /// The runner calls this when it has sent the last partial for a block.
