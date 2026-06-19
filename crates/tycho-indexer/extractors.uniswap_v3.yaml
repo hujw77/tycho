@@ -7,7 +7,7 @@ extractors:
     protocol_types:
       - name: "uniswap_v3_pool"
         financial_type: "Swap"
-    spkg: "protocols/substreams/ethereum-uniswap-v3-logs-only/uniswap-v3-v0.1.2.spkg"
+    spkg: "protocols/substreams/ethereum-uniswap-v3-logs-only/ethereum-uniswap-v3-logs-only-v0.1.2.spkg"
     module_name: "map_events"
     substreams_params:
       map_events: "factory=0x1F98431c8aD98523631AE4a59f267346ea31F984"
