@@ -1,4 +1,8 @@
 use anyhow::Ok;
+use substreams::{
+    store::{StoreGet, StoreGetProto},
+    Hex,
+};
 use substreams_ethereum::{
     pb::eth::v2::{self as eth, Log, TransactionTrace},
     Event,
@@ -15,12 +19,16 @@ use crate::{
             pool_event::{self, Type},
             PoolEvent,
         },
-        Block, Events,
+        Block, Events, Pool,
     },
 };
 
 #[substreams::handlers::map]
-pub fn map_events(params: String, block: eth::Block) -> Result<Events, anyhow::Error> {
+pub fn map_events(
+    params: String,
+    block: eth::Block,
+    pools_store: StoreGetProto<Pool>,
+) -> Result<Events, anyhow::Error> {
     let factory_address = parse_factory_address(&params);
     let block_ts = block.timestamp_seconds();
     let mut pool_events = block
@@ -36,7 +44,7 @@ pub fn map_events(params: String, block: eth::Block) -> Result<Events, anyhow::E
             receipt
                 .logs
                 .iter()
-                .filter_map(|log| log_to_event(log, &tx, &factory_address))
+                .filter_map(|log| log_to_event(log, &tx, &factory_address, &pools_store))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -63,6 +71,7 @@ fn log_to_event(
     event: &Log,
     tx: &TransactionTrace,
     factory_address: &str,
+    pools_store: &StoreGetProto<Pool>,
 ) -> Option<PoolEvent> {
     let log_address = event.address.to_hex();
 
@@ -82,12 +91,22 @@ fn log_to_event(
         }
     }
 
+    let (token0, token1) = pools_store
+        .get_last(format!("Pool:{}", &log_address))
+        .map(|pool| {
+            (
+                Hex(pool.token0.clone()).to_string(),
+                Hex(pool.token1.clone()).to_string(),
+            )
+        })
+        .unwrap_or_else(|| (String::new(), String::new()));
+
     if let Some(init) = Initialize::match_and_decode(event) {
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::Initialize(pool_event::Initialize {
                 sqrt_price: init.sqrt_price_x96.to_string(),
@@ -98,8 +117,8 @@ fn log_to_event(
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::Swap(pool_event::Swap {
                 sender: swap.sender.to_hex(),
@@ -115,8 +134,8 @@ fn log_to_event(
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::Flash(pool_event::Flash {
                 sender: flash.sender.to_hex(),
@@ -131,8 +150,8 @@ fn log_to_event(
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::Mint(pool_event::Mint {
                 sender: mint.sender.to_hex(),
@@ -148,8 +167,8 @@ fn log_to_event(
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::Burn(pool_event::Burn {
                 owner: burn.owner.to_hex(),
@@ -164,8 +183,8 @@ fn log_to_event(
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::Collect(pool_event::Collect {
                 owner: collect.owner.to_hex(),
@@ -180,8 +199,8 @@ fn log_to_event(
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::SetFeeProtocol(pool_event::SetFeeProtocol {
                 fee_protocol_0_old: set_fp.fee_protocol0_old.to_u64(),
@@ -194,8 +213,8 @@ fn log_to_event(
         Some(PoolEvent {
             log_ordinal: event.ordinal,
             pool_address: log_address,
-            token0: String::new(),
-            token1: String::new(),
+            token0,
+            token1,
             transaction: Some(tx.into()),
             r#type: Some(Type::CollectProtocol(pool_event::CollectProtocol {
                 sender: cp.sender.to_hex(),
