@@ -47,8 +47,8 @@ use crate::{
         protobuf_deserialisation::TryFromMessage,
         protocol_cache::{ProtocolDataCache, ProtocolMemoryCache},
         reorg_buffer::ReorgBuffer,
-        uniswap_v3_stream::{self, events::pool_event},
         u256_num::bytes_to_f64,
+        uniswap_v3_stream::{self, events::pool_event},
         BlockUpdateWithCursor, ExtractionError, Extractor, ExtractorExtension, ExtractorMsg,
     },
     pb::sf::substreams::{
@@ -96,6 +96,7 @@ pub struct ProtocolExtractor<G, T, E> {
     /// Allows to attach some custom logic, e.g. to fix encoding bugs without resync.
     post_processor: Option<fn(BlockChanges) -> BlockChanges>,
     reorg_buffer: Mutex<ReorgBuffer<BlockUpdateWithCursor<BlockChanges>>>,
+    in_flight_commit_buffer: Arc<Mutex<ReorgBuffer<BlockUpdateWithCursor<BlockChanges>>>>,
     partial_block_buffer: Mutex<PartialBlockBuffer>,
     dci_plugin: Option<Arc<Mutex<E>>>,
 }
@@ -171,6 +172,7 @@ where
                     protocol_types,
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
+                    in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
                     partial_block_buffer: Mutex::new(None),
                     dci_plugin,
                 }
@@ -216,6 +218,7 @@ where
                     protocol_types,
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
+                    in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
                     partial_block_buffer: Mutex::new(None),
                     dci_plugin,
                 }
@@ -237,16 +240,18 @@ where
         &self,
         msg: BlockChanges,
     ) -> Result<BlockChanges, ExtractionError> {
-        let msg = if let Some(post_process_f) = self.post_processor {
-            post_process_f(msg)
-        } else {
-            msg
-        };
+        let msg =
+            if let Some(post_process_f) = self.post_processor { post_process_f(msg) } else { msg };
 
         let mut msg = msg;
 
         if let Some(last_processed_block) = self.get_last_processed_block().await {
-            if msg.block.ts.and_utc().timestamp() == last_processed_block.ts.and_utc().timestamp() {
+            if msg.block.ts.and_utc().timestamp()
+                == last_processed_block
+                    .ts
+                    .and_utc()
+                    .timestamp()
+            {
                 // Blockchains with fast block times (e.g., Arbitrum) may produce blocks with
                 // identical timestamps (measured in seconds). To ensure accurate ordering, we
                 // adjust each block's timestamp by adding a microsecond offset
@@ -258,7 +263,8 @@ where
                 msg.block.ts = last_processed_block.ts + Duration::microseconds(1);
                 trace!(
                     "Block with identical timestamp detected; adjusted timestamp from {:?} to {:?}",
-                    last_processed_block.ts, msg.block.ts
+                    last_processed_block.ts,
+                    msg.block.ts
                 );
             }
         }
@@ -460,26 +466,22 @@ where
             .collect::<Vec<_>>();
 
         // Merge stored balances with new ones
-        let balances = {
-            let rb = self.reorg_buffer.lock().await;
-            let mut balances = self
-                .get_component_balances(&rb, &balance_request)
-                .await?;
-            // we assume the retrieved balances contain all tokens of the component
-            // here, doing this merge the other way around would not be safe.
-            balances
-                .iter_mut()
-                .for_each(|(k, bal)| {
-                    bal.extend(
-                        msg.component_balances
-                            .get(k)
-                            .cloned()
-                            .unwrap_or_else(HashMap::new)
-                            .into_iter(),
-                    )
-                });
-            balances
-        };
+        let mut balances = self
+            .get_component_balances_at_tip(&balance_request)
+            .await?;
+        // we assume the retrieved balances contain all tokens of the component
+        // here, doing this merge the other way around would not be safe.
+        balances
+            .iter_mut()
+            .for_each(|(k, bal)| {
+                bal.extend(
+                    msg.component_balances
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_else(HashMap::new)
+                        .into_iter(),
+                )
+            });
 
         // collect token decimals and prices to calculate tvl in the next step
         // most of this data should be in the cache.
@@ -601,6 +603,104 @@ where
                         .extend(b_changes);
                     acc
                 });
+        Ok(combined_balances)
+    }
+
+    async fn get_component_balances_at_tip(
+        &self,
+        reverted_balances_keys: &[(&String, &Bytes)],
+    ) -> Result<HashMap<String, HashMap<Bytes, ComponentBalance>>, ExtractionError> {
+        let (buffered_balances, missing_balances_keys) = {
+            let reorg_buffer = self.reorg_buffer.lock().await;
+            let in_flight_commit_buffer = self
+                .in_flight_commit_buffer
+                .lock()
+                .await;
+
+            let (mut buffered_balances, missing_balances_keys) =
+                reorg_buffer.lookup_component_balances(reverted_balances_keys);
+            let in_flight_keys = missing_balances_keys
+                .iter()
+                .map(|(component_id, token)| (component_id, token))
+                .collect::<Vec<_>>();
+            let (in_flight_balances, still_missing_balances_keys) =
+                in_flight_commit_buffer.lookup_component_balances(&in_flight_keys);
+
+            for (component_id, balances) in in_flight_balances {
+                buffered_balances
+                    .entry(component_id)
+                    .or_default()
+                    .extend(balances);
+            }
+
+            (buffered_balances, still_missing_balances_keys)
+        };
+
+        let missing_balances_map: HashMap<String, Vec<Bytes>> = missing_balances_keys
+            .into_iter()
+            .fold(HashMap::new(), |mut map, (component_id, token)| {
+                map.entry(component_id)
+                    .or_default()
+                    .push(token);
+                map
+            });
+
+        trace!(?missing_balances_map, "Missing component balance keys after tip lookup");
+
+        let missing_balances: HashMap<String, HashMap<Bytes, ComponentBalance>> = self
+            .gateway
+            .inner
+            .get_components_balances(
+                &missing_balances_map
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<&str>>(),
+            )
+            .await?;
+
+        let empty = HashMap::<Bytes, ComponentBalance>::new();
+
+        let combined_balances: HashMap<String, HashMap<Bytes, ComponentBalance>> =
+            missing_balances_map
+                .iter()
+                .map(|(id, tokens)| {
+                    let balances_for_id = missing_balances
+                        .get(id)
+                        .unwrap_or(&empty);
+                    let filtered_balances: HashMap<_, _> = tokens
+                        .iter()
+                        .map(|token| {
+                            let balance = balances_for_id
+                                .get(token)
+                                .cloned()
+                                .unwrap_or_else(|| ComponentBalance {
+                                    token: token.clone(),
+                                    balance: Bytes::new(),
+                                    balance_float: 0.0,
+                                    modify_tx: Bytes::new(),
+                                    component_id: id.to_string(),
+                                });
+                            (token.clone(), balance)
+                        })
+                        .collect();
+                    (id.clone(), filtered_balances)
+                })
+                .chain(buffered_balances)
+                .map(|(id, balances)| {
+                    (
+                        id,
+                        balances
+                            .into_iter()
+                            .collect::<HashMap<_, _>>(),
+                    )
+                })
+                .fold(HashMap::new(), |mut acc, (component_id, balance_changes)| {
+                    acc.entry(component_id)
+                        .or_default()
+                        .extend(balance_changes);
+                    acc
+                });
+
         Ok(combined_balances)
     }
 
@@ -817,9 +917,8 @@ where
         let created_in_block = pool_events
             .iter()
             .filter_map(|event| {
-                matches!(event.r#type, Some(pool_event::Type::PoolCreated(_))).then(|| {
-                    Self::normalize_hex_address(&event.pool_address)
-                })
+                matches!(event.r#type, Some(pool_event::Type::PoolCreated(_)))
+                    .then(|| Self::normalize_hex_address(&event.pool_address))
             })
             .collect::<Result<HashSet<_>, _>>()?;
 
@@ -891,11 +990,11 @@ where
             }
         }
 
-        let reorg_buffer = self.reorg_buffer.lock().await;
         let protocol_state_values = self
             .get_protocol_state_values_at_tip(
-                &reorg_buffer,
-                &state_lookup_keys.into_iter().collect::<Vec<_>>(),
+                &state_lookup_keys
+                    .into_iter()
+                    .collect::<Vec<_>>(),
             )
             .await?;
 
@@ -910,9 +1009,8 @@ where
             })
             .collect::<Vec<_>>();
         let component_balances = self
-            .get_component_balances(&reorg_buffer, &balance_lookup_keys)
+            .get_component_balances_at_tip(&balance_lookup_keys)
             .await?;
-        drop(reorg_buffer);
 
         let mut current_states = HashMap::new();
         for component_id in &tracked_existing_component_ids {
@@ -940,8 +1038,8 @@ where
                 let Ok(component_id) = Self::normalize_hex_address(&event.pool_address) else {
                     return true;
                 };
-                created_in_block.contains(&component_id) ||
-                    tracked_existing_component_ids.contains(&component_id)
+                created_in_block.contains(&component_id)
+                    || tracked_existing_component_ids.contains(&component_id)
             })
             .collect::<Vec<_>>();
 
@@ -950,15 +1048,15 @@ where
 
         for event in filtered_pool_events {
             let component_id = Self::normalize_hex_address(&event.pool_address)?;
-            let transaction = Self::transaction_from_uniswap_v3_event(
-                event.transaction.clone(),
-                &block.hash,
-            )?;
+            let transaction =
+                Self::transaction_from_uniswap_v3_event(event.transaction.clone(), &block.hash)?;
             if active_tx
                 .as_ref()
                 .is_some_and(|(current_tx, _)| current_tx.index != transaction.index)
             {
-                let (completed_tx, completed_acc) = active_tx.take().expect("active tx exists");
+                let (completed_tx, completed_acc) = active_tx
+                    .take()
+                    .expect("active tx exists");
                 if let Some(tx_update) =
                     Self::finalize_uniswap_v3_tx(completed_tx, completed_acc, &current_states)
                 {
@@ -968,7 +1066,9 @@ where
             let tx_hash = transaction.hash.clone();
             let (_, tx_acc) = active_tx
                 .get_or_insert_with(|| (transaction.clone(), UniswapV3TxAccumulator::default()));
-            let created_in_tx = tx_acc.created_components.contains(&component_id);
+            let created_in_tx = tx_acc
+                .created_components
+                .contains(&component_id);
 
             if let Some(pool_event::Type::PoolCreated(created)) = &event.r#type {
                 let token0 = Self::parse_address(&event.token0)?;
@@ -981,7 +1081,9 @@ where
                         token1.clone(),
                     ),
                 );
-                tx_acc.created_components.insert(component_id.clone());
+                tx_acc
+                    .created_components
+                    .insert(component_id.clone());
                 tx_acc.protocol_components.insert(
                     component_id.clone(),
                     Self::build_uniswap_v3_protocol_component(
@@ -1147,15 +1249,33 @@ where
 
     async fn get_protocol_state_values_at_tip(
         &self,
-        reorg_buffer: &ReorgBuffer<BlockUpdateWithCursor<BlockChanges>>,
         keys: &[(String, String)],
     ) -> Result<HashMap<String, HashMap<String, Bytes>>, ExtractionError> {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let key_refs = keys.iter().map(|(c, a)| (c, a)).collect::<Vec<_>>();
-        let (buffered_values, missing_keys) = reorg_buffer.lookup_protocol_state(&key_refs);
+        let (buffered_values, missing_keys) = {
+            let reorg_buffer = self.reorg_buffer.lock().await;
+            let in_flight_commit_buffer = self
+                .in_flight_commit_buffer
+                .lock()
+                .await;
+
+            let key_refs = keys
+                .iter()
+                .map(|(c, a)| (c, a))
+                .collect::<Vec<_>>();
+            let (mut buffered_values, missing_keys) = reorg_buffer.lookup_protocol_state(&key_refs);
+            let in_flight_keys = missing_keys
+                .iter()
+                .map(|(component_id, attr)| (component_id, attr))
+                .collect::<Vec<_>>();
+            let (in_flight_values, still_missing_keys) =
+                in_flight_commit_buffer.lookup_protocol_state(&in_flight_keys);
+            buffered_values.extend(in_flight_values);
+            (buffered_values, still_missing_keys)
+        };
         let missing_refs = missing_keys
             .iter()
             .map(|(component_id, attr)| (component_id.as_str(), attr.as_str()))
@@ -1209,13 +1329,7 @@ where
             ExtractionError::DecodeError("uniswap_v3 event is missing transaction".to_string())
         })?;
         let to = if tx.to.is_empty() { None } else { Some(tx.to.into()) };
-        Ok(Transaction::new(
-            tx.hash.into(),
-            block_hash.clone(),
-            tx.from.into(),
-            to,
-            tx.index,
-        ))
+        Ok(Transaction::new(tx.hash.into(), block_hash.clone(), tx.from.into(), to, tx.index))
     }
 
     fn runtime_state_from_snapshot(
@@ -1227,21 +1341,29 @@ where
             .tokens
             .first()
             .cloned()
-            .ok_or_else(|| ExtractionError::DecodeError(format!(
-                "component `{}` is missing token0",
-                component.id
-            )))?;
+            .ok_or_else(|| {
+                ExtractionError::DecodeError(format!(
+                    "component `{}` is missing token0",
+                    component.id
+                ))
+            })?;
         let token1 = component
             .tokens
             .get(1)
             .cloned()
-            .ok_or_else(|| ExtractionError::DecodeError(format!(
-                "component `{}` is missing token1",
-                component.id
-            )))?;
+            .ok_or_else(|| {
+                ExtractionError::DecodeError(format!(
+                    "component `{}` is missing token1",
+                    component.id
+                ))
+            })?;
 
-        let values = state_values.cloned().unwrap_or_default();
-        let balances = balance_values.cloned().unwrap_or_default();
+        let values = state_values
+            .cloned()
+            .unwrap_or_default();
+        let balances = balance_values
+            .cloned()
+            .unwrap_or_default();
         let tick_liquidity_net = values
             .iter()
             .filter_map(|(attr, value)| {
@@ -1359,7 +1481,10 @@ where
         state: &UniswapV3PoolRuntimeState,
     ) -> ProtocolComponentStateDelta {
         let updated_attributes = Self::runtime_dynamic_attributes(state);
-        let created_attributes = updated_attributes.keys().cloned().collect();
+        let created_attributes = updated_attributes
+            .keys()
+            .cloned()
+            .collect();
         ProtocolComponentStateDelta {
             component_id: state.component_id.clone(),
             updated_attributes,
@@ -1388,11 +1513,12 @@ where
                 continue;
             };
 
-            if acc.created_components.contains(&component_id) {
-                state_updates.insert(
-                    component_id.clone(),
-                    Self::created_state_delta_from_runtime(state),
-                );
+            if acc
+                .created_components
+                .contains(&component_id)
+            {
+                state_updates
+                    .insert(component_id.clone(), Self::created_state_delta_from_runtime(state));
                 balance_changes.insert(
                     component_id.clone(),
                     Self::all_balance_changes_from_runtime(state, &tx.hash),
@@ -1400,7 +1526,10 @@ where
                 continue;
             }
 
-            if let Some(initial_attrs) = acc.touched_attributes.get(&component_id) {
+            if let Some(initial_attrs) = acc
+                .touched_attributes
+                .get(&component_id)
+            {
                 let mut updated_attributes = HashMap::new();
                 let mut deleted_attributes = HashSet::new();
                 let mut created_attributes = HashSet::new();
@@ -1458,7 +1587,10 @@ where
             }
         }
 
-        if acc.protocol_components.is_empty() && state_updates.is_empty() && balance_changes.is_empty() {
+        if acc.protocol_components.is_empty()
+            && state_updates.is_empty()
+            && balance_changes.is_empty()
+        {
             return None;
         }
 
@@ -1500,26 +1632,15 @@ where
         let mut attrs = HashMap::from([
             ("liquidity".to_string(), Self::encode_big_int(&state.liquidity)),
             ("tick".to_string(), Self::encode_big_int(&BigInt::from(state.tick))),
-            (
-                "sqrt_price_x96".to_string(),
-                Self::encode_big_int(&state.sqrt_price_x96),
-            ),
-            (
-                "protocol_fees/token0".to_string(),
-                Self::encode_big_int(&state.protocol_fee_token0),
-            ),
-            (
-                "protocol_fees/token1".to_string(),
-                Self::encode_big_int(&state.protocol_fee_token1),
-            ),
+            ("sqrt_price_x96".to_string(), Self::encode_big_int(&state.sqrt_price_x96)),
+            ("protocol_fees/token0".to_string(), Self::encode_big_int(&state.protocol_fee_token0)),
+            ("protocol_fees/token1".to_string(), Self::encode_big_int(&state.protocol_fee_token1)),
         ]);
 
         for (tick, liquidity) in &state.tick_liquidity_net {
             if !liquidity.eq(&BigInt::default()) {
-                attrs.insert(
-                    format!("ticks/{tick}/net-liquidity"),
-                    Self::encode_big_int(liquidity),
-                );
+                attrs
+                    .insert(format!("ticks/{tick}/net-liquidity"), Self::encode_big_int(liquidity));
             }
         }
         attrs
@@ -1543,7 +1664,8 @@ where
     }
 
     fn runtime_balance_value(state: &UniswapV3PoolRuntimeState, token: &Address) -> Bytes {
-        state.balances
+        state
+            .balances
             .get(token)
             .map(Self::encode_big_int)
             .unwrap_or_default()
@@ -1582,27 +1704,46 @@ where
             .or_insert_with(|| Some(Self::runtime_balance_value(state, token)));
     }
 
-    fn adjust_tick_liquidity(
-        state: &mut UniswapV3PoolRuntimeState,
-        tick: i32,
-        delta: BigInt,
-    ) {
-        let entry = state.tick_liquidity_net.entry(tick).or_default();
+    fn adjust_tick_liquidity(state: &mut UniswapV3PoolRuntimeState, tick: i32, delta: BigInt) {
+        let entry = state
+            .tick_liquidity_net
+            .entry(tick)
+            .or_default();
         *entry += delta;
         if *entry == BigInt::default() {
             state.tick_liquidity_net.remove(&tick);
         }
     }
 
-    fn adjust_balance(
-        state: &mut UniswapV3PoolRuntimeState,
-        token: &Address,
-        delta: BigInt,
-    ) {
+    fn adjust_balance(state: &mut UniswapV3PoolRuntimeState, token: &Address, delta: BigInt) {
         *state
             .balances
             .entry(token.clone())
             .or_default() += delta;
+    }
+
+    async fn replace_in_flight_commit_blocks(
+        &self,
+        blocks: &[BlockUpdateWithCursor<BlockChanges>],
+    ) -> Result<(), ExtractionError> {
+        let mut in_flight_commit_buffer = self
+            .in_flight_commit_buffer
+            .lock()
+            .await;
+        in_flight_commit_buffer.drain_all();
+        for block in blocks.iter().cloned() {
+            in_flight_commit_buffer
+                .insert_block(block)
+                .map_err(ExtractionError::Storage)?;
+        }
+        Ok(())
+    }
+
+    async fn clear_in_flight_commit_blocks(&self) {
+        self.in_flight_commit_buffer
+            .lock()
+            .await
+            .drain_all();
     }
 
     fn normalize_hex_address(value: &str) -> Result<String, ExtractionError> {
@@ -1616,12 +1757,11 @@ where
     }
 
     fn parse_address(value: &str) -> Result<Bytes, ExtractionError> {
-        let address = Bytes::from_str(value)
-            .map_err(|err| ExtractionError::DecodeError(format!("parse address `{value}`: {err}")))?;
+        let address = Bytes::from_str(value).map_err(|err| {
+            ExtractionError::DecodeError(format!("parse address `{value}`: {err}"))
+        })?;
         if address.len() != 20 {
-            return Err(ExtractionError::DecodeError(format!(
-                "address `{value}` is not 20 bytes"
-            )));
+            return Err(ExtractionError::DecodeError(format!("address `{value}` is not 20 bytes")));
         }
         Ok(address)
     }
@@ -1638,9 +1778,14 @@ where
 
     fn parse_i32_bytes(value: &Bytes) -> Result<i32, ExtractionError> {
         let parsed = Self::parse_big_int_bytes(value);
-        parsed.to_string().parse::<i32>().map_err(|err| {
-            ExtractionError::DecodeError(format!("parse i32 from state value `{parsed}`: {err}"))
-        })
+        parsed
+            .to_string()
+            .parse::<i32>()
+            .map_err(|err| {
+                ExtractionError::DecodeError(format!(
+                    "parse i32 from state value `{parsed}`: {err}"
+                ))
+            })
     }
 
     fn encode_big_int(value: &BigInt) -> Bytes {
@@ -1725,30 +1870,48 @@ where
                 }
             }
 
+            self.replace_in_flight_commit_blocks(&blocks_to_commit)
+                .await?;
+
+            let in_flight_commit_buffer = Arc::clone(&self.in_flight_commit_buffer);
             let new_handle = tokio::spawn(async move {
                 let now = std::time::Instant::now();
 
-                let mut it = blocks_to_commit.iter().peekable();
-                while let Some(block) = it.next() {
-                    let force_db_commit = if is_syncing { false } else { it.peek().is_none() };
+                let result = async {
+                    let mut it = blocks_to_commit.iter().peekable();
+                    while let Some(block) = it.next() {
+                        // Always force the last block in the drained batch to become durable.
+                        // Otherwise small live batches can remain parked in CachedGateway::open_tx,
+                        // invisible to read paths after we've already removed them from the
+                        // reorg/in-flight buffers.
+                        let force_db_commit = it.peek().is_none();
 
-                    gateway
-                        .advance(block.block_update(), block.cursor(), force_db_commit)
-                        .await
-                        .map_err(ExtractionError::Storage)?;
+                        gateway
+                            .advance(block.block_update(), block.cursor(), force_db_commit)
+                            .await
+                            .map_err(ExtractionError::Storage)?;
+                    }
+
+                    let mut committed_hieght_guard = committed_block_height.lock().await;
+                    *committed_hieght_guard = Some(last_block_height);
+
+                    trace!(batch_size, block_height = last_block_height, extractor_id = extractor_name, chain = %chain, "CommitTaskCompleted");
+
+                    histogram!(
+                        "database_commit_duration_ms", "chain" => chain.to_string(), "extractor" => extractor_name
+                    )
+                    .record(now.elapsed().as_millis() as f64);
+
+                    Ok(())
                 }
+                .await;
 
-                let mut committed_hieght_guard = committed_block_height.lock().await;
-                *committed_hieght_guard = Some(last_block_height);
+                in_flight_commit_buffer
+                    .lock()
+                    .await
+                    .drain_all();
 
-                trace!(batch_size, block_height = last_block_height, extractor_id = extractor_name, chain = %chain, "CommitTaskCompleted");
-
-                histogram!(
-                    "database_commit_duration_ms", "chain" => chain.to_string(), "extractor" => extractor_name
-                )
-                .record(now.elapsed().as_millis() as f64);
-
-                Ok(())
+                result
             });
             let commit_span = info_span!(
                 parent: None,
@@ -1829,19 +1992,30 @@ where
             }
         }
 
+        self.replace_in_flight_commit_blocks(&blocks_to_commit)
+            .await?;
+
         let last_block_height = blocks_to_commit
             .last()
             .map(|block| block.block_update.block.number)
             .expect("non-empty blocks_to_commit must have a last block");
 
-        let mut it = blocks_to_commit.iter().peekable();
-        while let Some(block) = it.next() {
-            let force_db_commit = it.peek().is_none();
-            gateway
-                .advance(block.block_update(), block.cursor(), force_db_commit)
-                .await
-                .map_err(ExtractionError::Storage)?;
+        let result = async {
+            let mut it = blocks_to_commit.iter().peekable();
+            while let Some(block) = it.next() {
+                let force_db_commit = it.peek().is_none();
+                gateway
+                    .advance(block.block_update(), block.cursor(), force_db_commit)
+                    .await
+                    .map_err(ExtractionError::Storage)?;
+            }
+            Ok::<(), ExtractionError>(())
         }
+        .await;
+
+        self.clear_in_flight_commit_blocks()
+            .await;
+        result?;
 
         let mut committed_height_guard = committed_block_height.lock().await;
         *committed_height_guard = Some(last_block_height);
@@ -1987,7 +2161,9 @@ where
         cursor: String,
     ) -> Result<Option<ExtractorMsg>, ExtractionError> {
         let finalized_block_height = changes.finalized_block_height;
-        let msg = self.prepare_block_changes(changes).await?;
+        let msg = self
+            .prepare_block_changes(changes)
+            .await?;
         self.process_full_block_message(msg, cursor, finalized_block_height)
             .await
     }
@@ -3205,7 +3381,9 @@ mod test {
     }
 
     fn encode_i(value: i64) -> Bytes {
-        BigInt::from(value).to_signed_bytes_be().into()
+        BigInt::from(value)
+            .to_signed_bytes_be()
+            .into()
     }
 
     #[tokio::test]
@@ -3216,10 +3394,7 @@ mod test {
             .times(1)
             .return_once(|_, _, _, _, _| {
                 Box::pin(async {
-                    Ok(tycho_common::storage::WithTotal {
-                        entity: Vec::new(),
-                        total: None,
-                    })
+                    Ok(tycho_common::storage::WithTotal { entity: Vec::new(), total: None })
                 })
             });
         let protocol_cache = ProtocolMemoryCache::new(
@@ -3274,8 +3449,7 @@ mod test {
                     block: Some(uniswap_v3_test_block()),
                     pool_events: vec![uniswap_v3_stream::events::PoolEvent {
                         log_ordinal: 1,
-                        pool_address:
-                            "0x9999999999999999999999999999999999999999".to_string(),
+                        pool_address: "0x9999999999999999999999999999999999999999".to_string(),
                         token0: String::new(),
                         token1: String::new(),
                         transaction: Some(uniswap_v3_test_tx(
@@ -3461,6 +3635,201 @@ mod test {
             tx1.balance_changes[&pool][&token0].balance,
             encode_i(7),
             "tx1 should apply on top of tx0 final balance",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_uniswap_v3_events_continue_across_in_flight_commit_buffer() {
+        let pool = "0x1111111111111111111111111111111111111111".to_string();
+        let token0 = Bytes::from("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let token1 = Bytes::from("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let mut gw = MockExtractorGateway::new();
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| Ok(()));
+        gw.expect_get_cursor()
+            .times(1)
+            .returning(|| Ok(("cursor".into(), Bytes::default())));
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+        gw.expect_get_protocol_state_values()
+            .times(2)
+            .returning(|_| {
+                Ok(HashMap::from([(
+                    "0x1111111111111111111111111111111111111111".to_string(),
+                    HashMap::from([
+                        ("liquidity".to_string(), encode_i(0)),
+                        ("tick".to_string(), encode_i(0)),
+                        ("sqrt_price_x96".to_string(), encode_i(1)),
+                        ("protocol_fees/token0".to_string(), encode_i(0)),
+                        ("protocol_fees/token1".to_string(), encode_i(0)),
+                    ]),
+                )]))
+            });
+
+        let token0_for_first_balance_lookup = token0.clone();
+        let token1_for_first_balance_lookup = token1.clone();
+        let pool_for_first_balance_lookup = pool.clone();
+        gw.expect_get_components_balances()
+            .times(2)
+            .returning(move |component_ids| {
+                if component_ids.is_empty() {
+                    return Ok(HashMap::new());
+                }
+
+                assert_eq!(component_ids, ["0x1111111111111111111111111111111111111111"]);
+                Ok(HashMap::from([(
+                    "0x1111111111111111111111111111111111111111".to_string(),
+                    HashMap::from([
+                        (
+                            token0_for_first_balance_lookup.clone(),
+                            ComponentBalance::new(
+                                token0_for_first_balance_lookup.clone(),
+                                encode_i(0),
+                                0.0,
+                                Bytes::zero(32),
+                                &pool_for_first_balance_lookup,
+                            ),
+                        ),
+                        (
+                            token1_for_first_balance_lookup.clone(),
+                            ComponentBalance::new(
+                                token1_for_first_balance_lookup.clone(),
+                                encode_i(0),
+                                0.0,
+                                Bytes::zero(32),
+                                &pool_for_first_balance_lookup,
+                            ),
+                        ),
+                    ]),
+                )]))
+            });
+
+        let extractor = create_extractor(gw).await;
+        extractor
+            .protocol_cache
+            .add_components([ProtocolComponent::new(
+                &pool,
+                TEST_PROTOCOL,
+                "uniswap_v3_pool",
+                Chain::Ethereum,
+                vec![token0.clone(), token1.clone()],
+                Vec::new(),
+                HashMap::new(),
+                ChangeType::Creation,
+                Bytes::zero(32),
+                NaiveDateTime::default(),
+            )])
+            .await
+            .expect("add component");
+
+        let first_block = uniswap_v3_stream::Block { number: 10, ..uniswap_v3_test_block() };
+        let first_changes = extractor
+            .build_uniswap_v3_block_changes_from_events(
+                uniswap_v3_stream::Events {
+                    block: Some(first_block),
+                    pool_events: vec![uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 1,
+                        pool_address: pool.clone(),
+                        token0: String::new(),
+                        token1: String::new(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x8000000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::Mint(pool_event::Mint {
+                            sender: "0x1".to_string(),
+                            owner: "0x2".to_string(),
+                            tick_lower: -10,
+                            tick_upper: 10,
+                            amount: "100".to_string(),
+                            amount_0: "5".to_string(),
+                            amount_1: "7".to_string(),
+                        })),
+                    }],
+                },
+                10,
+                None,
+            )
+            .await
+            .expect("build first block changes");
+
+        extractor
+            .replace_in_flight_commit_blocks(&[BlockUpdateWithCursor::new(
+                first_changes,
+                "cursor@10".to_string(),
+            )])
+            .await
+            .expect("stage in-flight block");
+
+        let second_block = uniswap_v3_stream::Block {
+            number: 11,
+            parent_hash: Bytes::from(
+                "0x1000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .to_vec(),
+            hash: Bytes::from("0x1100000000000000000000000000000000000000000000000000000000000000")
+                .to_vec(),
+            ..uniswap_v3_test_block()
+        };
+        let second_changes = extractor
+            .build_uniswap_v3_block_changes_from_events(
+                uniswap_v3_stream::Events {
+                    block: Some(second_block),
+                    pool_events: vec![uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 1,
+                        pool_address: pool.clone(),
+                        token0: String::new(),
+                        token1: String::new(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x8100000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::Mint(pool_event::Mint {
+                            sender: "0x3".to_string(),
+                            owner: "0x4".to_string(),
+                            tick_lower: -10,
+                            tick_upper: 10,
+                            amount: "50".to_string(),
+                            amount_0: "11".to_string(),
+                            amount_1: "13".to_string(),
+                        })),
+                    }],
+                },
+                11,
+                None,
+            )
+            .await
+            .expect("build second block changes");
+
+        assert_eq!(second_changes.txs_with_update.len(), 1);
+        let tx = &second_changes.txs_with_update[0];
+        assert_eq!(
+            tx.state_updates[&pool].updated_attributes["liquidity"],
+            encode_i(150),
+            "second block should accumulate liquidity from in-flight tip state",
+        );
+        assert_eq!(
+            tx.state_updates[&pool].updated_attributes["ticks/-10/net-liquidity"],
+            encode_i(150),
+            "lower tick should accumulate across blocks",
+        );
+        assert_eq!(
+            tx.state_updates[&pool].updated_attributes["ticks/10/net-liquidity"],
+            encode_i(-150),
+            "upper tick should accumulate across blocks",
+        );
+        assert_eq!(
+            tx.balance_changes[&pool][&token0].balance,
+            encode_i(16),
+            "token0 balance should continue from the in-flight block",
+        );
+        assert_eq!(
+            tx.balance_changes[&pool][&token1].balance,
+            encode_i(20),
+            "token1 balance should continue from the in-flight block",
         );
     }
 
@@ -3678,6 +4047,79 @@ mod test {
         handle.await.unwrap().unwrap();
 
         assert_eq!(call_count.load(Ordering::SeqCst), 4, "second commit should be counted");
+    }
+
+    #[tokio::test]
+    async fn test_live_batch_forces_commit_on_last_drained_block() {
+        let mut gw = MockExtractorGateway::new();
+
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| Ok(()));
+        gw.expect_get_cursor()
+            .times(1)
+            .returning(|| Ok(("cursor".into(), Bytes::default())));
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+
+        let force_flags = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let force_flags_clone = Arc::clone(&force_flags);
+        gw.expect_advance()
+            .times(2)
+            .returning(move |_, _, force_commit| {
+                force_flags_clone
+                    .lock()
+                    .unwrap()
+                    .push(force_commit);
+                Ok(())
+            });
+
+        let extractor = create_extractor_with_batch_size(gw, 2).await;
+
+        let scoped = |n: u64| {
+            pb_fixtures::pb_block_scoped_data(
+                tycho_substreams::BlockChanges {
+                    block: Some(pb_fixtures::pb_blocks(n)),
+                    ..Default::default()
+                },
+                Some(&format!("cursor@{n}")),
+                Some(n),
+            )
+        };
+
+        extractor
+            .handle_tick_scoped_data(scoped(1))
+            .await
+            .unwrap()
+            .unwrap();
+        extractor
+            .handle_tick_scoped_data(scoped(2))
+            .await
+            .unwrap()
+            .unwrap();
+        extractor
+            .handle_tick_scoped_data(scoped(3))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let handle = {
+            let mut guard = extractor
+                .gateway
+                .commit_handle
+                .lock()
+                .await;
+            guard.take()
+        }
+        .expect("expected a running commit task");
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            force_flags.lock().unwrap().as_slice(),
+            &[false, true],
+            "the last drained live block must force the cached gateway to flush"
+        );
     }
 
     #[tokio::test]

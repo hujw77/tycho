@@ -131,20 +131,22 @@ impl ProtocolMemoryCache {
 
     /// Returns the approximate size of the cache in bytes.
     pub async fn size_of(&self) -> usize {
-        self.chain.deep_size_of() +
-            self.tokens.read().await.deep_size_of() +
-            self.token_prices
+        self.chain.deep_size_of()
+            + self.tokens.read().await.deep_size_of()
+            + self
+                .token_prices
                 .read()
                 .await
                 .prices
-                .deep_size_of() +
-            size_of::<NaiveDateTime>() +
-            self.components
+                .deep_size_of()
+            + size_of::<NaiveDateTime>()
+            + self
+                .components
                 .read()
                 .await
-                .deep_size_of() +
-            size_of::<Duration>() +
-            size_of_val(&self.gateway)
+                .deep_size_of()
+            + size_of::<Duration>()
+            + size_of_val(&self.gateway)
     }
 }
 

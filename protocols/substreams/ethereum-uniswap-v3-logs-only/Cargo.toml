@@ -14,6 +14,7 @@ hex = "0.4.3"
 itertools = "0.13.0"
 num-bigint = "0.4.4"
 prost = "0.11"
+prost-types = "0.11"
 substreams = "0.5.22"
 substreams-ethereum = "0.9.9"
 substreams-helper = { path = "../crates/substreams-helper" }

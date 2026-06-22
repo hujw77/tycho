@@ -47,8 +47,8 @@ pub fn calculate_fee(
 ) -> Result<(i64, Vec<FeeRecipient>), Error> {
     let fee_info = _get_fee_info(params)?;
 
-    if (client_fee_bps + fee_info.router_fee_on_output_bps > MAX_FEE_BPS) ||
-        fee_info.router_fee_on_client_fee_bps > MAX_FEE_BPS
+    if (client_fee_bps + fee_info.router_fee_on_output_bps > MAX_FEE_BPS)
+        || fee_info.router_fee_on_client_fee_bps > MAX_FEE_BPS
     {
         return Err(Error::revert("calculate_fee: fee bps too large"));
     }

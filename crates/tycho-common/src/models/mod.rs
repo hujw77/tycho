@@ -198,21 +198,21 @@ impl Chain {
             // ETH-native chains: 10 ETH ≈ $20K, 100 ETH ≈ $200K.
             // Starknet uses ETH-denominated TVL in Tycho (STRK tracked separately).
             (
-                Chain::Ethereum |
-                Chain::Starknet |
-                Chain::ZkSync |
-                Chain::Arbitrum |
-                Chain::Base |
-                Chain::Unichain,
+                Chain::Ethereum
+                | Chain::Starknet
+                | Chain::ZkSync
+                | Chain::Arbitrum
+                | Chain::Base
+                | Chain::Unichain,
                 TvlThresholdTier::Low,
             ) => 10.0,
             (
-                Chain::Ethereum |
-                Chain::Starknet |
-                Chain::ZkSync |
-                Chain::Arbitrum |
-                Chain::Base |
-                Chain::Unichain,
+                Chain::Ethereum
+                | Chain::Starknet
+                | Chain::ZkSync
+                | Chain::Arbitrum
+                | Chain::Base
+                | Chain::Unichain,
                 TvlThresholdTier::Medium,
             ) => 100.0,
 

@@ -4,11 +4,7 @@ use alloy::{primitives::Address, rpc::types::BlockNumberOrTag, sol_types::SolCal
 use async_trait::async_trait;
 use tracing::{instrument, warn};
 use tycho_common::{
-    models::{
-        blockchain::BlockTag,
-        token::Token,
-        Chain,
-    },
+    models::{blockchain::BlockTag, token::Token, Chain},
     traits::{TokenOwnerFinding, TokenPreProcessor},
     Bytes,
 };
@@ -32,6 +28,34 @@ impl EthereumTokenPreProcessor {
         EthereumTokenPreProcessor { rpc: rpc.clone(), chain }
     }
 
+    fn decode_symbol_result(token: Address, result: &[u8]) -> String {
+        match symbolCall::abi_decode_returns_validate(result) {
+            Ok(symbol) => symbol,
+            Err(dynamic_err) => {
+                if result.len() == 32 {
+                    let symbol_end = result
+                        .iter()
+                        .position(|b| *b == 0)
+                        .unwrap_or(result.len());
+                    let raw_symbol = &result[..symbol_end];
+
+                    if !raw_symbol.is_empty() {
+                        if let Ok(symbol) = std::str::from_utf8(raw_symbol) {
+                            return symbol.to_string();
+                        }
+                    }
+                }
+
+                warn!(
+                    ?dynamic_err,
+                    ?token,
+                    "Failed to decode symbol function result, using address as fallback"
+                );
+                format!("0x{:x}", token)
+            }
+        }
+    }
+
     async fn call_symbol(&self, token: Address, block: BlockNumberOrTag) -> String {
         let calldata = symbolCall {}.abi_encode();
 
@@ -47,17 +71,7 @@ impl EthereumTokenPreProcessor {
             }
         };
 
-        match symbolCall::abi_decode_returns_validate(&result) {
-            Ok(symbol) => symbol,
-            Err(e) => {
-                warn!(
-                    ?e,
-                    ?token,
-                    "Failed to decode symbol function result, using address as fallback"
-                );
-                format!("0x{:x}", token)
-            }
-        }
+        Self::decode_symbol_result(token, &result)
     }
 
     async fn call_symbols(&self, tokens: &[Address], block: BlockNumberOrTag) -> Vec<String> {
@@ -67,7 +81,11 @@ impl EthereumTokenPreProcessor {
             .map(|token| call_request(None, *token, calldata.clone()))
             .collect();
 
-        let results = match self.rpc.eth_call_many(requests, block.clone()).await {
+        let results = match self
+            .rpc
+            .eth_call_many(requests, block.clone())
+            .await
+        {
             Ok(results) => results,
             Err(e) => {
                 warn!(
@@ -78,7 +96,10 @@ impl EthereumTokenPreProcessor {
 
                 let mut symbols = Vec::with_capacity(tokens.len());
                 for token in tokens {
-                    symbols.push(self.call_symbol(*token, block.clone()).await);
+                    symbols.push(
+                        self.call_symbol(*token, block.clone())
+                            .await,
+                    );
                 }
                 return symbols;
             }
@@ -87,17 +108,7 @@ impl EthereumTokenPreProcessor {
         tokens
             .iter()
             .zip(results)
-            .map(|(token, result)| match symbolCall::abi_decode_returns_validate(&result) {
-                Ok(symbol) => symbol,
-                Err(e) => {
-                    warn!(
-                        ?e,
-                        ?token,
-                        "Failed to decode symbol function result, using address as fallback"
-                    );
-                    format!("0x{:x}", token)
-                }
-            })
+            .map(|(token, result)| Self::decode_symbol_result(*token, &result))
             .collect()
     }
 
@@ -136,7 +147,11 @@ impl EthereumTokenPreProcessor {
             .map(|token| call_request(None, *token, calldata.clone()))
             .collect();
 
-        let results = match self.rpc.eth_call_many(requests, block.clone()).await {
+        let results = match self
+            .rpc
+            .eth_call_many(requests, block.clone())
+            .await
+        {
             Ok(results) => results,
             Err(e) => {
                 warn!(
@@ -147,7 +162,10 @@ impl EthereumTokenPreProcessor {
 
                 let mut decimals = Vec::with_capacity(tokens.len());
                 for token in tokens {
-                    decimals.push(self.call_decimals(*token, block.clone()).await);
+                    decimals.push(
+                        self.call_decimals(*token, block.clone())
+                            .await,
+                    );
                 }
                 return decimals;
             }
@@ -185,8 +203,12 @@ impl TokenPreProcessor for EthereumTokenPreProcessor {
             .iter()
             .map(|address| Address::from_bytes(address))
             .collect::<Vec<_>>();
-        let symbols = self.call_symbols(&token_addresses, block.clone()).await;
-        let decimals = self.call_decimals_many(&token_addresses, block).await;
+        let symbols = self
+            .call_symbols(&token_addresses, block.clone())
+            .await;
+        let decimals = self
+            .call_decimals_many(&token_addresses, block)
+            .await;
         let mut tokens_info = Vec::with_capacity(addresses.len());
 
         for ((address, symbol), decimals) in addresses
@@ -194,7 +216,6 @@ impl TokenPreProcessor for EthereumTokenPreProcessor {
             .zip(symbols.into_iter())
             .zip(decimals.into_iter())
         {
-
             tokens_info.push(Token {
                 address,
                 symbol: symbol
@@ -277,6 +298,34 @@ mod tests {
             .call_decimals(usdc_address, BlockNumberOrTag::Latest)
             .await;
         assert_eq!(decimals, 6, "Expected USDC to have 6 decimals");
+    }
+
+    #[test]
+    fn test_decode_symbol_result_supports_bytes32() {
+        let token = address!("9f8f72aa9304c8b593d555f12ef6589cc3a579a2");
+        let raw = [
+            0x4d, 0x4b, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let symbol = EthereumTokenPreProcessor::decode_symbol_result(token, &raw);
+
+        assert_eq!(symbol, "MKR");
+    }
+
+    #[test]
+    fn test_decode_symbol_result_falls_back_to_address_for_invalid_bytes32() {
+        let token = address!("9f8f72aa9304c8b593d555f12ef6589cc3a579a2");
+        let raw = [
+            0xff, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let symbol = EthereumTokenPreProcessor::decode_symbol_result(token, &raw);
+
+        assert_eq!(symbol, format!("0x{:x}", token));
     }
 
     #[tokio::test]

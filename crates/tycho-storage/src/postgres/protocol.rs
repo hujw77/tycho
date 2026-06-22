@@ -40,7 +40,8 @@ impl PostgresGateway {
     ) -> Result<HashMap<ComponentId, HashMap<String, Bytes>>, StorageError> {
         let chain_db_id = self.get_chain_id(chain)?;
         let component_ids = orm::ProtocolComponent::ids_by_external_ids(
-            keys.iter().map(|(component_id, _)| *component_id),
+            keys.iter()
+                .map(|(component_id, _)| *component_id),
             chain_db_id,
             conn,
         )
@@ -67,14 +68,16 @@ impl PostgresGateway {
 
         let rows = orm::NewProtocolState::latest_versions_by_ids(db_keys, conn).await?;
 
-        Ok(rows.into_iter().fold(HashMap::new(), |mut acc, row| {
-            if let Some(component_id) = db_id_to_component_id.get(&row.protocol_component_id) {
-                acc.entry(component_id.clone())
-                    .or_default()
-                    .insert(row.attribute_name, row.attribute_value);
-            }
-            acc
-        }))
+        Ok(rows
+            .into_iter()
+            .fold(HashMap::new(), |mut acc, row| {
+                if let Some(component_id) = db_id_to_component_id.get(&row.protocol_component_id) {
+                    acc.entry(component_id.clone())
+                        .or_default()
+                        .insert(row.attribute_name, row.attribute_value);
+                }
+                acc
+            }))
     }
 
     /// # Decoding ProtocolStates from database results.
@@ -1738,8 +1741,8 @@ impl PostgresGateway {
 
                 // Iterate over states until the component_id no longer matches the current
                 // component id
-                while updates_index < state_updates.len() &&
-                    &state_updates[updates_index].1 == current_component_id
+                while updates_index < state_updates.len()
+                    && &state_updates[updates_index].1 == current_component_id
                 {
                     updates_index += 1;
                 }
@@ -1747,8 +1750,8 @@ impl PostgresGateway {
                 let deleted_start = deletes_index;
                 // Iterate over deleted attributes until the component_id no longer matches the
                 // current component id
-                while deletes_index < deleted_attrs.len() &&
-                    &deleted_attrs[deletes_index].0 == current_component_id
+                while deletes_index < deleted_attrs.len()
+                    && &deleted_attrs[deletes_index].0 == current_component_id
                 {
                     deletes_index += 1;
                 }

@@ -44,8 +44,8 @@ impl<T: Log> Outcome<T> {
             .params
             .get("msg_value")
             .unwrap_or(0);
-        self.final_caller_eth_balance() > msg_value ||
-            self.final_router_eth_balance() < self.sender_vault_eth_change()
+        self.final_caller_eth_balance() > msg_value
+            || self.final_router_eth_balance() < self.sender_vault_eth_change()
     }
 
     /// ETH/WETH vault balance change for sender-controlled addresses.
@@ -54,8 +54,8 @@ impl<T: Log> Outcome<T> {
     fn sender_vault_eth_change(&self) -> i64 {
         let mut total = 0;
         for ((owner, token), balance) in &self.vault.owner_and_token_to_balance {
-            if owner.is_sender_controlled() &&
-                (*token == Address::NativeETH || *token == Address::WETH)
+            if owner.is_sender_controlled()
+                && (*token == Address::NativeETH || *token == Address::WETH)
             {
                 total += balance;
             }
@@ -70,8 +70,9 @@ impl<T: Log> Outcome<T> {
             .owner_to_eth_balance
             .get(&Address::Router)
             .copied()
-            .unwrap_or(0) +
-            self.state
+            .unwrap_or(0)
+            + self
+                .state
                 .owner_and_token_to_balance
                 .get(&(Address::Router, Address::WETH))
                 .copied()

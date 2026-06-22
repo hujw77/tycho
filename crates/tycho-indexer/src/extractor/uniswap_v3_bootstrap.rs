@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use alloy::{
     primitives::{Address as AlloyAddress, U256},
@@ -110,7 +113,10 @@ pub fn parse_bootstrap_params(params: &str) -> Result<BootstrapParams, Extractio
     let mut bootstrap_block = None;
     let mut pools = Vec::new();
 
-    for pair in params.split('&').filter(|part| !part.is_empty()) {
+    for pair in params
+        .split('&')
+        .filter(|part| !part.is_empty())
+    {
         let Some((key, value)) = pair.split_once('=') else {
             return Err(ExtractionError::Setup(format!("invalid bootstrap param `{pair}`")));
         };
@@ -123,7 +129,10 @@ pub fn parse_bootstrap_params(params: &str) -> Result<BootstrapParams, Extractio
             }
             "pool" => pools.push(parse_address(value)?),
             "pools" => {
-                for pool in value.split(',').filter(|pool| !pool.is_empty()) {
+                for pool in value
+                    .split(',')
+                    .filter(|pool| !pool.is_empty())
+                {
                     pools.push(parse_address(pool)?);
                 }
             }
@@ -235,7 +244,9 @@ async fn fetch_block(
     let block = rpc
         .get_block_by_number(BlockId::Number(BlockNumberOrTag::Number(block_number)))
         .await
-        .map_err(|err| ExtractionError::Setup(format!("failed to fetch block {block_number}: {err}")))?;
+        .map_err(|err| {
+            ExtractionError::Setup(format!("failed to fetch block {block_number}: {err}"))
+        })?;
 
     Ok(Block {
         number: block.header.number,
@@ -258,11 +269,15 @@ async fn fetch_pool_snapshot_seeds(
     block_tag: BlockNumberOrTag,
     pools: &[AlloyAddress],
 ) -> Result<Vec<PoolSnapshotSeed>, ExtractionError> {
-    let pools_per_chunk = max_items_per_rpc_batch(STATIC_RPC_BATCH_SIZE, POOL_STATIC_CALLS_PER_POOL);
+    let pools_per_chunk =
+        max_items_per_rpc_batch(STATIC_RPC_BATCH_SIZE, POOL_STATIC_CALLS_PER_POOL);
     let total_chunks = pools.len().div_ceil(pools_per_chunk);
     let mut seeds = Vec::with_capacity(pools.len());
 
-    for (chunk_index, pools_chunk) in pools.chunks(pools_per_chunk).enumerate() {
+    for (chunk_index, pools_chunk) in pools
+        .chunks(pools_per_chunk)
+        .enumerate()
+    {
         info!(
             chunk = chunk_index + 1,
             total_chunks,
@@ -287,8 +302,10 @@ async fn fetch_pool_snapshot_seeds(
 
         for (pool_index, pool) in pools_chunk.iter().enumerate() {
             let offset = pool_index * POOL_STATIC_CALLS_PER_POOL;
-            let token0 = decode_address_response::<token0Call>(&responses[offset], pool, "token0()")?;
-            let token1 = decode_address_response::<token1Call>(&responses[offset + 1], pool, "token1()")?;
+            let token0 =
+                decode_address_response::<token0Call>(&responses[offset], pool, "token0()")?;
+            let token1 =
+                decode_address_response::<token1Call>(&responses[offset + 1], pool, "token1()")?;
             let fee = feeCall::abi_decode_returns_validate(&responses[offset + 2])
                 .map_err(|err| decode_error(pool, "fee()", err))?;
             let tick_spacing = tickSpacingCall::abi_decode_returns_validate(&responses[offset + 3])
@@ -297,8 +314,7 @@ async fn fetch_pool_snapshot_seeds(
                 .map_err(|err| decode_error(pool, "liquidity()", err))?;
             let slot0 = slot0Call::abi_decode_returns_validate(&responses[offset + 5])
                 .map_err(|err| decode_error(pool, "slot0()", err))?;
-            let (protocol_fee_token0, protocol_fee_token1) =
-                decode_fee_protocol(slot0.feeProtocol);
+            let (protocol_fee_token0, protocol_fee_token1) = decode_fee_protocol(slot0.feeProtocol);
 
             seeds.push(PoolSnapshotSeed {
                 pool: *pool,
@@ -324,11 +340,15 @@ async fn fetch_pool_balances_batched(
     block_tag: BlockNumberOrTag,
     seeds: &[PoolSnapshotSeed],
 ) -> Result<Vec<(Bytes, Bytes)>, ExtractionError> {
-    let pools_per_chunk = max_items_per_rpc_batch(BALANCE_RPC_BATCH_SIZE, POOL_BALANCE_CALLS_PER_POOL);
+    let pools_per_chunk =
+        max_items_per_rpc_batch(BALANCE_RPC_BATCH_SIZE, POOL_BALANCE_CALLS_PER_POOL);
     let total_chunks = seeds.len().div_ceil(pools_per_chunk);
     let mut balances = Vec::with_capacity(seeds.len());
 
-    for (chunk_index, seeds_chunk) in seeds.chunks(pools_per_chunk).enumerate() {
+    for (chunk_index, seeds_chunk) in seeds
+        .chunks(pools_per_chunk)
+        .enumerate()
+    {
         info!(
             chunk = chunk_index + 1,
             total_chunks,
@@ -371,10 +391,15 @@ async fn fetch_tick_attributes_batched(
     block_tag: BlockNumberOrTag,
     seeds: &[PoolSnapshotSeed],
 ) -> Result<Vec<HashMap<String, Bytes>>, ExtractionError> {
-    let total_chunks = seeds.len().div_ceil(TICK_POOL_BATCH_SIZE);
+    let total_chunks = seeds
+        .len()
+        .div_ceil(TICK_POOL_BATCH_SIZE);
     let mut all_attributes = Vec::with_capacity(seeds.len());
 
-    for (chunk_index, seeds_chunk) in seeds.chunks(TICK_POOL_BATCH_SIZE).enumerate() {
+    for (chunk_index, seeds_chunk) in seeds
+        .chunks(TICK_POOL_BATCH_SIZE)
+        .enumerate()
+    {
         info!(
             chunk = chunk_index + 1,
             total_chunks,
@@ -391,10 +416,22 @@ async fn fetch_tick_attributes_batched(
             total_chunks,
         )
         .await?;
-        let total_pages_scanned: usize = states.iter().map(|state| state.pages_scanned).sum();
-        let total_non_empty_pages: usize = states.iter().map(|state| state.non_empty_pages).sum();
-        let total_logical_calls: usize = states.iter().map(|state| state.logical_calls).sum();
-        let total_tick_attributes: usize = states.iter().map(|state| state.attributes.len()).sum();
+        let total_pages_scanned: usize = states
+            .iter()
+            .map(|state| state.pages_scanned)
+            .sum();
+        let total_non_empty_pages: usize = states
+            .iter()
+            .map(|state| state.non_empty_pages)
+            .sum();
+        let total_logical_calls: usize = states
+            .iter()
+            .map(|state| state.logical_calls)
+            .sum();
+        let total_tick_attributes: usize = states
+            .iter()
+            .map(|state| state.attributes.len())
+            .sum();
 
         info!(
             chunk = chunk_index + 1,
@@ -409,7 +446,11 @@ async fn fetch_tick_attributes_batched(
             "BootstrapTickChunkDone"
         );
 
-        all_attributes.extend(states.into_iter().map(|state| state.attributes));
+        all_attributes.extend(
+            states
+                .into_iter()
+                .map(|state| state.attributes),
+        );
     }
 
     Ok(all_attributes)
@@ -430,7 +471,10 @@ async fn snapshot_tick_chunk_via_lens(
         .collect();
     let word_bound_results = multicall_many(rpc, block_tag, word_bound_calls).await?;
 
-    for (seed, response) in seeds.iter().zip(word_bound_results.into_iter()) {
+    for (seed, response) in seeds
+        .iter()
+        .zip(word_bound_results.into_iter())
+    {
         let word_bounds = wordBoundsCall::abi_decode_returns_validate(&response)
             .map_err(|err| decode_error(&seed.pool, "wordBounds()", err))?;
         states.push(TickSnapshotState {
@@ -476,7 +520,10 @@ async fn snapshot_tick_chunk_via_lens(
         let scan_results = multicall_many(rpc, block_tag, scan_calls).await?;
 
         let mut decoded_pages = Vec::with_capacity(active_indices.len());
-        for (&index, response) in active_indices.iter().zip(scan_results.into_iter()) {
+        for (&index, response) in active_indices
+            .iter()
+            .zip(scan_results.into_iter())
+        {
             let page = scanWordsPageCall::abi_decode_returns_validate(&response)
                 .map_err(|err| decode_error(&seeds[index].pool, "scanWordsPage()", err))?;
             states[index].pages_scanned += 1;
@@ -506,15 +553,20 @@ async fn snapshot_tick_chunk_via_lens(
                 .collect();
             let tick_results = multicall_many(rpc, block_tag, tick_calls).await?;
 
-            for (&index, response) in tick_call_indices.iter().zip(tick_results.into_iter()) {
+            for (&index, response) in tick_call_indices
+                .iter()
+                .zip(tick_results.into_iter())
+            {
                 let tick_page = getTicksForWordsCall::abi_decode_returns_validate(&response)
                     .map_err(|err| decode_error(&seeds[index].pool, "getTicksForWords()", err))?;
                 states[index].non_empty_pages += 1;
                 states[index].logical_calls += 1;
-                states[index].attributes.extend(decode_packed_tick_attributes(
-                    &tick_page.packedTicks,
-                    &tick_page.counts,
-                )?);
+                states[index]
+                    .attributes
+                    .extend(decode_packed_tick_attributes(
+                        &tick_page.packedTicks,
+                        &tick_page.counts,
+                    )?);
             }
         }
 
@@ -527,9 +579,15 @@ async fn snapshot_tick_chunk_via_lens(
         }
 
         if round == 1 || round % TICK_PAGE_PROGRESS_INTERVAL == 0 {
-            let completed_pools = states.iter().filter(|state| state.done).count();
+            let completed_pools = states
+                .iter()
+                .filter(|state| state.done)
+                .count();
             let remaining_active_pools = seeds.len() - completed_pools;
-            let cumulative_ticks = states.iter().map(|state| state.attributes.len()).sum::<usize>();
+            let cumulative_ticks = states
+                .iter()
+                .map(|state| state.attributes.len())
+                .sum::<usize>();
 
             info!(
                 chunk,
@@ -566,7 +624,9 @@ fn build_protocol_component(
             ("fee".to_string(), seed.fee.to_signed_bytes_be().into()),
             (
                 "tick_spacing".to_string(),
-                seed.tick_spacing.to_signed_bytes_be().into(),
+                seed.tick_spacing
+                    .to_signed_bytes_be()
+                    .into(),
             ),
             ("pool_address".to_string(), seed.pool.to_bytes().into()),
         ]),
@@ -582,11 +642,18 @@ fn build_state_update(
     tick_attributes: HashMap<String, Bytes>,
 ) -> ProtocolComponentStateDelta {
     let mut updated_attributes = HashMap::from([
-        ("liquidity".to_string(), seed.liquidity.to_signed_bytes_be().into()),
+        (
+            "liquidity".to_string(),
+            seed.liquidity
+                .to_signed_bytes_be()
+                .into(),
+        ),
         ("tick".to_string(), seed.tick.to_signed_bytes_be().into()),
         (
             "sqrt_price_x96".to_string(),
-            seed.sqrt_price_x96.to_signed_bytes_be().into(),
+            seed.sqrt_price_x96
+                .to_signed_bytes_be()
+                .into(),
         ),
         (
             "protocol_fees/token0".to_string(),
@@ -602,7 +669,10 @@ fn build_state_update(
         ),
     ]);
     updated_attributes.extend(tick_attributes);
-    let created_attributes = updated_attributes.keys().cloned().collect::<HashSet<_>>();
+    let created_attributes = updated_attributes
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
 
     ProtocolComponentStateDelta {
         component_id: component_id.to_string(),
@@ -613,13 +683,7 @@ fn build_state_update(
 }
 
 fn synthetic_bootstrap_transaction(block: &Block) -> Transaction {
-    Transaction::new(
-        block.hash.clone(),
-        block.hash.clone(),
-        Bytes::zero(20),
-        None,
-        0,
-    )
+    Transaction::new(block.hash.clone(), block.hash.clone(), Bytes::zero(20), None, 0)
 }
 
 fn read_call_request(to: AlloyAddress, calldata: Vec<u8>) -> TransactionRequest {
@@ -668,10 +732,7 @@ async fn multicall_many(
 ) -> Result<Vec<Bytes>, ExtractionError> {
     let multicall = multicall_address()?;
     let response = rpc
-        .eth_call(
-            read_call_request(multicall, aggregate3Call { calls }.abi_encode()),
-            block_tag,
-        )
+        .eth_call(read_call_request(multicall, aggregate3Call { calls }.abi_encode()), block_tag)
         .await
         .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
     let results = aggregate3Call::abi_decode_returns_validate(&response)
@@ -705,10 +766,12 @@ fn decode_packed_tick_attributes(
     packed_ticks: &[u8],
     counts: &[u32],
 ) -> Result<HashMap<String, Bytes>, ExtractionError> {
-    let total_ticks = counts.iter().try_fold(0usize, |acc, count| {
-        acc.checked_add(*count as usize)
-            .ok_or_else(|| ExtractionError::Setup("tick count overflow".to_string()))
-    })?;
+    let total_ticks = counts
+        .iter()
+        .try_fold(0usize, |acc, count| {
+            acc.checked_add(*count as usize)
+                .ok_or_else(|| ExtractionError::Setup("tick count overflow".to_string()))
+        })?;
     let expected_len = total_ticks
         .checked_mul(PACKED_TICK_SIZE)
         .ok_or_else(|| ExtractionError::Setup("packed tick payload length overflow".to_string()))?;
@@ -729,7 +792,9 @@ fn decode_packed_tick_attributes(
         }
         attributes.insert(
             format!("ticks/{tick}/net-liquidity"),
-            liquidity_net.to_signed_bytes_be().into(),
+            liquidity_net
+                .to_signed_bytes_be()
+                .into(),
         );
     }
 
@@ -738,7 +803,10 @@ fn decode_packed_tick_attributes(
 
 fn decode_signed_bigint(bytes: &[u8], width: usize) -> BigInt {
     debug_assert_eq!(bytes.len(), width);
-    let sign_byte = if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+    let sign_byte = if bytes
+        .first()
+        .is_some_and(|byte| byte & 0x80 != 0)
+    {
         0xff
     } else {
         0x00
@@ -765,7 +833,9 @@ fn uint_to_bigint(value: U256) -> BigInt {
 }
 
 fn uint_to_bytes(value: U256) -> Bytes {
-    uint_to_bigint(value).to_signed_bytes_be().into()
+    uint_to_bigint(value)
+        .to_signed_bytes_be()
+        .into()
 }
 
 fn uint_bytes_to_bigint(bytes: &[u8]) -> BigInt {

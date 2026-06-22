@@ -1014,8 +1014,8 @@ fn select_components_to_process(
                     .update
                     .states
                     .keys()
-                    .contains(component_id) &&
-                    current_state
+                    .contains(component_id)
+                    && current_state
                         .components
                         .contains_key(component_id)
                 {
@@ -1031,8 +1031,8 @@ fn select_components_to_process(
                         let available_ids: Vec<_> = component_ids
                             .iter()
                             .filter(|id| {
-                                !update.update.states.keys().contains(id) &&
-                                    !all_selected_ids.contains(id)
+                                !update.update.states.keys().contains(id)
+                                    && !all_selected_ids.contains(id)
                             })
                             .cloned()
                             .collect();
@@ -1362,9 +1362,9 @@ fn process_execution_result(
             // Remove the router fee from the expected simulated amount out.
             let simulated_amount_out_without_fee = execution_info
                 .expected_amount_out
-                .clone() -
-                (execution_info.expected_amount_out * BigUint::from(router_fee)) /
-                    BigUint::from(10000u64);
+                .clone()
+                - (execution_info.expected_amount_out * BigUint::from(router_fee))
+                    / BigUint::from(10000u64);
 
             // Calculate slippage: positive = simulated > expected, negative = simulated <
             // expected
@@ -1372,14 +1372,14 @@ fn process_execution_result(
                 let diff = amount_out - &simulated_amount_out_without_fee;
                 ((diff.clone() * BigUint::from(10000u32)) / &simulated_amount_out_without_fee)
                     .to_f64()
-                    .unwrap_or(0.0) /
-                    100.0
+                    .unwrap_or(0.0)
+                    / 100.0
             } else {
                 let diff = &simulated_amount_out_without_fee - amount_out;
                 -((diff.clone() * BigUint::from(10000u32)) / &simulated_amount_out_without_fee)
                     .to_f64()
-                    .unwrap_or(0.0) /
-                    100.0
+                    .unwrap_or(0.0)
+                    / 100.0
             };
 
             // Generate Tenderly URL for debugging with state overrides

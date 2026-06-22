@@ -41,9 +41,9 @@ pub mod protocol_extractor;
 pub mod reorg_buffer;
 pub mod runner;
 pub mod token_analysis_cron;
+mod u256_num;
 pub mod uniswap_v3_bootstrap;
 pub mod uniswap_v3_stream;
-mod u256_num;
 
 #[derive(Error, Debug, PartialEq)]
 pub enum ExtractionError {
@@ -179,7 +179,7 @@ pub trait ExtractorExtension: Send + Sync {
 }
 
 /// Wrapper to carry a cursor along with another struct.
-#[derive(Debug, DeepSizeOf)]
+#[derive(Clone, Debug, DeepSizeOf)]
 pub(crate) struct BlockUpdateWithCursor<B: std::fmt::Debug> {
     block_update: B,
     cursor: String,

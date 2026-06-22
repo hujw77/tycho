@@ -42,9 +42,10 @@ impl Block {
 impl DeepSizeOf for Block {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.chain
-            .deep_size_of_children(context) +
-            self.hash.deep_size_of_children(context) +
-            self.parent_hash
+            .deep_size_of_children(context)
+            + self.hash.deep_size_of_children(context)
+            + self
+                .parent_hash
                 .deep_size_of_children(context)
     }
 }

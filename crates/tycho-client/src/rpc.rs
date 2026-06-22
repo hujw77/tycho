@@ -1360,9 +1360,9 @@ impl HttpRPCClient {
 
                 Err(RPCError::RateLimited(retry_after_raw))
             }
-            StatusCode::BAD_GATEWAY |
-            StatusCode::SERVICE_UNAVAILABLE |
-            StatusCode::GATEWAY_TIMEOUT => Err(RPCError::ServerUnreachable(
+            StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => Err(RPCError::ServerUnreachable(
                 response
                     .text()
                     .await

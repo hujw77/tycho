@@ -429,9 +429,9 @@ impl SynchronizerStream {
 
         if wait_duration > stale_threshold_chrono {
             let header_to_use = match (&self.state, fallback_header) {
-                (SynchronizerState::Ready(h), _) |
-                (SynchronizerState::Delayed(h), _) |
-                (SynchronizerState::Stale(h), _) => h.clone(),
+                (SynchronizerState::Ready(h), _)
+                | (SynchronizerState::Delayed(h), _)
+                | (SynchronizerState::Stale(h), _) => h.clone(),
                 (_, Some(h)) => h,
                 _ => BlockHeader::default(),
             };
@@ -554,9 +554,9 @@ impl SynchronizerStream {
     /// A stream is considered as active unless it has ended or is stale.
     fn get_current_header(&self) -> Option<&BlockHeader> {
         match &self.state {
-            SynchronizerState::Ready(b) |
-            SynchronizerState::Delayed(b) |
-            SynchronizerState::Advanced(b) => Some(b),
+            SynchronizerState::Ready(b)
+            | SynchronizerState::Delayed(b)
+            | SynchronizerState::Advanced(b) => Some(b),
             _ => None,
         }
     }
@@ -1018,9 +1018,9 @@ where
 
             if stream.has_ended() {
                 has_any_ended = true;
-                if latest_ended_stream.is_none() ||
-                    stream.modify_ts >
-                        latest_ended_stream
+                if latest_ended_stream.is_none()
+                    || stream.modify_ts
+                        > latest_ended_stream
                             .as_ref()
                             .unwrap()
                             .modify_ts
@@ -1690,9 +1690,9 @@ mod tests {
             let v2_state = msg.sync_states.get("uniswap-v2");
             let v3_state = msg.sync_states.get("uniswap-v3");
 
-            if !seen_delayed &&
-                (matches!(v2_state, Some(SynchronizerState::Delayed(_))) ||
-                    matches!(v3_state, Some(SynchronizerState::Delayed(_))))
+            if !seen_delayed
+                && (matches!(v2_state, Some(SynchronizerState::Delayed(_)))
+                    || matches!(v3_state, Some(SynchronizerState::Delayed(_))))
             {
                 seen_delayed = true;
                 assert!(
@@ -1701,8 +1701,8 @@ mod tests {
                 );
             }
 
-            if matches!(v2_state, Some(SynchronizerState::Stale(_))) &&
-                matches!(v3_state, Some(SynchronizerState::Stale(_)))
+            if matches!(v2_state, Some(SynchronizerState::Stale(_)))
+                && matches!(v3_state, Some(SynchronizerState::Stale(_)))
             {
                 seen_stale = true;
                 assert!(
@@ -1797,8 +1797,8 @@ mod tests {
                 .sync_states
                 .get("uniswap-v3")
                 .unwrap();
-            if matches!(v2, SynchronizerState::Stale(_)) &&
-                matches!(v3, SynchronizerState::Stale(_))
+            if matches!(v2, SynchronizerState::Stale(_))
+                && matches!(v3, SynchronizerState::Stale(_))
             {
                 seen_stale = true;
                 assert!(
@@ -1836,8 +1836,8 @@ mod tests {
                 .sync_states
                 .get("uniswap-v3")
                 .unwrap();
-            if matches!(v2, SynchronizerState::Ready(h) if h.number == 5) &&
-                matches!(v3, SynchronizerState::Ready(h) if h.number == 5)
+            if matches!(v2, SynchronizerState::Ready(h) if h.number == 5)
+                && matches!(v3, SynchronizerState::Ready(h) if h.number == 5)
             {
                 recovered = true;
                 break;

@@ -214,10 +214,7 @@ impl EthereumRpcClient {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn get_block_by_number(
-        &self,
-        block_id: BlockId,
-    ) -> Result<Block, RPCError> {
+    pub async fn get_block_by_number(&self, block_id: BlockId) -> Result<Block, RPCError> {
         let full_tx_objects = false;
 
         let result: Option<Block> = self
@@ -692,7 +689,10 @@ impl EthereumRpcClient {
                         let mut batch_calls = request_chunk
                             .into_iter()
                             .map(|request| {
-                                batch.add_call::<_, AlloyBytes>("eth_call", &(request, block.clone()))
+                                batch.add_call::<_, AlloyBytes>(
+                                    "eth_call",
+                                    &(request, block.clone()),
+                                )
                             })
                             .collect::<Result<Vec<_>, RpcError<TransportErrorKind>>>()?;
 

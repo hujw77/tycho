@@ -247,7 +247,9 @@ impl BlockChanges {
         } else if self_index < other_index {
             (other, self)
         } else {
-            return Err(MergeError::InvalidState(format!("same partial block index: {self_index}")));
+            return Err(MergeError::InvalidState(format!(
+                "same partial block index: {self_index}"
+            )));
         };
 
         // Merge tokens: later block's tokens take precedence

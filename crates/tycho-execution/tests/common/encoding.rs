@@ -143,8 +143,8 @@ pub fn encode_tycho_router_call(
     // ABI tuple matching ClientFeeParams: (uint16, address, uint256, uint256, bytes)
     let client_fee_params =
         (client_fee_bps, client_fee_receiver, max_client_contribution, deadline, client_signature);
-    let (permit, signature) = if *solution.user_transfer_type() ==
-        UserTransferType::TransferFromPermit2
+    let (permit, signature) = if *solution.user_transfer_type()
+        == UserTransferType::TransferFromPermit2
     {
         let permit2 = Permit2::new()?;
         let permit_single = permit2.get_permit(
@@ -212,8 +212,8 @@ pub fn encode_tycho_router_call(
             swaps,
         )
             .abi_encode()
-    } else if function_signature.contains("singleSwap") ||
-        function_signature.contains("sequentialSwap")
+    } else if function_signature.contains("singleSwap")
+        || function_signature.contains("sequentialSwap")
     {
         (
             given_amount,
@@ -366,9 +366,9 @@ fn encode_input(selector: &str, mut encoded_args: Vec<u8>) -> Vec<u8> {
     // Remove extra prefix if present (32 bytes for dynamic data)
     // Alloy encoding is including a prefix for dynamic data indicating the offset or length
     // but at this point we don't want that
-    if encoded_args.len() > 32 &&
-        encoded_args[..32] ==
-            [0u8; 31]
+    if encoded_args.len() > 32
+        && encoded_args[..32]
+            == [0u8; 31]
                 .into_iter()
                 .chain([32].to_vec())
                 .collect::<Vec<u8>>()

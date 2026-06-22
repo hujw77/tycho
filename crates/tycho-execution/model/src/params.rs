@@ -85,7 +85,9 @@ impl Params {
             .map(|x| x.into())
             .collect();
         if variants.is_empty() {
-            return Err(RequestParamError::VariantsShouldNotBeEmptySinceWouldCauseInfiniteLoop(key));
+            return Err(RequestParamError::VariantsShouldNotBeEmptySinceWouldCauseInfiniteLoop(
+                key,
+            ));
         }
 
         Err(RequestParamError::RequestParam(RequestParam::new(self, key, variants)))

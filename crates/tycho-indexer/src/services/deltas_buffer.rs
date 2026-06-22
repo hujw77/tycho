@@ -444,8 +444,8 @@ impl PendingDeltasBuffer for PendingDeltas {
                         let tvl_matches = min_tvl.as_ref().is_none_or(|tvl| {
                             components_tvls
                                 .get(&comp.id)
-                                .unwrap_or(&0.0) >=
-                                tvl
+                                .unwrap_or(&0.0)
+                                >= tvl
                         });
 
                         id_matches && tvl_matches
@@ -523,7 +523,10 @@ impl PendingDeltasBuffer for PendingDeltas {
             return Ok(None);
         };
 
-        let Some(latest_entry) = guard.get_block_range(None, None)?.last() else {
+        let Some(latest_entry) = guard
+            .get_block_range(None, None)?
+            .last()
+        else {
             return Ok(None);
         };
 

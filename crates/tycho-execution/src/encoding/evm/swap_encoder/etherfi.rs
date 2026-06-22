@@ -65,20 +65,20 @@ impl SwapEncoder for EtherfiSwapEncoder {
         swap: &Swap,
         _encoding_context: &EncodingContext,
     ) -> Result<Vec<u8>, EncodingError> {
-        let direction = if *swap.token_in().address == self.eeth_address &&
-            *swap.token_out().address == self.eth_address
+        let direction = if *swap.token_in().address == self.eeth_address
+            && *swap.token_out().address == self.eth_address
         {
             EtherfiDirection::EethToEth
-        } else if *swap.token_in().address == self.eth_address &&
-            *swap.token_out().address == self.eeth_address
+        } else if *swap.token_in().address == self.eth_address
+            && *swap.token_out().address == self.eeth_address
         {
             EtherfiDirection::EthToEeth
-        } else if *swap.token_in().address == self.eeth_address &&
-            *swap.token_out().address == self.weeth_address
+        } else if *swap.token_in().address == self.eeth_address
+            && *swap.token_out().address == self.weeth_address
         {
             EtherfiDirection::EethToWeeth
-        } else if *swap.token_in().address == self.weeth_address &&
-            *swap.token_out().address == self.eeth_address
+        } else if *swap.token_in().address == self.weeth_address
+            && *swap.token_out().address == self.eeth_address
         {
             EtherfiDirection::WeethToEeth
         } else {

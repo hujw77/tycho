@@ -13,6 +13,10 @@ use substreams::{scalar::BigInt, store::StoreNew};
 
 use anyhow::Ok;
 
+fn decode_prefixed_hex(value: &str) -> Vec<u8> {
+    hex::decode(value.trim_start_matches("0x")).unwrap()
+}
+
 #[substreams::handlers::store]
 pub fn store_pool_current_tick(events: Events, store: StoreSetInt64) {
     events
@@ -76,7 +80,7 @@ fn event_to_liquidity_deltas(current_tick: i64, event: PoolEvent) -> Option<Liqu
         pool_event::Type::Mint(mint) => {
             if current_tick >= mint.tick_lower.into() && current_tick < mint.tick_upper.into() {
                 Some(LiquidityChange {
-                    pool_address: hex::decode(event.pool_address).unwrap(),
+                    pool_address: decode_prefixed_hex(&event.pool_address),
                     value: BigInt::from_str(&mint.amount)
                         .unwrap()
                         .to_signed_bytes_be(),
@@ -91,7 +95,7 @@ fn event_to_liquidity_deltas(current_tick: i64, event: PoolEvent) -> Option<Liqu
         pool_event::Type::Burn(burn) => {
             if current_tick >= burn.tick_lower.into() && current_tick < burn.tick_upper.into() {
                 Some(LiquidityChange {
-                    pool_address: hex::decode(event.pool_address).unwrap(),
+                    pool_address: decode_prefixed_hex(&event.pool_address),
                     value: BigInt::from_str(&burn.amount)
                         .unwrap()
                         .neg()
@@ -105,7 +109,7 @@ fn event_to_liquidity_deltas(current_tick: i64, event: PoolEvent) -> Option<Liqu
             }
         }
         pool_event::Type::Swap(swap) => Some(LiquidityChange {
-            pool_address: hex::decode(event.pool_address).unwrap(),
+            pool_address: decode_prefixed_hex(&event.pool_address),
             value: BigInt::from_str(&swap.liquidity)
                 .unwrap()
                 .to_signed_bytes_be(),

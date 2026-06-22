@@ -663,7 +663,11 @@ where
         let mut statuses = Vec::with_capacity(protocol_systems.len());
 
         for protocol_system in protocol_systems {
-            let committed_block = match self.db_gateway.get_state(&protocol_system, &chain).await {
+            let committed_block = match self
+                .db_gateway
+                .get_state(&protocol_system, &chain)
+                .await
+            {
                 Ok(state) => Some(
                     self.db_gateway
                         .get_block(&BlockIdentifier::Hash(state.block_hash))
@@ -695,13 +699,17 @@ where
                 chain,
                 protocol_system,
                 latest_seen_block,
-                latest_seen_ts: buffer_status.as_ref().map(|status| status.latest_seen_ts),
+                latest_seen_ts: buffer_status
+                    .as_ref()
+                    .map(|status| status.latest_seen_ts),
                 latest_buffer_db_committed_block_height: buffer_status
                     .as_ref()
                     .and_then(|status| status.latest_db_committed_block_height),
                 latest_rpc_visible_block,
                 latest_committed_block,
-                latest_committed_ts: committed_block.as_ref().map(|block| block.ts),
+                latest_committed_ts: committed_block
+                    .as_ref()
+                    .map(|block| block.ts),
                 latest_finalized_block,
                 oldest_uncommitted_block: buffer_status
                     .as_ref()
@@ -710,12 +718,12 @@ where
                     .as_ref()
                     .map(|status| status.buffered_block_count)
                     .unwrap_or_default(),
-                pending_vs_committed_gap: latest_seen_block.zip(latest_committed_block).map(
-                    |(seen, committed)| seen.saturating_sub(committed),
-                ),
-                seen_vs_finalized_gap: latest_seen_block.zip(latest_finalized_block).map(
-                    |(seen, finalized)| seen.saturating_sub(finalized),
-                ),
+                pending_vs_committed_gap: latest_seen_block
+                    .zip(latest_committed_block)
+                    .map(|(seen, committed)| seen.saturating_sub(committed)),
+                seen_vs_finalized_gap: latest_seen_block
+                    .zip(latest_finalized_block)
+                    .map(|(seen, finalized)| seen.saturating_sub(finalized)),
             });
         }
 
@@ -1698,6 +1706,11 @@ mod tests {
                 f: &dyn Fn(&BlockAggregatedChanges) -> bool,
                 protocol_system: &'a str,
             ) -> Result<Option<BlockAggregatedChanges>,PendingDeltasError>;
+
+            fn get_sync_status(
+                &self,
+                protocol_system: &str,
+            ) -> Result<Option<crate::services::deltas_buffer::BufferSyncStatus>, PendingDeltasError>;
         }
     }
 
@@ -1778,8 +1791,8 @@ mod tests {
             .version
             .timestamp
             .unwrap()
-            .timestamp_millis() -
-            result
+            .timestamp_millis()
+            - result
                 .version
                 .timestamp
                 .unwrap()
@@ -3059,10 +3072,10 @@ mod tests {
         #[case] traded_n_days_ago: Option<u64>,
         #[case] should_pass: bool,
     ) {
-        let use_addresses = plan_header == Some("restricted") &&
-            request_quality.is_none() &&
-            traded_n_days_ago.is_none() &&
-            should_pass;
+        let use_addresses = plan_header == Some("restricted")
+            && request_quality.is_none()
+            && traded_n_days_ago.is_none()
+            && should_pass;
 
         let mut gw = MockGateway::new();
         if should_pass {

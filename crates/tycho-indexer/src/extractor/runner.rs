@@ -47,10 +47,7 @@ use crate::{
         uniswap_v3_bootstrap::{build_uniswap_v3_bootstrap_block, parse_bootstrap_params},
         ExtractionError, Extractor, ExtractorExtension, ExtractorMsg,
     },
-    pb::sf::substreams::{
-        rpc::v2::BlockScopedData,
-        v1::Package,
-    },
+    pb::sf::substreams::{rpc::v2::BlockScopedData, v1::Package},
     substreams::{
         stream::{BlockResponse, SubstreamsStream},
         SubstreamsEndpoint,
@@ -677,7 +674,8 @@ impl ExtractorBuilder {
     }
 
     async fn ensure_spkg(&self) -> Result<(), ExtractionError> {
-        self.ensure_spkg_path(&self.config.spkg).await
+        self.ensure_spkg_path(&self.config.spkg)
+            .await
     }
 
     async fn ensure_spkg_path(&self, spkg_path: &str) -> Result<(), ExtractionError> {
@@ -888,7 +886,9 @@ impl ExtractorBuilder {
         let rpc_client = self
             .rpc_client
             .as_ref()
-            .ok_or_else(|| ExtractionError::Setup("missing RPC client for bootstrap".to_string()))?;
+            .ok_or_else(|| {
+                ExtractionError::Setup("missing RPC client for bootstrap".to_string())
+            })?;
         let parsed_params = self.validate_bootstrap_config(bootstrap)?;
 
         info!(
@@ -915,10 +915,7 @@ impl ExtractorBuilder {
         let bootstrap_block_hash = changes.block.hash.clone();
 
         extractor
-            .handle_block_changes(
-                changes,
-                format!("bootstrap@{}", parsed_params.bootstrap_block),
-            )
+            .handle_block_changes(changes, format!("bootstrap@{}", parsed_params.bootstrap_block))
             .await?;
         extractor.flush().await?;
         extractor
@@ -992,12 +989,13 @@ impl ExtractorBuilder {
                 let completed_bootstrap_block = extractor
                     .get_completed_bootstrap_block()
                     .await?;
-                let configured_bootstrap_block = u64::try_from(bootstrap.start_block).map_err(|_| {
-                    ExtractionError::Setup(format!(
-                        "bootstrap start_block must be non-negative for extractor `{}`",
-                        self.config.name
-                    ))
-                })?;
+                let configured_bootstrap_block =
+                    u64::try_from(bootstrap.start_block).map_err(|_| {
+                        ExtractionError::Setup(format!(
+                            "bootstrap start_block must be non-negative for extractor `{}`",
+                            self.config.name
+                        ))
+                    })?;
 
                 if completed_bootstrap_block == Some(configured_bootstrap_block) {
                     info!(
@@ -1544,9 +1542,8 @@ dci_plugin:
                 bootstrap: Some(BootstrapConfig {
                     strategy: BootstrapStrategy::UniswapV3Rpc,
                     start_block: 42,
-                    params:
-                        "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                            .to_owned(),
+                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
+                        .to_owned(),
                 }),
                 ..Default::default()
             },
@@ -1581,8 +1578,7 @@ dci_plugin:
         let bootstrap = BootstrapConfig {
             strategy: BootstrapStrategy::UniswapV3Rpc,
             start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                .to_owned(),
+            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         };
 
         let parsed = builder
@@ -1603,8 +1599,7 @@ dci_plugin:
         let bootstrap = BootstrapConfig {
             strategy: BootstrapStrategy::UniswapV3Rpc,
             start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                .to_owned(),
+            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         };
 
         let err = builder

@@ -483,11 +483,11 @@ where
             .find(|tx_with_changes| {
                 tx_with_changes
                     .balance_changes
-                    .contains_key(component_id) ||
-                    tx_with_changes
+                    .contains_key(component_id)
+                    || tx_with_changes
                         .protocol_components
-                        .contains_key(component_id) ||
-                    tx_with_changes
+                        .contains_key(component_id)
+                    || tx_with_changes
                         .state_updates
                         .contains_key(component_id)
             })

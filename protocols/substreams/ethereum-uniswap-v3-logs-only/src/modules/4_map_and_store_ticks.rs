@@ -14,6 +14,10 @@ use substreams::{
 
 use anyhow::Ok;
 
+fn decode_prefixed_hex(value: &str) -> Vec<u8> {
+    hex::decode(value.trim_start_matches("0x")).unwrap()
+}
+
 #[substreams::handlers::map]
 pub fn map_ticks_changes(events: Events) -> Result<TickDeltas, anyhow::Error> {
     let ticks_deltas = events
@@ -45,7 +49,7 @@ fn event_to_ticks_deltas(event: PoolEvent) -> Vec<TickDelta> {
         pool_event::Type::Mint(mint) => {
             vec![
                 TickDelta {
-                    pool_address: hex::decode(&event.pool_address).unwrap(),
+                    pool_address: decode_prefixed_hex(&event.pool_address),
                     tick_index: mint.tick_lower,
                     liquidity_net_delta: BigInt::from_str(&mint.amount)
                         .unwrap()
@@ -54,7 +58,7 @@ fn event_to_ticks_deltas(event: PoolEvent) -> Vec<TickDelta> {
                     transaction: event.transaction.clone(),
                 },
                 TickDelta {
-                    pool_address: hex::decode(&event.pool_address).unwrap(),
+                    pool_address: decode_prefixed_hex(&event.pool_address),
                     tick_index: mint.tick_upper,
                     liquidity_net_delta: BigInt::from_str(&mint.amount)
                         .unwrap()
@@ -67,7 +71,7 @@ fn event_to_ticks_deltas(event: PoolEvent) -> Vec<TickDelta> {
         }
         pool_event::Type::Burn(burn) => vec![
             TickDelta {
-                pool_address: hex::decode(&event.pool_address).unwrap(),
+                pool_address: decode_prefixed_hex(&event.pool_address),
                 tick_index: burn.tick_lower,
                 liquidity_net_delta: BigInt::from_str(&burn.amount)
                     .unwrap()
@@ -77,7 +81,7 @@ fn event_to_ticks_deltas(event: PoolEvent) -> Vec<TickDelta> {
                 transaction: event.transaction.clone(),
             },
             TickDelta {
-                pool_address: hex::decode(&event.pool_address).unwrap(),
+                pool_address: decode_prefixed_hex(&event.pool_address),
                 tick_index: burn.tick_upper,
                 liquidity_net_delta: BigInt::from_str(&burn.amount)
                     .unwrap()

@@ -404,7 +404,10 @@ fn parse_i64_yaml_value(value: &Value) -> Result<i64, Box<dyn std::error::Error>
 }
 
 fn extract_bootstrap_block_from_query(params: &str) -> Result<i64, Box<dyn std::error::Error>> {
-    for pair in params.split('&').filter(|part| !part.is_empty()) {
+    for pair in params
+        .split('&')
+        .filter(|part| !part.is_empty())
+    {
         let Some((key, value)) = pair.split_once('=') else {
             return Err(format!("invalid bootstrap param `{pair}`").into());
         };
@@ -654,46 +657,42 @@ fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), Ext
 
     let (control_tx, control_rx) = mpsc::channel();
 
-    let (extraction_tasks, other_tasks) = main_runtime
-        .block_on(async {
-            create_tracing_subscriber();
-            let _metrics_task = create_metrics_exporter();
-            #[cfg(feature = "jemalloc")]
-            spawn_jemalloc_stats_reporter();
+    let (extraction_tasks, other_tasks) = main_runtime.block_on(async {
+        create_tracing_subscriber();
+        let _metrics_task = create_metrics_exporter();
+        #[cfg(feature = "jemalloc")]
+        spawn_jemalloc_stats_reporter();
 
-            info!("Starting Tycho");
-            debug!("{} CPUs detected", num_cpus::get());
-            let extractors_config = ExtractorConfigs::from_yaml(&index_args.extractors_config)
-                .map_err(|e| {
-                    ExtractionError::Setup(format!("Failed to load extractors.yaml. {e}"))
-                })?;
+        info!("Starting Tycho");
+        debug!("{} CPUs detected", num_cpus::get());
+        let extractors_config = ExtractorConfigs::from_yaml(&index_args.extractors_config)
+            .map_err(|e| ExtractionError::Setup(format!("Failed to load extractors.yaml. {e}")))?;
 
-            let retention_horizon: NaiveDateTime = index_args
-                .retention_horizon
-                .parse()
-                .expect("Failed to parse retention horizon");
+        let retention_horizon: NaiveDateTime = index_args
+            .retention_horizon
+            .parse()
+            .expect("Failed to parse retention horizon");
 
-            let (extraction_tasks, other_tasks) = create_indexing_tasks(
-                &global_args,
-                &index_args.substreams_args,
-                &index_args
-                    .chains
-                    .iter()
-                    .map(|chain_str| {
-                        Chain::from_str(chain_str)
-                            .unwrap_or_else(|_| panic!("Unknown chain {chain_str}"))
-                    })
-                    .collect::<Vec<_>>(),
-                retention_horizon,
-                extractors_config,
-                Some(extraction_runtime.handle()),
-                index_args.settlement_contract,
-            )
-            .await?;
+        let (extraction_tasks, other_tasks) = create_indexing_tasks(
+            &global_args,
+            &index_args.substreams_args,
+            &index_args
+                .chains
+                .iter()
+                .map(|chain_str| {
+                    Chain::from_str(chain_str)
+                        .unwrap_or_else(|_| panic!("Unknown chain {chain_str}"))
+                })
+                .collect::<Vec<_>>(),
+            retention_horizon,
+            extractors_config,
+            Some(extraction_runtime.handle()),
+            index_args.settlement_contract,
+        )
+        .await?;
 
-            Ok::<_, ExtractionError>((extraction_tasks, other_tasks))
-        })
-        ?;
+        Ok::<_, ExtractionError>((extraction_tasks, other_tasks))
+    })?;
 
     let extractor_ctrl_tx = control_tx.clone();
     extraction_runtime.spawn(async move {
