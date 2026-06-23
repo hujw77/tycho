@@ -620,11 +620,30 @@ where
                 }
             }
 
-            if !protocol_msg.snapshots.states.is_empty() {
-                info!("Decoded {} snapshots for protocol {protocol}", new_components.len());
+            let snapshot_count = protocol_msg.snapshots.states.len();
+            let failed_snapshot_count = msg_failed_components.len();
+            if snapshot_count > 0 {
+                let failed_samples = msg_failed_components
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                info!(
+                    protocol = %protocol,
+                    snapshot_count,
+                    decoded_snapshot_count = new_components.len(),
+                    failed_snapshot_count,
+                    count_token_skips,
+                    failed_samples = ?failed_samples,
+                    "Decoded protocol snapshots",
+                );
             }
             if count_token_skips > 0 {
-                info!("Skipped {count_token_skips} pools due to missing tokens");
+                info!(
+                    protocol = %protocol,
+                    count_token_skips,
+                    "Skipped pools due to missing tokens",
+                );
             }
 
             //TODO: should we remove failed components for new_components?

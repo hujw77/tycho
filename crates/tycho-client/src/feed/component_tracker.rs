@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use tycho_common::models::{
     blockchain::{BlockAggregatedChanges, DCIUpdate},
     protocol::ProtocolComponent,
@@ -199,6 +199,13 @@ where
             .map(|comp| (comp.id.clone(), comp))
             .filter(|(id, _)| !self.filter.is_blocklisted(id))
             .collect::<HashMap<_, _>>();
+
+        info!(
+            chain = %self.chain,
+            protocol_system = %self.protocol_system,
+            n_components = self.components.len(),
+            "Initialised tracked components",
+        );
 
         self.reinitialize_contracts();
 
