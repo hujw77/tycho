@@ -21,8 +21,9 @@ use crate::{
         dynamic_contract_indexer::cache::DCICacheError,
         models::BlockChanges,
         reorg_buffer::{
-            AccountStateIdType, AccountStateKeyType, AccountStateValueType, ProtocolStateIdType,
-            ProtocolStateKeyType, ProtocolStateValueType, StateUpdateBufferEntry,
+            AccountStateIdType, AccountStateKeyType, AccountStateValueType,
+            BufferedProtocolStateValue, ProtocolStateIdType, ProtocolStateKeyType,
+            ProtocolStateValueType, StateUpdateBufferEntry,
         },
     },
     pb::sf::substreams::{
@@ -42,6 +43,8 @@ pub mod reorg_buffer;
 pub mod runner;
 pub mod token_analysis_cron;
 mod u256_num;
+pub mod uniswap_v3_bootstrap;
+pub mod uniswap_v3_stream;
 
 #[derive(Error, Debug, PartialEq)]
 pub enum ExtractionError {
@@ -114,6 +117,27 @@ pub trait Extractor: Send + Sync {
         inp: BlockScopedData,
     ) -> Result<Option<ExtractorMsg>, ExtractionError>;
 
+    /// Processes a fully materialized block update produced outside the Substreams stream.
+    ///
+    /// This is used for local bootstrap flows that want to reuse the normal extractor, reorg
+    /// buffer, aggregation, and persistence pipeline without fabricating a `BlockScopedData`.
+    async fn handle_block_changes(
+        &self,
+        changes: BlockChanges,
+        cursor: String,
+    ) -> Result<Option<ExtractorMsg>, ExtractionError>;
+
+    /// Returns the bootstrap block that has already been fully materialized and committed, if
+    /// any.
+    async fn get_completed_bootstrap_block(&self) -> Result<Option<u64>, ExtractionError>;
+
+    /// Persists that bootstrap for `bootstrap_block` has completed and is durable in storage.
+    async fn mark_bootstrap_completed(
+        &self,
+        bootstrap_block: u64,
+        block_hash: tycho_common::models::BlockHash,
+    ) -> Result<(), ExtractionError>;
+
     /// Drains the partial block buffer and processes the accumulated block as a full block.
     /// The runner calls this when it has sent the last partial for a block.
     async fn collect_and_process_full_block(
@@ -122,6 +146,9 @@ pub trait Extractor: Send + Sync {
         final_block_height: u64,
         clock: Option<Clock>,
     ) -> Result<Option<ExtractorMsg>, ExtractionError>;
+
+    /// Forces all buffered finalized blocks to be committed to storage.
+    async fn flush(&self) -> Result<(), ExtractionError>;
 
     /// Processes a chain reorg signal.
     async fn handle_revert(
@@ -153,7 +180,7 @@ pub trait ExtractorExtension: Send + Sync {
 }
 
 /// Wrapper to carry a cursor along with another struct.
-#[derive(Debug, DeepSizeOf)]
+#[derive(Clone, Debug, DeepSizeOf)]
 pub(crate) struct BlockUpdateWithCursor<B: std::fmt::Debug> {
     block_update: B,
     cursor: String,
@@ -205,7 +232,7 @@ where
     fn get_filtered_protocol_state_update(
         &self,
         keys: Vec<(&ProtocolStateIdType, &ProtocolStateKeyType)>,
-    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), ProtocolStateValueType> {
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue> {
         self.block_update
             .get_filtered_protocol_state_update(keys)
     }

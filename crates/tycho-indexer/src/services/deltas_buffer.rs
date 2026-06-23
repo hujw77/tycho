@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::NaiveDateTime;
 use deepsize::DeepSizeOf;
 use futures03::{stream, StreamExt};
 use metrics::gauge;
@@ -54,6 +55,16 @@ pub enum PendingDeltasError {
 
 pub type Result<T> = std::result::Result<T, PendingDeltasError>;
 
+#[derive(Debug, Clone)]
+pub struct BufferSyncStatus {
+    pub oldest_uncommitted_block: u64,
+    pub latest_seen_block: u64,
+    pub latest_seen_ts: NaiveDateTime,
+    pub latest_finalized_block: u64,
+    pub latest_db_committed_block_height: Option<u64>,
+    pub buffered_block_count: usize,
+}
+
 #[async_trait::async_trait]
 pub trait PendingDeltasBuffer {
     fn merge_native_states(
@@ -90,6 +101,8 @@ pub trait PendingDeltasBuffer {
         f: &dyn Fn(&BlockAggregatedChanges) -> bool,
         protocol_system: &str,
     ) -> Result<Option<BlockAggregatedChanges>>;
+
+    fn get_sync_status(&self, protocol_system: &str) -> Result<Option<BufferSyncStatus>>;
 }
 
 impl PendingDeltas {
@@ -431,8 +444,8 @@ impl PendingDeltasBuffer for PendingDeltas {
                         let tvl_matches = min_tvl.as_ref().is_none_or(|tvl| {
                             components_tvls
                                 .get(&comp.id)
-                                .unwrap_or(&0.0) >=
-                                tvl
+                                .unwrap_or(&0.0)
+                                >= tvl
                         });
 
                         id_matches && tvl_matches
@@ -492,6 +505,39 @@ impl PendingDeltasBuffer for PendingDeltas {
         }
 
         Ok(None)
+    }
+
+    fn get_sync_status(&self, protocol_system: &str) -> Result<Option<BufferSyncStatus>> {
+        let buffer = self
+            .buffers
+            .get(protocol_system)
+            .ok_or_else(|| {
+                error!("Missing reorg buffer for {}", protocol_system);
+                PendingDeltasError::UnknownExtractor(protocol_system.to_string())
+            })?;
+        let guard = buffer.lock().map_err(|e| {
+            PendingDeltasError::LockError(protocol_system.to_string(), e.to_string())
+        })?;
+
+        let Some(oldest_uncommitted_block) = guard.get_oldest_block() else {
+            return Ok(None);
+        };
+
+        let Some(latest_entry) = guard
+            .get_block_range(None, None)?
+            .last()
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(BufferSyncStatus {
+            oldest_uncommitted_block: oldest_uncommitted_block.number,
+            latest_seen_block: latest_entry.block.number,
+            latest_seen_ts: latest_entry.block.ts,
+            latest_finalized_block: latest_entry.finalized_block_height,
+            latest_db_committed_block_height: latest_entry.db_committed_block_height,
+            buffered_block_count: guard.len(),
+        }))
     }
 }
 

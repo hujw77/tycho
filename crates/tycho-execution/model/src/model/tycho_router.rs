@@ -569,8 +569,8 @@ fn _split_swap(
         };
 
         let mut swap_receiver = Address::Router;
-        if token_out_index == checked_subtract(n_tokens, 1)? && !is_cyclical ||
-            is_cyclical && token_out_index == 0
+        if token_out_index == checked_subtract(n_tokens, 1)? && !is_cyclical
+            || is_cyclical && token_out_index == 0
         {
             swap_receiver = receiver;
         }

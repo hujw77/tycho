@@ -22,7 +22,7 @@ binaries:
 modules:
   - name: map_pools_created
     kind: map
-    initialBlock: 12369621
+    initialBlock: 25377209
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
@@ -31,7 +31,7 @@ modules:
 
   - name: store_pools
     kind: store
-    initialBlock: 12369621
+    initialBlock: 25377209
     updatePolicy: set_if_not_exists
     valueType: proto:uniswap.v3.Pool
     inputs:
@@ -39,8 +39,9 @@ modules:
 
   - name: map_events
     kind: map
-    initialBlock: 12369621
+    initialBlock: 25377209
     inputs:
+      - params: string
       - source: sf.ethereum.type.v2.Block
       - store: store_pools
     output:
@@ -48,15 +49,16 @@ modules:
 
   - name: map_balance_changes
     kind: map
-    initialBlock: 12369621
+    initialBlock: 25377209
     inputs:
       - map: map_events
+      - store: store_pools
     output:
       type: proto:tycho.evm.v1.BlockBalanceDeltas
 
   - name: store_pools_balances
     kind: store
-    initialBlock: 12369621
+    initialBlock: 25377209
     updatePolicy: add
     valueType: bigint
     inputs:
@@ -64,7 +66,7 @@ modules:
 
   - name: map_ticks_changes
     kind: map
-    initialBlock: 12369621
+    initialBlock: 25377209
     inputs:
       - map: map_events
     output:
@@ -72,7 +74,7 @@ modules:
 
   - name: store_ticks_liquidity
     kind: store
-    initialBlock: 12369621
+    initialBlock: 25377209
     updatePolicy: add
     valueType: bigint
     inputs:
@@ -80,7 +82,7 @@ modules:
 
   - name: store_pool_current_tick
     kind: store
-    initialBlock: 12369621
+    initialBlock: 25377209
     updatePolicy: set
     valueType: int64
     inputs:
@@ -88,7 +90,7 @@ modules:
 
   - name: map_liquidity_changes
     kind: map
-    initialBlock: 12369621
+    initialBlock: 25377209
     inputs:
       - map: map_events
       - store: store_pool_current_tick
@@ -97,7 +99,7 @@ modules:
 
   - name: store_liquidity
     kind: store
-    initialBlock: 12369621
+    initialBlock: 25377209
     updatePolicy: set_sum
     valueType: bigint
     inputs:
@@ -105,7 +107,7 @@ modules:
 
   - name: map_protocol_changes
     kind: map
-    initialBlock: 12369621
+    initialBlock: 25377209
     inputs:
       - source: sf.ethereum.type.v2.Block
       - map: map_pools_created
@@ -124,3 +126,4 @@ modules:
 
 params:
   map_pools_created: "1F98431c8aD98523631AE4a59f267346ea31F984"
+  map_events: "1F98431c8aD98523631AE4a59f267346ea31F984"

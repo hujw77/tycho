@@ -25,12 +25,12 @@ pub struct SwapGroup {
 
 impl PartialEq for SwapGroup {
     fn eq(&self, other: &Self) -> bool {
-        self.token_in == other.token_in &&
-            self.token_out == other.token_out &&
-            self.protocol_system == other.protocol_system &&
-            self.swaps == other.swaps &&
-            self.split == other.split &&
-            self.estimated_gas == other.estimated_gas
+        self.token_in == other.token_in
+            && self.token_out == other.token_out
+            && self.protocol_system == other.protocol_system
+            && self.swaps == other.swaps
+            && self.split == other.split
+            && self.estimated_gas == other.estimated_gas
     }
 }
 

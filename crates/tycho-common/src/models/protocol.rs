@@ -85,19 +85,24 @@ impl ProtocolComponent<Arc<Token>> {
 
 impl DeepSizeOf for ProtocolComponent {
     fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
-        self.id.deep_size_of_children(ctx) +
-            self.protocol_system
-                .deep_size_of_children(ctx) +
-            self.protocol_type_name
-                .deep_size_of_children(ctx) +
-            self.chain.deep_size_of_children(ctx) +
-            self.tokens.deep_size_of_children(ctx) +
-            self.contract_addresses
-                .deep_size_of_children(ctx) +
-            self.static_attributes
-                .deep_size_of_children(ctx) +
-            self.change.deep_size_of_children(ctx) +
-            self.creation_tx
+        self.id.deep_size_of_children(ctx)
+            + self
+                .protocol_system
+                .deep_size_of_children(ctx)
+            + self
+                .protocol_type_name
+                .deep_size_of_children(ctx)
+            + self.chain.deep_size_of_children(ctx)
+            + self.tokens.deep_size_of_children(ctx)
+            + self
+                .contract_addresses
+                .deep_size_of_children(ctx)
+            + self
+                .static_attributes
+                .deep_size_of_children(ctx)
+            + self.change.deep_size_of_children(ctx)
+            + self
+                .creation_tx
                 .deep_size_of_children(ctx)
     }
 }

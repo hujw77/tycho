@@ -187,8 +187,8 @@ impl TychoEncoder for TychoRouterEncoder {
             }
         }
 
-        if solution_tokens.len() !=
-            solution_tokens
+        if solution_tokens.len()
+            != solution_tokens
                 .iter()
                 .cloned()
                 .collect::<HashSet<&Bytes>>()

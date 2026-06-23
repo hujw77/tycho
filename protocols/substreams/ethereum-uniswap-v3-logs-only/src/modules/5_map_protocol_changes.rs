@@ -3,13 +3,24 @@ use crate::pb::uniswap::v3::{
     Events, LiquidityChanges, TickDeltas,
 };
 use itertools::Itertools;
-use std::{collections::HashMap, str::FromStr, vec};
-use substreams::{pb::substreams::StoreDeltas, scalar::BigInt};
+use std::{
+    collections::{HashMap, VecDeque},
+    str::FromStr,
+    vec,
+};
+use substreams::{
+    pb::substreams::{StoreDelta, StoreDeltas},
+    scalar::BigInt,
+};
 use substreams_ethereum::pb::eth::v2::{self as eth};
 use substreams_helper::hex::Hexable;
 use tycho_substreams::{balances::aggregate_balances_changes, prelude::*};
 
 type PoolAddress = Vec<u8>;
+
+fn decode_prefixed_hex(value: &str) -> Vec<u8> {
+    hex::decode(value.trim_start_matches("0x")).unwrap()
+}
 
 #[substreams::handlers::map]
 pub fn map_protocol_changes(
@@ -73,11 +84,21 @@ pub fn map_protocol_changes(
         });
 
     // Insert ticks net-liquidity changes
-    ticks_store_deltas
+    let mut indexed_tick_store_deltas = index_store_deltas(ticks_store_deltas.deltas);
+    ticks_map_deltas
         .deltas
         .into_iter()
-        .zip(ticks_map_deltas.deltas)
-        .for_each(|(store_delta, tick_delta)| {
+        .for_each(|tick_delta| {
+            let tick_store_key = format!(
+                "pool:{}:tick:{}",
+                hex::encode(&tick_delta.pool_address),
+                tick_delta.tick_index
+            );
+            let store_delta = pop_matching_store_delta(
+                &mut indexed_tick_store_deltas,
+                &tick_store_key,
+                tick_delta.ordinal,
+            );
             let new_value_bigint =
                 BigInt::from_str(&String::from_utf8(store_delta.new_value).unwrap()).unwrap();
 
@@ -108,13 +129,20 @@ pub fn map_protocol_changes(
                 attributes: vec![attribute],
             });
         });
+    assert_all_store_deltas_consumed(indexed_tick_store_deltas);
 
     // Insert liquidity changes
-    pool_liquidity_store_deltas
-        .deltas
+    let mut indexed_liquidity_store_deltas = index_store_deltas(pool_liquidity_store_deltas.deltas);
+    pool_liquidity_changes
+        .changes
         .into_iter()
-        .zip(pool_liquidity_changes.changes)
-        .for_each(|(store_delta, change)| {
+        .for_each(|change| {
+            let liquidity_store_key = format!("pool:{}", hex::encode(&change.pool_address));
+            let store_delta = pop_matching_store_delta(
+                &mut indexed_liquidity_store_deltas,
+                &liquidity_store_key,
+                change.ordinal,
+            );
             let new_value_bigint = BigInt::from_str(
                 String::from_utf8(store_delta.new_value)
                     .unwrap()
@@ -137,6 +165,7 @@ pub fn map_protocol_changes(
                 }],
             });
         });
+    assert_all_store_deltas_consumed(indexed_liquidity_store_deltas);
 
     // Insert others changes
     events
@@ -174,7 +203,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
                         .as_ref()
                         .unwrap()
                         .into(),
-                    hex::decode(&event.pool_address).unwrap(),
+                    decode_prefixed_hex(&event.pool_address),
                     Attribute {
                         name: "sqrt_price_x96".to_string(),
                         value: BigInt::from_str(&initalize.sqrt_price)
@@ -185,7 +214,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
                 ),
                 (
                     event.transaction.unwrap().into(),
-                    hex::decode(event.pool_address).unwrap(),
+                    decode_prefixed_hex(&event.pool_address),
                     Attribute {
                         name: "tick".to_string(),
                         value: BigInt::from(initalize.tick).to_signed_bytes_be(),
@@ -201,7 +230,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
                     .as_ref()
                     .unwrap()
                     .into(),
-                hex::decode(&event.pool_address).unwrap(),
+                decode_prefixed_hex(&event.pool_address),
                 Attribute {
                     name: "sqrt_price_x96".to_string(),
                     value: BigInt::from_str(&swap.sqrt_price)
@@ -212,7 +241,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
             ),
             (
                 event.transaction.unwrap().into(),
-                hex::decode(event.pool_address).unwrap(),
+                decode_prefixed_hex(&event.pool_address),
                 Attribute {
                     name: "tick".to_string(),
                     value: BigInt::from(swap.tick).to_signed_bytes_be(),
@@ -227,7 +256,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
                     .as_ref()
                     .unwrap()
                     .into(),
-                hex::decode(&event.pool_address).unwrap(),
+                decode_prefixed_hex(&event.pool_address),
                 Attribute {
                     name: "protocol_fees/token0".to_string(),
                     value: BigInt::from(sfp.fee_protocol_0_new).to_signed_bytes_be(),
@@ -236,7 +265,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
             ),
             (
                 event.transaction.unwrap().into(),
-                hex::decode(event.pool_address).unwrap(),
+                decode_prefixed_hex(&event.pool_address),
                 Attribute {
                     name: "protocol_fees/token1".to_string(),
                     value: BigInt::from(sfp.fee_protocol_1_new).to_signed_bytes_be(),
@@ -245,5 +274,42 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
             ),
         ],
         _ => vec![],
+    }
+}
+
+fn index_store_deltas(deltas: Vec<StoreDelta>) -> HashMap<(String, u64), VecDeque<StoreDelta>> {
+    let mut indexed = HashMap::<(String, u64), VecDeque<StoreDelta>>::new();
+
+    deltas.into_iter().for_each(|delta| {
+        indexed
+            .entry((delta.key.clone(), delta.ordinal))
+            .or_default()
+            .push_back(delta);
+    });
+
+    indexed
+}
+
+fn pop_matching_store_delta(
+    indexed_store_deltas: &mut HashMap<(String, u64), VecDeque<StoreDelta>>,
+    key: &str,
+    ordinal: u64,
+) -> StoreDelta {
+    indexed_store_deltas
+        .get_mut(&(key.to_string(), ordinal))
+        .and_then(|queue| queue.pop_front())
+        .unwrap_or_else(|| panic!("Missing matching store delta for key `{}` at ordinal {}", key, ordinal))
+}
+
+fn assert_all_store_deltas_consumed(
+    indexed_store_deltas: HashMap<(String, u64), VecDeque<StoreDelta>>,
+) {
+    let leftovers = indexed_store_deltas
+        .into_iter()
+        .filter_map(|((key, ordinal), mut queue)| queue.pop_front().map(|_| (key, ordinal)))
+        .collect::<Vec<_>>();
+
+    if !leftovers.is_empty() {
+        panic!("Unmatched store deltas remaining: {:?}", leftovers);
     }
 }

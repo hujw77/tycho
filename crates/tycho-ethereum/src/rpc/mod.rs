@@ -143,7 +143,7 @@ impl EthereumRpcClient {
         // Assume EIP-1559 first (most modern chains)
         // Get the latest block to check for base fee
         let block = self
-            .eth_get_block_by_number(BlockId::Number(BlockNumberOrTag::Latest))
+            .get_block_by_number(BlockId::Number(BlockNumberOrTag::Latest))
             .await?;
 
         let block_number = block.header.number;
@@ -214,10 +214,7 @@ impl EthereumRpcClient {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub(crate) async fn eth_get_block_by_number(
-        &self,
-        block_id: BlockId,
-    ) -> Result<Block, RPCError> {
+    pub async fn get_block_by_number(&self, block_id: BlockId) -> Result<Block, RPCError> {
         let full_tx_objects = false;
 
         let result: Option<Block> = self
@@ -640,7 +637,7 @@ impl EthereumRpcClient {
     ///
     /// Returns the output data from the call or an error if the call failed.
     #[instrument(level = "debug", skip(self, request))]
-    pub(crate) async fn eth_call(
+    pub async fn eth_call(
         &self,
         request: TransactionRequest,
         block: BlockNumberOrTag,
@@ -658,6 +655,64 @@ impl EthereumRpcClient {
                     e,
                 )
             })
+    }
+
+    /// Executes many read-only `eth_call` requests using the client's batching configuration.
+    ///
+    /// Requests are chunked according to `max_batch_size` when batching is enabled. When batching
+    /// is disabled the calls fall back to sequential `eth_call`.
+    #[instrument(level = "debug", skip(self, requests))]
+    pub async fn eth_call_many(
+        &self,
+        requests: Vec<TransactionRequest>,
+        block: BlockNumberOrTag,
+    ) -> Result<Vec<Bytes>, RPCError> {
+        let Some(max_batch_size) = self.batching.max_batch_size() else {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                responses.push(self.eth_call(request, block).await?);
+            }
+            return Ok(responses);
+        };
+
+        let chunk_size = usize::max(1, max_batch_size);
+        let mut responses = Vec::with_capacity(requests.len());
+
+        for request_chunk in requests.chunks(chunk_size) {
+            let chunk_res = self
+                .retry_policy
+                .call_with_retry(|| {
+                    let block = block.clone();
+                    let request_chunk = request_chunk.to_vec();
+                    async move {
+                        let mut batch = self.inner.new_batch();
+                        let mut batch_calls = request_chunk
+                            .into_iter()
+                            .map(|request| {
+                                batch.add_call::<_, AlloyBytes>(
+                                    "eth_call",
+                                    &(request, block.clone()),
+                                )
+                            })
+                            .collect::<Result<Vec<_>, RpcError<TransportErrorKind>>>()?;
+
+                        batch.send().await?;
+
+                        let mut chunk_results = Vec::with_capacity(batch_calls.len());
+                        for call in batch_calls.iter_mut() {
+                            chunk_results.push(Bytes::from(call.await?.to_vec()));
+                        }
+
+                        Ok(chunk_results)
+                    }
+                })
+                .await
+                .map_err(|e| RPCError::from_alloy("Failed to send batched eth_call requests", e))?;
+
+            responses.extend(chunk_res);
+        }
+
+        Ok(responses)
     }
 
     /// Executes `eth_call` with EVM state overrides.

@@ -2212,8 +2212,8 @@ mod tests {
         }
         const {
             assert!(
-                NewComponentBalanceLatest::MAX_BATCH_SIZE * NewComponentBalanceLatest::FIELD_COUNT <=
-                    32767,
+                NewComponentBalanceLatest::MAX_BATCH_SIZE * NewComponentBalanceLatest::FIELD_COUNT
+                    <= 32767,
                 "NewComponentBalanceLatest: MAX_BATCH_SIZE * FIELD_COUNT exceeds i16::MAX"
             );
         }
@@ -2225,8 +2225,8 @@ mod tests {
         }
         const {
             assert!(
-                NewProtocolStateLatest::MAX_BATCH_SIZE * NewProtocolStateLatest::FIELD_COUNT <=
-                    32767,
+                NewProtocolStateLatest::MAX_BATCH_SIZE * NewProtocolStateLatest::FIELD_COUNT
+                    <= 32767,
                 "NewProtocolStateLatest: MAX_BATCH_SIZE * FIELD_COUNT exceeds i16::MAX"
             );
         }
@@ -2268,9 +2268,9 @@ mod tests {
         }
         const {
             assert!(
-                NewEntryPointTracingResult::MAX_BATCH_SIZE *
-                    NewEntryPointTracingResult::FIELD_COUNT <=
-                    32767,
+                NewEntryPointTracingResult::MAX_BATCH_SIZE
+                    * NewEntryPointTracingResult::FIELD_COUNT
+                    <= 32767,
                 "NewEntryPointTracingResult: MAX_BATCH_SIZE * FIELD_COUNT exceeds i16::MAX"
             );
         }

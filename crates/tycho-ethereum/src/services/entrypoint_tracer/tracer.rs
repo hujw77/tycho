@@ -69,8 +69,8 @@ impl EVMEntrypointService {
             tx_params["from"] = json!(caller.to_string());
         }
 
-        if params.state_overrides.is_none() ||
-            params
+        if params.state_overrides.is_none()
+            || params
                 .state_overrides
                 .as_ref()
                 .unwrap_or(&BTreeMap::new())
@@ -1657,7 +1657,7 @@ mod tests {
 
         // Get a recent finalized block from the chain (works on any EVM chain)
         let recent_block = rpc_client
-            .eth_get_block_by_number(BlockId::Number(BlockNumberOrTag::Finalized))
+            .get_block_by_number(BlockId::Number(BlockNumberOrTag::Finalized))
             .await
             .expect("Failed to get finalized block");
         let block_hash = Bytes::from(recent_block.header.hash.to_vec());

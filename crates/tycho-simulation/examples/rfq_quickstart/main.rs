@@ -126,9 +126,9 @@ async fn main() {
         (env::var("HASHFLOW_USER").ok(), env::var("HASHFLOW_KEY").ok());
     let (liquorice_user, liquorice_key) =
         (env::var("LIQUORICE_USER").ok(), env::var("LIQUORICE_KEY").ok());
-    if (bebop_user.is_none() || bebop_key.is_none()) &&
-        (hashflow_user.is_none() || hashflow_key.is_none()) &&
-        (liquorice_user.is_none() || liquorice_key.is_none())
+    if (bebop_user.is_none() || bebop_key.is_none())
+        && (hashflow_user.is_none() || hashflow_key.is_none())
+        && (liquorice_user.is_none() || liquorice_key.is_none())
     {
         panic!("No RFQ credentials found. Please set BEBOP_USER and BEBOP_KEY, HASHFLOW_USER and HASHFLOW_KEY, or LIQUORICE_USER and LIQUORICE_KEY environment variables.");
     }
@@ -879,9 +879,9 @@ pub fn encode_input(selector: &str, mut encoded_args: Vec<u8>) -> Vec<u8> {
     // Remove extra prefix if present (32 bytes for dynamic data)
     // Alloy encoding is including a prefix for dynamic data indicating the offset or length
     // but at this point we don't want that
-    if encoded_args.len() > 32 &&
-        encoded_args[..32] ==
-            [0u8; 31]
+    if encoded_args.len() > 32
+        && encoded_args[..32]
+            == [0u8; 31]
                 .into_iter()
                 .chain([32].to_vec())
                 .collect::<Vec<u8>>()

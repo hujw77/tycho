@@ -48,8 +48,8 @@ pub fn _call_swap_on_executor(
 
     let measure_at = if transfer_data.output_to_router { Address::Router } else { receiver };
 
-    let balance_before_swap = if measure_at.is_sender_controlled() ||
-        transfer_data
+    let balance_before_swap = if measure_at.is_sender_controlled()
+        || transfer_data
             .token_out
             .is_sender_controlled()
     {
@@ -86,8 +86,8 @@ pub fn _call_swap_on_executor(
         _revoke_unconsumed_approval(state, transfer_data.token_in, transfer_data.receiver)?;
     }
 
-    let balance_after_swap = if measure_at.is_sender_controlled() ||
-        transfer_data
+    let balance_after_swap = if measure_at.is_sender_controlled()
+        || transfer_data
             .token_out
             .is_sender_controlled()
     {

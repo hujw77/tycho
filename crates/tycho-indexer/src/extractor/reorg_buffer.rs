@@ -187,6 +187,18 @@ where
         None
     }
 
+    /// Returns the oldest block currently stored in the buffer.
+    pub fn get_oldest_block(&self) -> Option<tycho_common::models::blockchain::Block> {
+        self.block_messages
+            .front()
+            .map(BlockScoped::block)
+    }
+
+    /// Returns the number of buffered blocks.
+    pub fn len(&self) -> usize {
+        self.block_messages.len()
+    }
+
     /// Returns the number of blocks in the buffer with a block number less than the specified
     /// target block number. Assumes blocks are stored in ascending order.
     pub fn count_blocks_before(&self, target_block: u64) -> usize {
@@ -194,6 +206,11 @@ where
             .iter()
             .take_while(|msg| msg.block().number < target_block)
             .count()
+    }
+
+    /// Drains every buffered block in ascending order.
+    pub fn drain_all(&mut self) -> Vec<B> {
+        self.block_messages.drain(..).collect()
     }
 
     /// Retrieves a range of blocks from the buffer.
@@ -271,8 +288,8 @@ where
 
                 if !version.greater_than(&first_block) {
                     Some(CommitStatus::Committed)
-                } else if (version.greater_than(&first_block)) &
-                    (!version.greater_than(&last_block))
+                } else if (version.greater_than(&first_block))
+                    & (!version.greater_than(&last_block))
                 {
                     Some(CommitStatus::Uncommitted)
                 } else {
@@ -287,6 +304,7 @@ where
 pub type ProtocolStateIdType = ComponentId;
 pub type ProtocolStateKeyType = AttrStoreKey;
 pub type ProtocolStateValueType = StoreVal;
+pub type BufferedProtocolStateValue = Option<ProtocolStateValueType>;
 pub type AccountStateIdType = Bytes;
 pub type AccountStateKeyType = Bytes;
 pub type AccountStateValueType = Bytes;
@@ -298,7 +316,7 @@ pub(crate) trait StateUpdateBufferEntry: std::fmt::Debug {
     fn get_filtered_protocol_state_update(
         &self,
         keys: Vec<(&ProtocolStateIdType, &ProtocolStateKeyType)>,
-    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), ProtocolStateValueType>;
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue>;
 
     #[allow(clippy::mutable_key_type)]
     fn get_filtered_account_state_update(
@@ -353,7 +371,9 @@ where
                     .collect(),
             ) {
                 if remaining_keys.remove(&(key.0.clone(), key.1.clone())) {
-                    res.insert(key, val);
+                    if let Some(val) = val {
+                        res.insert(key, val);
+                    }
                 }
             }
         }
@@ -735,6 +755,46 @@ mod test {
                 ((c_ids[1].clone(), reserve.clone()), Bytes::from(30_u64.to_be_bytes().to_vec()))
             ])
         );
+    }
+
+    #[test]
+    fn test_reorg_buffer_state_lookup_does_not_resurrect_deleted_key_from_older_block() {
+        let mut reorg_buffer = ReorgBuffer::new();
+        reorg_buffer
+            .insert_block(get_block_changes(1))
+            .unwrap();
+
+        let tx = transaction();
+        let component_id = "State1".to_string();
+        let reserve = "reserve".to_string();
+        let deleting_block = BlockChanges::new(
+            "test".to_string(),
+            Chain::Ethereum,
+            testing::block(2),
+            0,
+            false,
+            vec![TxWithChanges {
+                tx,
+                state_updates: HashMap::from([(
+                    component_id.clone(),
+                    ProtocolComponentStateDelta {
+                        component_id: component_id.clone(),
+                        updated_attributes: HashMap::new(),
+                        deleted_attributes: HashSet::from([reserve.clone()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }],
+            Vec::new(),
+        );
+        reorg_buffer
+            .insert_block(deleting_block)
+            .unwrap();
+
+        let (res, missing_keys) = reorg_buffer.lookup_protocol_state(&[(&component_id, &reserve)]);
+        assert!(res.is_empty());
+        assert!(missing_keys.is_empty());
     }
 
     #[test]

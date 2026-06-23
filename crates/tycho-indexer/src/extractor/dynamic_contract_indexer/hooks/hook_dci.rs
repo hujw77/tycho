@@ -533,8 +533,8 @@ where
                         }
                         ProcessingStatus::Failed => {
                             // Check retry count
-                            if state.retry_count < self.max_retries &&
-                                state.retry_count < self.pause_after_retries
+                            if state.retry_count < self.max_retries
+                                && state.retry_count < self.pause_after_retries
                             {
                                 failed_retryable_count += 1;
                                 components_needing_full_processing
@@ -2085,11 +2085,11 @@ mod tests {
             db_gateway2
                 .expect_get_protocol_components()
                 .withf(move |chain, system, ids, min_tvl, pagination| {
-                    chain == &Chain::Ethereum &&
-                        system.as_deref() == Some("uniswap_v4_hooks") &&
-                        ids.is_none() &&
-                        min_tvl.is_none() &&
-                        pagination.is_none()
+                    chain == &Chain::Ethereum
+                        && system.as_deref() == Some("uniswap_v4_hooks")
+                        && ids.is_none()
+                        && min_tvl.is_none()
+                        && pagination.is_none()
                 })
                 .return_once(move |_, _, _, _, _| {
                     Box::pin(async move {

@@ -16,9 +16,9 @@ use tycho_common::{
 };
 
 use crate::extractor::{
-    reorg_buffer::ProtocolStateIdType, AccountStateIdType, AccountStateKeyType,
-    AccountStateValueType, ExtractionError, ProtocolStateKeyType, ProtocolStateValueType,
-    StateUpdateBufferEntry,
+    reorg_buffer::{BufferedProtocolStateValue, ProtocolStateIdType}, AccountStateIdType,
+    AccountStateKeyType, AccountStateValueType, ExtractionError, ProtocolStateKeyType,
+    ProtocolStateValueType, StateUpdateBufferEntry,
 };
 
 /// Storage changes grouped by transaction
@@ -247,7 +247,9 @@ impl BlockChanges {
         } else if self_index < other_index {
             (other, self)
         } else {
-            return Err(MergeError::InvalidState(format!("same partial block index: {self_index}")));
+            return Err(MergeError::InvalidState(format!(
+                "same partial block index: {self_index}"
+            )));
         };
 
         // Merge tokens: later block's tokens take precedence
@@ -404,20 +406,28 @@ impl StateUpdateBufferEntry for BlockChanges {
     fn get_filtered_protocol_state_update(
         &self,
         keys: Vec<(&ProtocolStateIdType, &ProtocolStateKeyType)>,
-    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), ProtocolStateValueType> {
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue> {
         // Convert keys to a HashSet for faster lookups
         let keys_set: HashSet<(&ComponentId, &AttrStoreKey)> = keys.into_iter().collect();
         let mut res = HashMap::new();
 
         for update in self.txs_with_update.iter().rev() {
             for (component_id, protocol_update) in update.state_updates.iter() {
+                for attr in protocol_update
+                    .deleted_attributes
+                    .iter()
+                    .filter(|attr| keys_set.contains(&(component_id, *attr)))
+                {
+                    res.entry((component_id.clone(), attr.clone()))
+                        .or_insert(None);
+                }
                 for (attr, val) in protocol_update
                     .updated_attributes
                     .iter()
                     .filter(|(attr, _)| keys_set.contains(&(component_id, attr)))
                 {
                     res.entry((component_id.clone(), attr.clone()))
-                        .or_insert(val.clone());
+                        .or_insert(Some(val.clone()));
                 }
             }
         }
@@ -1012,11 +1022,56 @@ mod test {
             filtered,
             HashMap::from([
                 // "reserve" in both txs: tx1 value (2000) wins over tx0 value (1000)
-                ((c_id.clone(), attr_reserve), Bytes::from(2000u64).lpad(32, 0)),
+                ((c_id.clone(), attr_reserve), Some(Bytes::from(2000u64).lpad(32, 0))),
                 // "fee" only in tx0: value (50) returned
-                ((c_id, attr_fee), Bytes::from(50u64).lpad(32, 0)),
+                ((c_id, attr_fee), Some(Bytes::from(50u64).lpad(32, 0))),
             ])
         );
+    }
+
+    #[test]
+    fn test_block_changes_protocol_state_filter_treats_deletion_as_terminal() {
+        let c_id = "pool_0".to_string();
+        let attr_tick = "ticks/10/net-liquidity".to_string();
+        let tx0 = default_tx();
+        let mut tx1 = default_tx();
+        tx1.index = tx0.index + 1;
+
+        let block_changes = block_changes_with(vec![
+            TxWithChanges {
+                tx: tx0,
+                state_updates: HashMap::from([(
+                    c_id.clone(),
+                    ProtocolComponentStateDelta {
+                        component_id: c_id.clone(),
+                        updated_attributes: HashMap::from([(
+                            attr_tick.clone(),
+                            Bytes::from(1234u64).lpad(32, 0),
+                        )]),
+                        deleted_attributes: HashSet::new(),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            TxWithChanges {
+                tx: tx1,
+                state_updates: HashMap::from([(
+                    c_id.clone(),
+                    ProtocolComponentStateDelta {
+                        component_id: c_id.clone(),
+                        updated_attributes: HashMap::new(),
+                        deleted_attributes: HashSet::from([attr_tick.clone()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        ]);
+
+        let filtered = block_changes
+            .get_filtered_protocol_state_update(vec![(&c_id, &attr_tick)]);
+        assert_eq!(filtered, HashMap::from([((c_id, attr_tick), None)]));
     }
 
     #[test]

@@ -726,8 +726,8 @@ where
                 .front()
                 .unwrap()
                 .block
-                .parent_hash ==
-                *block
+                .parent_hash
+                == *block
             {
                 self.pending.clear();
                 return Ok(());

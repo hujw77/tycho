@@ -678,19 +678,24 @@ pub struct ProtocolComponent {
 // Manual impl as `NaiveDateTime` structure referenced in `created_at` does not implement DeepSizeOf
 impl DeepSizeOf for ProtocolComponent {
     fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
-        self.id.deep_size_of_children(ctx) +
-            self.protocol_system
-                .deep_size_of_children(ctx) +
-            self.protocol_type_name
-                .deep_size_of_children(ctx) +
-            self.chain.deep_size_of_children(ctx) +
-            self.tokens.deep_size_of_children(ctx) +
-            self.contract_ids
-                .deep_size_of_children(ctx) +
-            self.static_attributes
-                .deep_size_of_children(ctx) +
-            self.change.deep_size_of_children(ctx) +
-            self.creation_tx
+        self.id.deep_size_of_children(ctx)
+            + self
+                .protocol_system
+                .deep_size_of_children(ctx)
+            + self
+                .protocol_type_name
+                .deep_size_of_children(ctx)
+            + self.chain.deep_size_of_children(ctx)
+            + self.tokens.deep_size_of_children(ctx)
+            + self
+                .contract_ids
+                .deep_size_of_children(ctx)
+            + self
+                .static_attributes
+                .deep_size_of_children(ctx)
+            + self.change.deep_size_of_children(ctx)
+            + self
+                .creation_tx
                 .deep_size_of_children(ctx)
     }
 }
@@ -1302,11 +1307,11 @@ impl PartialEq for ProtocolComponentsRequestBody {
             _ => false,
         };
 
-        self.protocol_system == other.protocol_system &&
-            self.component_ids == other.component_ids &&
-            tvl_close_enough &&
-            self.chain == other.chain &&
-            self.pagination == other.pagination
+        self.protocol_system == other.protocol_system
+            && self.component_ids == other.component_ids
+            && tvl_close_enough
+            && self.chain == other.chain
+            && self.pagination == other.pagination
     }
 }
 

@@ -85,14 +85,14 @@ impl SynchronizerError {
         match self {
             SynchronizerError::RPCError(e) => matches!(
                 e,
-                RPCError::HttpClient(_, _) |
-                    RPCError::RateLimited(_) |
-                    RPCError::ServerUnreachable(_) |
-                    RPCError::StaleBlock(_)
+                RPCError::HttpClient(_, _)
+                    | RPCError::RateLimited(_)
+                    | RPCError::ServerUnreachable(_)
+                    | RPCError::StaleBlock(_)
             ),
-            SynchronizerError::Timeout(_) |
-            SynchronizerError::ConnectionError(_) |
-            SynchronizerError::ConnectionClosed => true,
+            SynchronizerError::Timeout(_)
+            | SynchronizerError::ConnectionError(_)
+            | SynchronizerError::ConnectionClosed => true,
             _ => false,
         }
     }
@@ -1127,8 +1127,8 @@ where
                 let made_progress = self
                     .last_synced_block
                     .as_ref()
-                    .map(|h| h.number) >
-                    prev_block;
+                    .map(|h| h.number)
+                    > prev_block;
                 match res {
                     Ok(()) => {
                         info!(
@@ -1889,8 +1889,8 @@ mod test {
                  _chunk_size: &Option<usize>,
                  _concurrency: &usize| {
                     // Verify that the request contains ONLY Component2, not all tracked components
-                    request.components.len() == 1 &&
-                        request
+                    request.components.len() == 1
+                        && request
                             .components
                             .contains_key("Component2")
                 },
@@ -3049,8 +3049,8 @@ mod test {
             !first_snapshot
                 .snapshots
                 .states
-                .is_empty() ||
-                first_snapshot.deltas.is_some()
+                .is_empty()
+                || first_snapshot.deltas.is_some()
         );
         // Now send close signal - this should be handled in the main processing loop
         let _ = end_tx.send(());
@@ -3913,11 +3913,11 @@ mod test {
                 |request: &SnapshotParameters,
                  _chunk_size: &Option<usize>,
                  _concurrency: &usize| {
-                    request.block_number == 2 &&
-                        (request
+                    request.block_number == 2
+                        && (request
                             .components
-                            .contains_key("BrandNew") ||
-                            request
+                            .contains_key("BrandNew")
+                            || request
                                 .components
                                 .contains_key("Preexisting"))
                 },

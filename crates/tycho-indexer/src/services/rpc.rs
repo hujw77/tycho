@@ -6,8 +6,9 @@ use std::{
 
 use actix_web::{http::StatusCode, web, HttpResponse, ResponseError};
 use anyhow::Error;
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDateTime, Utc};
 use diesel_async::pooled_connection::deadpool;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, trace, warn};
 use tycho_common::{
@@ -91,6 +92,36 @@ impl ResponseError for RpcError {
             RpcError::PlanRestrictionViolation(e) => HttpResponse::BadRequest().body(e.to_owned()),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SyncStatusQuery {
+    #[serde(default)]
+    pub chain: Chain,
+    pub protocol_system: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProtocolSyncStatus {
+    pub chain: Chain,
+    pub protocol_system: String,
+    pub latest_seen_block: Option<u64>,
+    pub latest_seen_ts: Option<NaiveDateTime>,
+    pub latest_buffer_db_committed_block_height: Option<u64>,
+    pub latest_rpc_visible_block: Option<u64>,
+    pub latest_committed_block: Option<u64>,
+    pub latest_committed_ts: Option<NaiveDateTime>,
+    pub latest_finalized_block: Option<u64>,
+    pub oldest_uncommitted_block: Option<u64>,
+    pub buffered_block_count: usize,
+    pub pending_vs_committed_gap: Option<u64>,
+    pub seen_vs_finalized_gap: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncStatusResponse {
+    pub chain: Chain,
+    pub statuses: Vec<ProtocolSyncStatus>,
 }
 
 pub struct RpcHandler<G, T> {
@@ -615,6 +646,88 @@ where
             self.dci_protocols.clone(),
             PaginationResponse::new(page, page_size, total),
         ))
+    }
+
+    async fn get_sync_status(
+        &self,
+        query: SyncStatusQuery,
+    ) -> Result<SyncStatusResponse, RpcError> {
+        let chain = query.chain;
+        let mut protocol_systems = match query.protocol_system {
+            Some(protocol_system) => vec![protocol_system],
+            None => self.protocol_systems.clone(),
+        };
+        protocol_systems.sort();
+        protocol_systems.dedup();
+
+        let mut statuses = Vec::with_capacity(protocol_systems.len());
+
+        for protocol_system in protocol_systems {
+            let committed_block = match self
+                .db_gateway
+                .get_state(&protocol_system, &chain)
+                .await
+            {
+                Ok(state) => Some(
+                    self.db_gateway
+                        .get_block(&BlockIdentifier::Hash(state.block_hash))
+                        .await?,
+                ),
+                Err(StorageError::NotFound(_, _)) => None,
+                Err(err) => return Err(err.into()),
+            };
+
+            let buffer_status = self
+                .pending_deltas
+                .as_ref()
+                .map(|pending| pending.get_sync_status(&protocol_system))
+                .transpose()?
+                .flatten();
+
+            let latest_seen_block = buffer_status
+                .as_ref()
+                .map(|status| status.latest_seen_block);
+            let latest_committed_block = committed_block
+                .as_ref()
+                .map(|block| block.number);
+            let latest_rpc_visible_block = latest_seen_block.or(latest_committed_block);
+            let latest_finalized_block = buffer_status
+                .as_ref()
+                .map(|status| status.latest_finalized_block);
+
+            statuses.push(ProtocolSyncStatus {
+                chain,
+                protocol_system,
+                latest_seen_block,
+                latest_seen_ts: buffer_status
+                    .as_ref()
+                    .map(|status| status.latest_seen_ts),
+                latest_buffer_db_committed_block_height: buffer_status
+                    .as_ref()
+                    .and_then(|status| status.latest_db_committed_block_height),
+                latest_rpc_visible_block,
+                latest_committed_block,
+                latest_committed_ts: committed_block
+                    .as_ref()
+                    .map(|block| block.ts),
+                latest_finalized_block,
+                oldest_uncommitted_block: buffer_status
+                    .as_ref()
+                    .map(|status| status.oldest_uncommitted_block),
+                buffered_block_count: buffer_status
+                    .as_ref()
+                    .map(|status| status.buffered_block_count)
+                    .unwrap_or_default(),
+                pending_vs_committed_gap: latest_seen_block
+                    .zip(latest_committed_block)
+                    .map(|(seen, committed)| seen.saturating_sub(committed)),
+                seen_vs_finalized_gap: latest_seen_block
+                    .zip(latest_finalized_block)
+                    .map(|(seen, finalized)| seen.saturating_sub(finalized)),
+            });
+        }
+
+        Ok(SyncStatusResponse { chain, statuses })
     }
 
     #[instrument(skip(self, request))]
@@ -1508,6 +1621,18 @@ pub async fn health() -> Result<HttpResponse, RpcError> {
     Ok(HttpResponse::Ok().json(dto::Health::Ready))
 }
 
+#[instrument(skip_all, fields(chain = ?query.chain, protocol_system = ?query.protocol_system))]
+pub async fn sync_status<G: Gateway, T: EntryPointTracer>(
+    query: web::Query<SyncStatusQuery>,
+    handler: web::Data<RpcHandler<G, T>>,
+) -> Result<HttpResponse, RpcError> {
+    let response = handler
+        .into_inner()
+        .get_sync_status(query.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
 #[cfg(test)]
 #[allow(clippy::extra_unused_lifetimes)]
 mod tests {
@@ -1581,6 +1706,11 @@ mod tests {
                 f: &dyn Fn(&BlockAggregatedChanges) -> bool,
                 protocol_system: &'a str,
             ) -> Result<Option<BlockAggregatedChanges>,PendingDeltasError>;
+
+            fn get_sync_status(
+                &self,
+                protocol_system: &str,
+            ) -> Result<Option<crate::services::deltas_buffer::BufferSyncStatus>, PendingDeltasError>;
         }
     }
 
@@ -1661,8 +1791,8 @@ mod tests {
             .version
             .timestamp
             .unwrap()
-            .timestamp_millis() -
-            result
+            .timestamp_millis()
+            - result
                 .version
                 .timestamp
                 .unwrap()
@@ -2942,10 +3072,10 @@ mod tests {
         #[case] traded_n_days_ago: Option<u64>,
         #[case] should_pass: bool,
     ) {
-        let use_addresses = plan_header == Some("restricted") &&
-            request_quality.is_none() &&
-            traded_n_days_ago.is_none() &&
-            should_pass;
+        let use_addresses = plan_header == Some("restricted")
+            && request_quality.is_none()
+            && traded_n_days_ago.is_none()
+            && should_pass;
 
         let mut gw = MockGateway::new();
         if should_pass {

@@ -27,10 +27,13 @@ use crate::{
     prelude::BalanceDelta,
 };
 use itertools::Itertools;
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, VecDeque},
+    str::FromStr,
+};
 use substreams::{
     key,
-    pb::substreams::StoreDeltas,
+    pb::substreams::{StoreDelta, StoreDeltas},
     prelude::{BigInt, StoreAdd},
 };
 use substreams_ethereum::{pb::eth::v2::TransactionTrace, Event};
@@ -60,6 +63,9 @@ use substreams_ethereum::{pb::eth::v2::TransactionTrace, Event};
 /// - The ordinals for any given token address are not strictly increasing.
 pub fn store_balance_changes(deltas: BlockBalanceDeltas, store: impl StoreAdd<BigInt>) {
     let mut previous_ordinal = HashMap::<String, u64>::new();
+    let mut aggregated_by_key_and_ordinal = HashMap::<(String, u64), BigInt>::new();
+    let mut ordered_entries = Vec::<(String, u64)>::new();
+
     deltas
         .balance_deltas
         .iter()
@@ -74,17 +80,37 @@ pub fn store_balance_changes(deltas: BlockBalanceDeltas, store: impl StoreAdd<Bi
             previous_ordinal
                 .entry(balance_key.clone())
                 .and_modify(|ord| {
-                    // ordinals must arrive in increasing order
-                    if *ord >= current_ord {
+                    // ordinals must arrive in increasing order, but same-ordinal deltas for the
+                    // same key are merged before hitting the store.
+                    if *ord > current_ord {
                         panic!(
-                            "Invalid ordinal sequence for {}: {} >= {}",
+                            "Invalid ordinal sequence for {}: {} > {}",
                             balance_key, *ord, current_ord
                         );
                     }
                     *ord = current_ord;
                 })
                 .or_insert(delta.ord);
-            store.add(delta.ord, balance_key, BigInt::from_signed_bytes_be(&delta.delta));
+
+            let entry_key = (balance_key.clone(), current_ord);
+            if !aggregated_by_key_and_ordinal.contains_key(&entry_key) {
+                ordered_entries.push(entry_key.clone());
+            }
+            aggregated_by_key_and_ordinal
+                .entry(entry_key)
+                .and_modify(|value| {
+                    *value = value.clone() + BigInt::from_signed_bytes_be(&delta.delta)
+                })
+                .or_insert_with(|| BigInt::from_signed_bytes_be(&delta.delta));
+        });
+
+    ordered_entries
+        .into_iter()
+        .for_each(|(balance_key, ordinal)| {
+            let value = aggregated_by_key_and_ordinal
+                .remove(&(balance_key.clone(), ordinal))
+                .expect("aggregated balance delta should exist");
+            store.add(ordinal, balance_key, value);
         });
 }
 
@@ -120,11 +146,20 @@ pub fn aggregate_balances_changes(
     balance_store: StoreDeltas,
     deltas: BlockBalanceDeltas,
 ) -> TxAggregatedBalances {
-    balance_store
-        .deltas
+    let mut indexed_store_deltas = index_store_deltas(balance_store.deltas);
+
+    let aggregated = deltas
+        .balance_deltas
         .into_iter()
-        .zip(deltas.balance_deltas)
-        .map(|(store_delta, balance_delta)| {
+        .map(|balance_delta| {
+            let component_id = String::from_utf8(balance_delta.component_id.clone())
+                .expect("delta.component_id is not valid utf-8!");
+            let balance_key = format!("{}:{}", component_id, hex::encode(&balance_delta.token));
+            let store_delta = pop_matching_store_delta(
+                &mut indexed_store_deltas,
+                &balance_key,
+                balance_delta.ord,
+            );
             let component_id = key::segment_at(&store_delta.key, 0);
             let token_id = key::segment_at(&store_delta.key, 1);
             // store_delta.new_value is an ASCII string representing an integer
@@ -167,7 +202,48 @@ pub fn aggregate_balances_changes(
             }
             (txh, (transactions.pop().unwrap(), balances))
         })
-        .collect()
+        .collect();
+
+    assert_all_store_deltas_consumed(indexed_store_deltas);
+
+    aggregated
+}
+
+fn index_store_deltas(deltas: Vec<StoreDelta>) -> HashMap<(String, u64), VecDeque<StoreDelta>> {
+    let mut indexed = HashMap::<(String, u64), VecDeque<StoreDelta>>::new();
+
+    deltas.into_iter().for_each(|delta| {
+        indexed
+            .entry((delta.key.clone(), delta.ordinal))
+            .or_default()
+            .push_back(delta);
+    });
+
+    indexed
+}
+
+fn pop_matching_store_delta(
+    indexed_store_deltas: &mut HashMap<(String, u64), VecDeque<StoreDelta>>,
+    key: &str,
+    ordinal: u64,
+) -> StoreDelta {
+    indexed_store_deltas
+        .get_mut(&(key.to_string(), ordinal))
+        .and_then(|queue| queue.pop_front())
+        .unwrap_or_else(|| panic!("Missing matching store delta for key `{}` at ordinal {}", key, ordinal))
+}
+
+fn assert_all_store_deltas_consumed(
+    indexed_store_deltas: HashMap<(String, u64), VecDeque<StoreDelta>>,
+) {
+    let leftovers = indexed_store_deltas
+        .into_iter()
+        .filter_map(|((key, ordinal), mut queue)| queue.pop_front().map(|_| (key, ordinal)))
+        .collect::<Vec<_>>();
+
+    if !leftovers.is_empty() {
+        panic!("Unmatched store deltas remaining: {:?}", leftovers);
+    }
 }
 
 /// Extracts balance deltas from a transaction trace based on a given address predicate.
@@ -468,5 +544,88 @@ mod tests {
 
         let res = aggregate_balances_changes(store_deltas, balance_deltas);
         assert_eq!(res, exp);
+    }
+
+    #[test]
+    fn test_store_balances_merges_same_ordinal_for_same_key() {
+        let comp_id = "0x42c0ffee"
+            .to_string()
+            .as_bytes()
+            .to_vec();
+        let token = hex::decode("bad999").unwrap();
+        let deltas = BlockBalanceDeltas {
+            balance_deltas: vec![
+                BalanceDelta {
+                    ord: 7,
+                    tx: Some(Transaction {
+                        hash: vec![0, 1],
+                        from: vec![9, 9],
+                        to: vec![8, 8],
+                        index: 0,
+                    }),
+                    token: token.clone(),
+                    delta: BigInt::from_str("+100")
+                        .unwrap()
+                        .to_signed_bytes_be(),
+                    component_id: comp_id.clone(),
+                },
+                BalanceDelta {
+                    ord: 7,
+                    tx: Some(Transaction {
+                        hash: vec![0, 1],
+                        from: vec![9, 9],
+                        to: vec![8, 8],
+                        index: 0,
+                    }),
+                    token: token.clone(),
+                    delta: BigInt::from_str("-25")
+                        .unwrap()
+                        .to_signed_bytes_be(),
+                    component_id: comp_id.clone(),
+                },
+            ],
+        };
+        let store = <MockStore as StoreNew>::new();
+
+        store_balance_changes(deltas, store.clone());
+
+        let res = store.get_last(format!(
+            "{}:{}",
+            String::from_utf8(comp_id).unwrap(),
+            hex::encode(token)
+        ));
+        assert_eq!(res, Some(BigInt::from_str("+75").unwrap()));
+    }
+
+    #[test]
+    fn test_aggregate_balances_changes_matches_by_key_and_ordinal() {
+        let mut store_deltas = store_deltas();
+        store_deltas.deltas.swap(0, 3);
+        store_deltas.deltas.swap(1, 2);
+
+        let res = aggregate_balances_changes(store_deltas, block_balance_deltas());
+
+        let tx_balances = res
+            .get(&vec![0, 1])
+            .expect("transaction balances should exist");
+        let balances = tx_balances
+            .1
+            .get("0x42c0ffee".as_bytes())
+            .expect("component balances should exist");
+
+        assert_eq!(
+            balances
+                .get(&hex::decode("bad999").unwrap())
+                .expect("token0 balance should exist")
+                .balance,
+            BigInt::from(999).to_signed_bytes_be()
+        );
+        assert_eq!(
+            balances
+                .get(&hex::decode("babe00").unwrap())
+                .expect("token1 balance should exist")
+                .balance,
+            vec![150]
+        );
     }
 }

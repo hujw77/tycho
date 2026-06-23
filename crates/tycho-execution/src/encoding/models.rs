@@ -337,13 +337,13 @@ impl Swap {
 
 impl PartialEq for Swap {
     fn eq(&self, other: &Self) -> bool {
-        self.component() == other.component() &&
-            self.token_in().address == other.token_in().address &&
-            self.token_out().address == other.token_out().address &&
-            self.split() == other.split() &&
-            self.user_data() == other.user_data() &&
-            self.estimated_amount_in() == other.estimated_amount_in() &&
-            self.estimated_gas() == other.estimated_gas()
+        self.component() == other.component()
+            && self.token_in().address == other.token_in().address
+            && self.token_out().address == other.token_out().address
+            && self.split() == other.split()
+            && self.user_data() == other.user_data()
+            && self.estimated_amount_in() == other.estimated_amount_in()
+            && self.estimated_gas() == other.estimated_gas()
     }
 }
 
@@ -408,10 +408,10 @@ impl EncodedSolution {
             .next()
             .unwrap_or("");
         let head_params = match name {
-            "singleSwap" |
-            "singleSwapUsingVault" |
-            "sequentialSwap" |
-            "sequentialSwapUsingVault" => 7,
+            "singleSwap"
+            | "singleSwapUsingVault"
+            | "sequentialSwap"
+            | "sequentialSwapUsingVault" => 7,
             "splitSwap" | "splitSwapUsingVault" => 8,
             "singleSwapPermit2" | "sequentialSwapPermit2" => 14,
             "splitSwapPermit2" => 15,

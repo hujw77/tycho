@@ -93,3 +93,6 @@ db/*.backup
 /tycho-client-py/dist/
 
 __pycache__/
+
+.agents
+AGENTS.md

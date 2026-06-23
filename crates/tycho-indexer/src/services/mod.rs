@@ -255,6 +255,11 @@ where
                         .route(web::get().to(rpc::health)),
                 )
                 .service(
+                    web::resource(format!("/{}/debug/sync_status", self.prefix))
+                        .wrap(access_control::AccessControl::new(&self.api_key))
+                        .route(web::get().to(rpc::sync_status::<G, EVMEntrypointService>)),
+                )
+                .service(
                     web::resource(format!("/{}/protocol_systems", self.prefix))
                         .route(web::post().to(rpc::protocol_systems::<G, EVMEntrypointService>)),
                 )

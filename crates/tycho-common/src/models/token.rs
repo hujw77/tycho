@@ -29,7 +29,7 @@ pub struct Token {
     ///  - 100: Normal token
     ///  - 75: Rebase token
     ///  - 50: Fee token
-    ///  - 10: Token analysis failed at creation
+    ///  - 10: Token analysis deferred at creation or failed during creation-time analysis
     ///  - 9-5: Token analysis failed on cronjob (after creation).
     ///  - 0: Failed to extract decimals onchain
     pub quality: u32,

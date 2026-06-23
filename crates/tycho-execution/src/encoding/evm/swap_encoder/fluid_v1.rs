@@ -42,8 +42,8 @@ impl SwapEncoder for FluidV1SwapEncoder {
 
         let args = (
             dex_address,
-            self.coerce_native_address(&swap.token_in().address) <
-                self.coerce_native_address(&swap.token_out().address),
+            self.coerce_native_address(&swap.token_in().address)
+                < self.coerce_native_address(&swap.token_out().address),
             convert_to_router_token(bytes_to_address(&swap.token_in().address)?),
             convert_to_router_token(bytes_to_address(&swap.token_out().address)?),
             swap.token_in().address == self.chain.native_token().address,

@@ -64,8 +64,8 @@ pub fn simulate(params: &Params) -> Result<(State, Vault, impl Log + use<> + Ser
     {
         functions.push("sequentialSwapUsingVault");
     }
-    if crate::config::ENABLE_SEQUENTIAL_SWAP_FUNCTIONS &&
-        crate::config::ENABLE_PERMIT2_SWAP_FUNCTIONS
+    if crate::config::ENABLE_SEQUENTIAL_SWAP_FUNCTIONS
+        && crate::config::ENABLE_PERMIT2_SWAP_FUNCTIONS
     {
         functions.push("sequentialSwapPermit2");
     }

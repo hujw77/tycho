@@ -59,3 +59,20 @@ impl From<Transaction> for tycho_substreams::prelude::Transaction {
         Self { hash: value.hash, from: value.from, to: value.to, index: value.index }
     }
 }
+
+impl From<&tycho_substreams::prelude::Transaction> for Transaction {
+    fn from(value: &tycho_substreams::prelude::Transaction) -> Self {
+        Self {
+            hash: value.hash.clone(),
+            from: value.from.clone(),
+            to: value.to.clone(),
+            index: value.index,
+        }
+    }
+}
+
+impl From<tycho_substreams::prelude::Transaction> for Transaction {
+    fn from(value: tycho_substreams::prelude::Transaction) -> Self {
+        Self { hash: value.hash, from: value.from, to: value.to, index: value.index }
+    }
+}
