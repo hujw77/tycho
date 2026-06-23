@@ -26,7 +26,7 @@ use chrono::{NaiveDateTime, Utc};
 use clap::Parser;
 use futures03::future::select_all;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use tokio::{
     runtime::Handle,
@@ -244,7 +244,7 @@ struct BootstrapParamsYaml {
     routes: Vec<BootstrapRouteYaml>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct BootstrapRouteYaml {
     token0: String,
     token1: String,
@@ -252,17 +252,18 @@ struct BootstrapRouteYaml {
     routers: Vec<BootstrapRouterYaml>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct BootstrapRouterYaml {
     pool: String,
     protocol: String,
 }
 
 fn parse_substreams_params_yaml(
+    extractor_name: &str,
     contents: &str,
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let parsed: SubstreamsParamsFile = serde_yaml::from_str(contents)?;
-    let (start_block, params) = normalize_substreams_params(parsed)?;
+    let (start_block, params) = normalize_substreams_params(extractor_name, parsed)?;
     let mut substreams_params = Vec::with_capacity(params.len());
 
     for (key, value) in params {
@@ -293,7 +294,7 @@ fn resolve_substreams_params_map(
             )
         })?;
         let (start_block, resolved_params) =
-            parse_substreams_params_yaml(&params).map_err(|err| {
+            parse_substreams_params_yaml(extractor_name, &params).map_err(|err| {
                 format!(
                     "failed to parse substreams config file for extractor `{extractor_name}` \
                  module `{module_name}` at `{}`: {err}",
@@ -338,7 +339,8 @@ fn resolve_bootstrap_params(
             params_path.display()
         )
     })?;
-    let (start_block, resolved_params) = parse_bootstrap_params_yaml(&params).map_err(|err| {
+    let (start_block, resolved_params) =
+        parse_bootstrap_params_yaml(extractor_name, &params).map_err(|err| {
         format!(
             "failed to parse bootstrap config file for extractor `{extractor_name}` at `{}`: \
              {err}",
@@ -359,6 +361,7 @@ fn resolve_bootstrap_params(
 }
 
 fn parse_bootstrap_params_yaml(
+    extractor_name: &str,
     contents: &str,
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let parsed: BootstrapParamsFile = serde_yaml::from_str(contents)?;
@@ -380,27 +383,8 @@ fn parse_bootstrap_params_yaml(
         }
     };
 
-    let BootstrapParamsYaml { pools, routes, .. } = parsed.params;
-    let mut seen_pools = HashSet::new();
-    let mut all_pools = Vec::new();
-
-    for pool in pools {
-        if seen_pools.insert(pool.clone()) {
-            all_pools.push(pool);
-        }
-    }
-
-    for route in routes {
-        let BootstrapRouteYaml { token0, token1, routers } = route;
-        let _ = (token0, token1);
-        for router in routers {
-            let BootstrapRouterYaml { pool, protocol } = router;
-            let _ = protocol;
-            if seen_pools.insert(pool.clone()) {
-                all_pools.push(pool);
-            }
-        }
-    }
+    let protocol_filter = protocol_filter_for_extractor(extractor_name);
+    let all_pools = collect_bootstrap_pools(&parsed.params, protocol_filter.as_ref())?;
 
     if all_pools.is_empty() {
         return Err("bootstrap config is missing `params.pools` or `params.routes`".into());
@@ -413,10 +397,13 @@ fn parse_bootstrap_params_yaml(
 }
 
 fn normalize_substreams_params(
+    extractor_name: &str,
     mut parsed: SubstreamsParamsFile,
 ) -> Result<(Option<i64>, BTreeMap<String, Value>), Box<dyn std::error::Error>> {
     if parsed.params.contains_key("routes") {
-        let (pools, pool_tokens) = collect_bootstrap_pool_metadata(&parsed.params)?;
+        let protocol_filter = protocol_filter_for_extractor(extractor_name);
+        let (pools, pool_tokens) =
+            collect_bootstrap_pool_metadata(&parsed.params, protocol_filter.as_ref())?;
         if !pools.is_empty() {
             parsed.params.insert(
                 "pools".to_string(),
@@ -494,12 +481,20 @@ fn render_substreams_scalar_value(value: &Value) -> Result<String, Box<dyn std::
 
 fn collect_bootstrap_pool_metadata(
     params: &BTreeMap<String, Value>,
+    allowed_protocols: Option<&HashSet<String>>,
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
-    let pools = params
-        .get("pools")
-        .map(parse_string_sequence_yaml_value)
-        .transpose()?
-        .unwrap_or_default();
+    let all_pools = collect_bootstrap_pools_from_parts(
+        params
+            .get("pools")
+            .map(parse_string_sequence_yaml_value)
+            .transpose()?
+            .unwrap_or_default(),
+        params
+            .get("routes")
+            .cloned()
+            .unwrap_or(Value::Sequence(vec![])),
+        allowed_protocols,
+    )?;
 
     let routes = params
         .get("routes")
@@ -507,9 +502,45 @@ fn collect_bootstrap_pool_metadata(
         .unwrap_or(Value::Sequence(vec![]));
     let routes: Vec<BootstrapRouteYaml> = serde_yaml::from_value(routes)?;
 
+    let mut pool_tokens = Vec::new();
+    let mut seen_pool_tokens = HashSet::new();
+
+    for route in routes {
+        for router in route.routers {
+            if !router_matches_allowed_protocols(router.protocol.as_str(), allowed_protocols) {
+                continue;
+            }
+
+            let pool_token = format!("{}:{}:{}", router.pool, route.token0, route.token1);
+            if seen_pool_tokens.insert(pool_token.clone()) {
+                pool_tokens.push(pool_token);
+            }
+        }
+    }
+
+    Ok((all_pools, pool_tokens))
+}
+
+fn collect_bootstrap_pools(
+    params: &BootstrapParamsYaml,
+    allowed_protocols: Option<&HashSet<String>>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    collect_bootstrap_pools_from_parts(
+        params.pools.clone(),
+        serde_yaml::to_value(&params.routes)?,
+        allowed_protocols,
+    )
+}
+
+fn collect_bootstrap_pools_from_parts(
+    pools: Vec<String>,
+    routes: Value,
+    allowed_protocols: Option<&HashSet<String>>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let routes: Vec<BootstrapRouteYaml> = serde_yaml::from_value(routes)?;
+
     let mut seen_pools = HashSet::new();
     let mut all_pools = Vec::new();
-    let mut pool_tokens = Vec::new();
 
     for pool in pools {
         if seen_pools.insert(pool.clone()) {
@@ -520,15 +551,43 @@ fn collect_bootstrap_pool_metadata(
     for route in routes {
         for router in route.routers {
             let BootstrapRouterYaml { pool, protocol } = router;
-            let _ = protocol;
+            if !router_matches_allowed_protocols(protocol.as_str(), allowed_protocols) {
+                continue;
+            }
             if seen_pools.insert(pool.clone()) {
-                all_pools.push(pool.clone());
-                pool_tokens.push(format!("{pool}:{}:{}", route.token0, route.token1));
+                all_pools.push(pool);
             }
         }
     }
 
-    Ok((all_pools, pool_tokens))
+    Ok(all_pools)
+}
+
+fn protocol_filter_for_extractor(extractor_name: &str) -> Option<HashSet<String>> {
+    match extractor_name {
+        "uniswap_v2" => Some(HashSet::from([canonicalize_protocol_name("uniswap_v2")])),
+        "uniswap_v3" => Some(HashSet::from([canonicalize_protocol_name("uniswap_v3")])),
+        _ => None,
+    }
+}
+
+fn router_matches_allowed_protocols(
+    router_protocol: &str,
+    allowed_protocols: Option<&HashSet<String>>,
+) -> bool {
+    let Some(allowed_protocols) = allowed_protocols else {
+        return true;
+    };
+
+    allowed_protocols.contains(&canonicalize_protocol_name(router_protocol))
+}
+
+fn canonicalize_protocol_name(protocol: &str) -> String {
+    protocol
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric())
+        .flat_map(|char| char.to_lowercase())
+        .collect()
 }
 
 fn parse_i64_yaml_value(value: &Value) -> Result<i64, Box<dyn std::error::Error>> {
@@ -704,6 +763,7 @@ extractors:
     #[test]
     fn bootstrap_config_supports_route_format() {
         let (start_block, params) = parse_bootstrap_params_yaml(
+            "test_protocol",
             r#"
 start_block: 25377208
 params:
@@ -731,6 +791,7 @@ params:
     #[test]
     fn extractor_configs_reject_mismatched_start_and_bootstrap_blocks() {
         let err = parse_substreams_params_yaml(
+            "test_protocol",
             r#"
 start_block: 1
 params:
@@ -747,6 +808,7 @@ params:
     #[test]
     fn substreams_params_support_route_format_with_pool_token_metadata() {
         let (start_block, params) = parse_substreams_params_yaml(
+            "uniswap_v2",
             r#"
 start_block: 25377208
 params:
@@ -767,6 +829,194 @@ params:
             params,
             "bootstrap_block=25377208&pool_tokens=0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0x8710039d5de6840ede452a85672b32270a709ae2:0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2&pools=0x6f40d4a6237c257fff2db00fa0510deeecd303eb,0x8710039d5de6840ede452a85672b32270a709ae2"
         );
+    }
+
+    #[test]
+    fn bootstrap_route_format_filters_by_extractor_protocol() {
+        let contents = r#"
+start_block: 25377208
+params:
+  routes:
+    - token0: "0x6f40d4a6237c257fff2db00fa0510deeecd303eb"
+      token1: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+      routers:
+        - pool: "0x1111111111111111111111111111111111111111"
+          protocol: uniswap_v2
+        - pool: "0x2222222222222222222222222222222222222222"
+          protocol: uniswap_v3
+"#;
+
+        let (_, v2_params) =
+            parse_bootstrap_params_yaml("uniswap_v2", contents).expect("v2 bootstrap should parse");
+        let (_, v3_params) =
+            parse_bootstrap_params_yaml("uniswap_v3", contents).expect("v3 bootstrap should parse");
+
+        assert_eq!(
+            v2_params,
+            "bootstrap_block=25377208&pools=0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            v3_params,
+            "bootstrap_block=25377208&pools=0x2222222222222222222222222222222222222222"
+        );
+    }
+
+    #[test]
+    fn substreams_route_format_filters_by_extractor_protocol() {
+        let contents = r#"
+start_block: 25377208
+params:
+  routes:
+    - token0: "0x6f40d4a6237c257fff2db00fa0510deeecd303eb"
+      token1: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+      routers:
+        - pool: "0x1111111111111111111111111111111111111111"
+          protocol: uniswap_v2
+        - pool: "0x2222222222222222222222222222222222222222"
+          protocol: uniswap_v3
+"#;
+
+        let (_, v2_params) =
+            parse_substreams_params_yaml("uniswap_v2", contents).expect("v2 substreams params should parse");
+        let (_, v3_params) =
+            parse_substreams_params_yaml("uniswap_v3", contents).expect("v3 substreams params should parse");
+
+        assert_eq!(
+            v2_params,
+            "bootstrap_block=25377208&pool_tokens=0x1111111111111111111111111111111111111111:0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2&pools=0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            v3_params,
+            "bootstrap_block=25377208&pool_tokens=0x2222222222222222222222222222222222222222:0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2&pools=0x2222222222222222222222222222222222222222"
+        );
+    }
+
+    #[test]
+    fn extractor_configs_keep_v2_params_consistent_between_v2_only_and_v2_v3() {
+        let temp_root = std::env::temp_dir()
+            .join(format!("tycho-indexer-uniswap-shared-bootstrap-{}", process::id()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(temp_root.join("config")).expect("create temp config dir");
+
+        fs::write(
+            temp_root.join("config/shared_uniswap_bootstrap.yaml"),
+            r#"
+start_block: 25377208
+params:
+  routes:
+    - token0: "0x6f40d4a6237c257fff2db00fa0510deeecd303eb"
+      token1: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+      routers:
+        - pool: "0x1111111111111111111111111111111111111111"
+          protocol: uniswap_v2
+        - pool: "0x2222222222222222222222222222222222222222"
+          protocol: uniswap_v3
+"#,
+        )
+        .expect("write shared bootstrap config");
+
+        fs::write(
+            temp_root.join("extractors.uniswap_v2.yaml"),
+            r#"
+extractors:
+  uniswap_v2:
+    name: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "uniswap_v2_pool"
+        financial_type: "Swap"
+    spkg: "stream.spkg"
+    module_name: "map_pool_events"
+    substreams_params:
+      map_pool_events: "@config/shared_uniswap_bootstrap.yaml"
+    bootstrap:
+      strategy: "uniswap_v2_rpc"
+      params: "@config/shared_uniswap_bootstrap.yaml"
+"#,
+        )
+        .expect("write v2 extractor config");
+
+        fs::write(
+            temp_root.join("extractors.uniswap_v2_v3.yaml"),
+            r#"
+extractors:
+  uniswap_v2:
+    name: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "uniswap_v2_pool"
+        financial_type: "Swap"
+    spkg: "stream.spkg"
+    module_name: "map_pool_events"
+    substreams_params:
+      map_pool_events: "@config/shared_uniswap_bootstrap.yaml"
+    bootstrap:
+      strategy: "uniswap_v2_rpc"
+      params: "@config/shared_uniswap_bootstrap.yaml"
+  uniswap_v3:
+    name: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "uniswap_v3_pool"
+        financial_type: "Swap"
+    spkg: "stream.spkg"
+    module_name: "map_events"
+    substreams_params:
+      map_events: "@config/shared_uniswap_bootstrap.yaml"
+    bootstrap:
+      strategy: "uniswap_v3_rpc"
+      params: "@config/shared_uniswap_bootstrap.yaml"
+"#,
+        )
+        .expect("write v2+v3 extractor config");
+
+        let v2_only = ExtractorConfigs::from_yaml(
+            temp_root
+                .join("extractors.uniswap_v2.yaml")
+                .to_str()
+                .expect("utf8 temp path"),
+        )
+        .expect("load v2-only extractor config");
+        let v2_v3 = ExtractorConfigs::from_yaml(
+            temp_root
+                .join("extractors.uniswap_v2_v3.yaml")
+                .to_str()
+                .expect("utf8 temp path"),
+        )
+        .expect("load v2+v3 extractor config");
+
+        let v2_only_extractor = v2_only
+            .extractors
+            .get("uniswap_v2")
+            .expect("v2-only extractor present");
+        let v2_v3_extractor = v2_v3
+            .extractors
+            .get("uniswap_v2")
+            .expect("v2 extractor present in combined config");
+
+        assert_eq!(v2_only_extractor.start_block(), v2_v3_extractor.start_block());
+        assert_eq!(
+            v2_only_extractor
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone()),
+            v2_v3_extractor
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone())
+        );
+        assert_eq!(
+            v2_only_extractor.substreams_params.get("map_pool_events"),
+            v2_v3_extractor.substreams_params.get("map_pool_events")
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 }
 
