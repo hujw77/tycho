@@ -9,9 +9,11 @@ extractors:
         financial_type: "Swap"
     spkg: "protocols/substreams/ethereum-uniswap-v2/ethereum-uniswap-v2-v0.3.2.spkg"
     module_name: "map_pool_events"
+    substreams_params:
+      map_pool_events: "@config/uniswap_v2_substreams.yaml"
     bootstrap:
       strategy: "uniswap_v2_rpc"
-      params: "@config/uniswap_v2_bootstrap.yaml"
+      params: "@config/shared_uniswap_bootstrap.yaml"
 
   uniswap_v3:
     name: "uniswap_v3"
@@ -25,7 +27,7 @@ extractors:
     module_name: "map_protocol_changes"
     bootstrap:
       strategy: "uniswap_v3_rpc"
-      params: "@config/uniswap_v3_bootstrap.yaml"
+      params: "@config/shared_uniswap_bootstrap.yaml"
 
   sushiswap_v2:
     name: "sushiswap_v2"
