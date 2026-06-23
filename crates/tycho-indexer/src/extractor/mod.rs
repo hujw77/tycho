@@ -21,8 +21,9 @@ use crate::{
         dynamic_contract_indexer::cache::DCICacheError,
         models::BlockChanges,
         reorg_buffer::{
-            AccountStateIdType, AccountStateKeyType, AccountStateValueType, ProtocolStateIdType,
-            ProtocolStateKeyType, ProtocolStateValueType, StateUpdateBufferEntry,
+            AccountStateIdType, AccountStateKeyType, AccountStateValueType,
+            BufferedProtocolStateValue, ProtocolStateIdType, ProtocolStateKeyType,
+            ProtocolStateValueType, StateUpdateBufferEntry,
         },
     },
     pb::sf::substreams::{
@@ -231,7 +232,7 @@ where
     fn get_filtered_protocol_state_update(
         &self,
         keys: Vec<(&ProtocolStateIdType, &ProtocolStateKeyType)>,
-    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), ProtocolStateValueType> {
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue> {
         self.block_update
             .get_filtered_protocol_state_update(keys)
     }

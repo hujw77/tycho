@@ -55,7 +55,7 @@ pub(crate) fn get_amount0_delta(
     if round_up {
         div_rounding_up(mul_div_rounding_up(numerator1, numerator2, sqrt_ratio_b)?, sqrt_ratio_a)
     } else {
-        safe_div_u256(mul_div_rounding_up(numerator1, numerator2, sqrt_ratio_b)?, sqrt_ratio_a)
+        safe_div_u256(mul_div(numerator1, numerator2, sqrt_ratio_b)?, sqrt_ratio_a)
     }
 }
 
@@ -326,6 +326,21 @@ mod tests {
     ) {
         let res = get_amount0_delta(a, b, liquidity, round_up).unwrap();
         assert_eq!(res, exp);
+    }
+
+    #[test]
+    fn test_get_amount0_delta_round_down_matches_floor_formula() {
+        let a = U256::from(2u64);
+        let b = U256::from(3u64);
+        let liquidity = 1u128;
+
+        let result = get_amount0_delta(a, b, liquidity, false).unwrap();
+
+        let numerator1 = U256::from(liquidity) << RESOLUTION;
+        let numerator2 = b - a;
+        let expected = safe_div_u256(mul_div(numerator1, numerator2, b).unwrap(), a).unwrap();
+
+        assert_eq!(result, expected);
     }
 
     #[rstest]

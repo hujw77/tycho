@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::Ok;
 use substreams::{
     store::{StoreGet, StoreGetProto},
@@ -29,7 +31,7 @@ pub fn map_events(
     block: eth::Block,
     pools_store: StoreGetProto<Pool>,
 ) -> Result<Events, anyhow::Error> {
-    let factory_address = parse_factory_address(&params);
+    let filter = parse_event_filter(&params);
     let block_ts = block.timestamp_seconds();
     let mut pool_events = block
         .transaction_traces
@@ -44,7 +46,7 @@ pub fn map_events(
             receipt
                 .logs
                 .iter()
-                .filter_map(|log| log_to_event(log, &tx, &factory_address, &pools_store))
+                .filter_map(|log| log_to_event(log, &tx, &filter, &pools_store))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -67,19 +69,30 @@ pub fn map_events(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventFilter {
+    factory_address: String,
+    allowed_pools: HashSet<String>,
+}
+
 fn log_to_event(
     event: &Log,
     tx: &TransactionTrace,
-    factory_address: &str,
+    filter: &EventFilter,
     pools_store: &StoreGetProto<Pool>,
 ) -> Option<PoolEvent> {
     let log_address = event.address.to_hex();
 
-    if log_address.eq_ignore_ascii_case(factory_address) {
+    if log_address.eq_ignore_ascii_case(&filter.factory_address) {
         if let Some(created) = PoolCreated::match_and_decode(event) {
+            let pool_address = created.pool.to_hex().to_lowercase();
+            if !filter.allows_pool(&pool_address) {
+                return None;
+            }
+
             return Some(PoolEvent {
                 log_ordinal: event.ordinal,
-                pool_address: created.pool.to_hex(),
+                pool_address: pool_address,
                 token0: created.token0.to_hex(),
                 token1: created.token1.to_hex(),
                 transaction: Some(tx.into()),
@@ -89,6 +102,10 @@ fn log_to_event(
                 })),
             });
         }
+    }
+
+    if !filter.allows_pool(&log_address) {
+        return None;
     }
 
     let (token0, token1) = pools_store
@@ -228,10 +245,63 @@ fn log_to_event(
     }
 }
 
-fn parse_factory_address(params: &str) -> String {
-    params
-        .split('&')
-        .find_map(|part| part.strip_prefix("factory="))
-        .unwrap_or(params)
-        .to_lowercase()
+impl EventFilter {
+    fn allows_pool(&self, pool_address: &str) -> bool {
+        self.allowed_pools.is_empty() || self.allowed_pools.contains(&pool_address.to_lowercase())
+    }
+}
+
+fn parse_event_filter(params: &str) -> EventFilter {
+    let mut factory_address = None;
+    let mut allowed_pools = HashSet::new();
+
+    for part in params.split('&').filter(|part| !part.is_empty()) {
+        if let Some(address) = part.strip_prefix("factory=") {
+            factory_address = Some(address.to_lowercase());
+            continue;
+        }
+
+        if let Some(pool) = part.strip_prefix("pool=") {
+            allowed_pools.insert(pool.to_lowercase());
+            continue;
+        }
+
+        if let Some(pools) = part.strip_prefix("pools=") {
+            for pool in pools.split(',').filter(|pool| !pool.is_empty()) {
+                allowed_pools.insert(pool.to_lowercase());
+            }
+            continue;
+        }
+    }
+
+    EventFilter {
+        factory_address: factory_address.unwrap_or_else(|| params.to_lowercase()),
+        allowed_pools,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_event_filter;
+
+    #[test]
+    fn parse_event_filter_supports_legacy_factory_only_param() {
+        let filter = parse_event_filter("1F98431c8aD98523631AE4a59f267346ea31F984");
+
+        assert_eq!(filter.factory_address, "1f98431c8ad98523631ae4a59f267346ea31f984");
+        assert!(filter.allowed_pools.is_empty());
+    }
+
+    #[test]
+    fn parse_event_filter_supports_single_and_multiple_pool_params() {
+        let filter = parse_event_filter(
+            "factory=0x1F98431c8aD98523631AE4a59f267346ea31F984&pool=0xe0554a476a092703abdb3ef35c80e0d76d32939f&pools=0x1111111111111111111111111111111111111111,0x2222222222222222222222222222222222222222",
+        );
+
+        assert_eq!(filter.factory_address, "0x1f98431c8ad98523631ae4a59f267346ea31f984");
+        assert!(filter.allowed_pools.contains("0xe0554a476a092703abdb3ef35c80e0d76d32939f"));
+        assert!(filter.allowed_pools.contains("0x1111111111111111111111111111111111111111"));
+        assert!(filter.allowed_pools.contains("0x2222222222222222222222222222222222222222"));
+        assert!(!filter.allows_pool("0x3333333333333333333333333333333333333333"));
+    }
 }

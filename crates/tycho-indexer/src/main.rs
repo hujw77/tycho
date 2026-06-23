@@ -10,7 +10,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 extern crate pretty_assertions;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     fs::File,
     io::Read,
@@ -226,6 +226,38 @@ struct SubstreamsParamsFile {
     params: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BootstrapParamsFile {
+    #[serde(default)]
+    start_block: Option<i64>,
+    #[serde(default)]
+    params: BootstrapParamsYaml,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BootstrapParamsYaml {
+    #[serde(default)]
+    bootstrap_block: Option<i64>,
+    #[serde(default)]
+    pools: Vec<String>,
+    #[serde(default)]
+    routes: Vec<BootstrapRouteYaml>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootstrapRouteYaml {
+    token0: String,
+    token1: String,
+    #[serde(default)]
+    routers: Vec<BootstrapRouterYaml>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BootstrapRouterYaml {
+    pool: String,
+    protocol: String,
+}
+
 fn parse_substreams_params_yaml(
     contents: &str,
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
@@ -306,7 +338,7 @@ fn resolve_bootstrap_params(
             params_path.display()
         )
     })?;
-    let (start_block, resolved_params) = parse_substreams_params_yaml(&params).map_err(|err| {
+    let (start_block, resolved_params) = parse_bootstrap_params_yaml(&params).map_err(|err| {
         format!(
             "failed to parse bootstrap config file for extractor `{extractor_name}` at `{}`: \
              {err}",
@@ -324,6 +356,60 @@ fn resolve_bootstrap_params(
 
     *params_value = resolved_params;
     Ok(start_block)
+}
+
+fn parse_bootstrap_params_yaml(
+    contents: &str,
+) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
+    let parsed: BootstrapParamsFile = serde_yaml::from_str(contents)?;
+    let bootstrap_block = match (parsed.start_block, parsed.params.bootstrap_block) {
+        (Some(start_block), Some(bootstrap_block)) => {
+            if start_block != bootstrap_block {
+                return Err(format!(
+                    "`start_block` ({start_block}) must match `params.bootstrap_block` \
+                     ({bootstrap_block})"
+                )
+                .into());
+            }
+            start_block
+        }
+        (Some(start_block), None) => start_block,
+        (None, Some(bootstrap_block)) => bootstrap_block,
+        (None, None) => {
+            return Err("bootstrap config is missing `start_block` or `params.bootstrap_block`".into())
+        }
+    };
+
+    let BootstrapParamsYaml { pools, routes, .. } = parsed.params;
+    let mut seen_pools = HashSet::new();
+    let mut all_pools = Vec::new();
+
+    for pool in pools {
+        if seen_pools.insert(pool.clone()) {
+            all_pools.push(pool);
+        }
+    }
+
+    for route in routes {
+        let BootstrapRouteYaml { token0, token1, routers } = route;
+        let _ = (token0, token1);
+        for router in routers {
+            let BootstrapRouterYaml { pool, protocol } = router;
+            let _ = protocol;
+            if seen_pools.insert(pool.clone()) {
+                all_pools.push(pool);
+            }
+        }
+    }
+
+    if all_pools.is_empty() {
+        return Err("bootstrap config is missing `params.pools` or `params.routes`".into());
+    }
+
+    Ok((
+        Some(bootstrap_block),
+        format!("bootstrap_block={bootstrap_block}&pools={}", all_pools.join(",")),
+    ))
 }
 
 fn normalize_substreams_params(
@@ -544,6 +630,33 @@ extractors:
         );
 
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn bootstrap_config_supports_route_format() {
+        let (start_block, params) = parse_bootstrap_params_yaml(
+            r#"
+start_block: 25377208
+params:
+  routes:
+    - token0: "0x6f40d4a6237c257fff2db00fa0510deeecd303eb"
+      token1: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+      routers:
+        - pool: "0x6f40d4a6237c257fff2db00fa0510deeecd303eb"
+          protocol: bebop
+        - pool: "0x8710039d5de6840ede452a85672b32270a709ae2"
+          protocol: fluid
+        - pool: "0xc1cd3d0913f4633b43fcddbcd7342bc9b71c676f"
+          protocol: uniswapv3
+"#,
+        )
+        .expect("route-format bootstrap should parse");
+
+        assert_eq!(start_block, Some(25377208));
+        assert_eq!(
+            params,
+            "bootstrap_block=25377208&pools=0x6f40d4a6237c257fff2db00fa0510deeecd303eb,0x8710039d5de6840ede452a85672b32270a709ae2,0xc1cd3d0913f4633b43fcddbcd7342bc9b71c676f"
+        );
     }
 
     #[test]
