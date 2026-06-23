@@ -44,6 +44,7 @@ use crate::{
         post_processors::POST_PROCESSOR_REGISTRY,
         protocol_cache::ProtocolMemoryCache,
         protocol_extractor::{ExtractorPgGateway, ProtocolExtractor},
+        uniswap_v2_bootstrap::build_uniswap_v2_bootstrap_block,
         uniswap_v3_bootstrap::{build_uniswap_v3_bootstrap_block, parse_bootstrap_params},
         ExtractionError, Extractor, ExtractorExtension, ExtractorMsg,
     },
@@ -470,6 +471,7 @@ impl ProtocolTypeConfig {
 pub enum BootstrapStrategy {
     #[default]
     UniswapV3Rpc,
+    UniswapV2Rpc,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -902,6 +904,17 @@ impl ExtractorBuilder {
         let changes = match bootstrap.strategy {
             BootstrapStrategy::UniswapV3Rpc => {
                 build_uniswap_v3_bootstrap_block(
+                    rpc_client,
+                    &self.config.name,
+                    self.config.chain,
+                    &self.config.name,
+                    parsed_params.bootstrap_block,
+                    &parsed_params.pools,
+                )
+                .await?
+            }
+            BootstrapStrategy::UniswapV2Rpc => {
+                build_uniswap_v2_bootstrap_block(
                     rpc_client,
                     &self.config.name,
                     self.config.chain,

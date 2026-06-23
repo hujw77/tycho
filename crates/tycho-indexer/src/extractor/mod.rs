@@ -43,6 +43,7 @@ pub mod reorg_buffer;
 pub mod runner;
 pub mod token_analysis_cron;
 mod u256_num;
+pub mod uniswap_v2_bootstrap;
 pub mod uniswap_v3_bootstrap;
 pub mod uniswap_v3_stream;
 

@@ -1,5 +1,6 @@
 use itertools::Itertools;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2::{self as eth};
 
@@ -46,18 +47,36 @@ impl PartialChanges {
     }
 }
 
+#[derive(Clone)]
+struct PoolMetadata {
+    token0: Vec<u8>,
+    token1: Vec<u8>,
+}
+
 #[substreams::handlers::map]
 pub fn map_pool_events(
+    params: String,
     block: eth::Block,
     block_entity_changes: BlockChanges,
     pools_store: StoreGetProto<ProtocolComponent>,
 ) -> Result<BlockChanges, substreams::errors::Error> {
     // Sync event is sufficient for our use-case. Since it's emitted on every reserve-altering
     // function call, we can use it as the only event to update the reserves of a pool.
+    let bootstrap_pool_tokens = parse_bootstrap_pool_tokens(&params);
+    let bootstrap_pools = bootstrap_pool_tokens
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut block_entity_changes = block_entity_changes;
     let mut tx_changes: HashMap<Vec<u8>, PartialChanges> = HashMap::new();
 
-    handle_sync(&block, &mut tx_changes, &pools_store);
+    handle_sync(
+        &block,
+        &mut tx_changes,
+        &pools_store,
+        &bootstrap_pool_tokens,
+        &bootstrap_pools,
+    );
     merge_block(&mut tx_changes, &mut block_entity_changes);
 
     Ok(block_entity_changes)
@@ -77,12 +96,14 @@ fn handle_sync(
     block: &eth::Block,
     tx_changes: &mut HashMap<Vec<u8>, PartialChanges>,
     store: &StoreGetProto<ProtocolComponent>,
+    bootstrap_pool_tokens: &HashMap<String, PoolMetadata>,
+    bootstrap_pools: &HashSet<String>,
 ) {
     let mut on_sync = |event: Sync, _tx: &eth::TransactionTrace, _log: &eth::Log| {
         let pool_address_hex = _log.address.to_hex();
 
-        let pool =
-            store.must_get_last(StoreKey::Pool.get_unique_pool_key(pool_address_hex.as_str()));
+        let pool = store
+            .get_last(StoreKey::Pool.get_unique_pool_key(pool_address_hex.as_str()));
         // Convert reserves to bytes
         let reserves_bytes = [event.reserve0, event.reserve1];
 
@@ -110,27 +131,69 @@ fn handle_sync(
             );
         }
 
-        // Update balance changes for each token
-        for (index, token) in pool.tokens.iter().enumerate() {
-            let balance = &reserves_bytes[index];
-            // HashMap also prevents having duplicate balance changes for the same pool and token.
-            tx_change.balance_changes.insert(
-                ComponentKey::new(pool_address_hex.clone(), token.clone()),
-                BalanceChange {
-                    token: token.clone(),
-                    balance: balance.clone().to_signed_bytes_be(),
-                    component_id: pool_address_hex.as_bytes().to_vec(),
-                },
-            );
+        let tokens = if let Some(pool) = pool {
+            Some([pool.tokens[0].clone(), pool.tokens[1].clone()])
+        } else {
+            bootstrap_pool_tokens
+                .get(&pool_address_hex)
+                .map(|meta| [meta.token0.clone(), meta.token1.clone()])
+        };
+
+        if let Some(tokens) = tokens {
+            for (index, token) in tokens.iter().enumerate() {
+                let balance = &reserves_bytes[index];
+                // HashMap also prevents having duplicate balance changes for the same pool and token.
+                tx_change.balance_changes.insert(
+                    ComponentKey::new(pool_address_hex.clone(), token.clone()),
+                    BalanceChange {
+                        token: token.clone(),
+                        balance: balance.clone().to_signed_bytes_be(),
+                        component_id: pool_address_hex.as_bytes().to_vec(),
+                    },
+                );
+            }
         }
     };
 
     let mut eh = EventHandler::new(block);
     // Filter the sync events by the pool address, to make sure we don't process events for other
     // Protocols that use the same event signature.
-    eh.filter_by_address(PoolAddresser { store });
+    eh.filter_by_address(PoolAddresser { store, bootstrap_pools });
     eh.on::<Sync, _>(&mut on_sync);
     eh.handle_events();
+}
+
+fn parse_bootstrap_pool_tokens(params: &str) -> HashMap<String, PoolMetadata> {
+    let mut pool_tokens = HashMap::new();
+
+    for pair in params.split('&').filter(|part| !part.is_empty()) {
+        let Some(value) = pair.strip_prefix("pool_tokens=") else {
+            continue;
+        };
+
+        for entry in value.split(',').filter(|entry| !entry.is_empty()) {
+            let mut parts = entry.split(':');
+            let (Some(pool), Some(token0), Some(token1), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+
+            pool_tokens.insert(
+                pool.to_lowercase(),
+                PoolMetadata {
+                    token0: ethabi::ethereum_types::Address::from_str(token0)
+                        .map(|address| address.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                    token1: ethabi::ethereum_types::Address::from_str(token1)
+                        .map(|address| address.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                },
+            );
+        }
+    }
+
+    pool_tokens
 }
 
 /// Merge the changes from the sync events with the create_pool events previously mapped on

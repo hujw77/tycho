@@ -1,0 +1,16 @@
+extractors:
+  uniswap_v2:
+    name: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "uniswap_v2_pool"
+        financial_type: "Swap"
+    spkg: "protocols/substreams/ethereum-uniswap-v2/ethereum-uniswap-v2-v0.3.2.spkg"
+    module_name: "map_pool_events"
+    substreams_params:
+      map_pool_events: "@config/uniswap_v2_bootstrap.yaml"
+    bootstrap:
+      strategy: "uniswap_v2_rpc"
+      params: "@config/uniswap_v2_bootstrap.yaml"

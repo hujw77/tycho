@@ -255,7 +255,10 @@ impl PostgresGateway {
             }
         }
 
-        if let Some(thr) = min_tvl {
+        // Treat non-positive thresholds as "no TVL filter". This preserves the common
+        // `min_tvl = 0` meaning "include everything", including components that do not
+        // currently have a materialized component_tvl row.
+        if let Some(thr) = min_tvl.filter(|thr| *thr > 0.0) {
             query = query.filter(schema::component_tvl::tvl.gt(thr));
             count_query = count_query.filter(schema::component_tvl::tvl.gt(thr));
         }
@@ -3739,7 +3742,7 @@ mod test {
     #[rstest]
     #[case::empty(Some(10.0), & [])]
     #[case::all(None, & ["state1", "state3", "no_tvl"])]
-    #[case::with_tvl(Some(0.0), & ["state1", "state3"])]
+    #[case::with_tvl_zero(Some(0.0), & ["state1", "state3", "no_tvl"])]
     #[case::with_tvl(Some(1.0), & ["state1"])]
     #[tokio::test]
     async fn test_get_protocol_components_with_min_tvl(

@@ -415,6 +415,23 @@ fn parse_bootstrap_params_yaml(
 fn normalize_substreams_params(
     mut parsed: SubstreamsParamsFile,
 ) -> Result<(Option<i64>, BTreeMap<String, Value>), Box<dyn std::error::Error>> {
+    if parsed.params.contains_key("routes") {
+        let (pools, pool_tokens) = collect_bootstrap_pool_metadata(&parsed.params)?;
+        if !pools.is_empty() {
+            parsed.params.insert(
+                "pools".to_string(),
+                Value::Sequence(pools.into_iter().map(Value::String).collect()),
+            );
+        }
+        if !pool_tokens.is_empty() {
+            parsed.params.insert(
+                "pool_tokens".to_string(),
+                Value::Sequence(pool_tokens.into_iter().map(Value::String).collect()),
+            );
+        }
+        parsed.params.remove("routes");
+    }
+
     let bootstrap_block = parsed
         .params
         .get("bootstrap_block")
@@ -475,6 +492,45 @@ fn render_substreams_scalar_value(value: &Value) -> Result<String, Box<dyn std::
     }
 }
 
+fn collect_bootstrap_pool_metadata(
+    params: &BTreeMap<String, Value>,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    let pools = params
+        .get("pools")
+        .map(parse_string_sequence_yaml_value)
+        .transpose()?
+        .unwrap_or_default();
+
+    let routes = params
+        .get("routes")
+        .cloned()
+        .unwrap_or(Value::Sequence(vec![]));
+    let routes: Vec<BootstrapRouteYaml> = serde_yaml::from_value(routes)?;
+
+    let mut seen_pools = HashSet::new();
+    let mut all_pools = Vec::new();
+    let mut pool_tokens = Vec::new();
+
+    for pool in pools {
+        if seen_pools.insert(pool.clone()) {
+            all_pools.push(pool);
+        }
+    }
+
+    for route in routes {
+        for router in route.routers {
+            let BootstrapRouterYaml { pool, protocol } = router;
+            let _ = protocol;
+            if seen_pools.insert(pool.clone()) {
+                all_pools.push(pool.clone());
+                pool_tokens.push(format!("{pool}:{}:{}", route.token0, route.token1));
+            }
+        }
+    }
+
+    Ok((all_pools, pool_tokens))
+}
+
 fn parse_i64_yaml_value(value: &Value) -> Result<i64, Box<dyn std::error::Error>> {
     match value {
         Value::Number(value) => value
@@ -486,6 +542,19 @@ fn parse_i64_yaml_value(value: &Value) -> Result<i64, Box<dyn std::error::Error>
         | Value::Sequence(_)
         | Value::Mapping(_)
         | Value::Tagged(_) => Err("block parameters must be scalar integers".into()),
+    }
+}
+
+fn parse_string_sequence_yaml_value(value: &Value) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    match value {
+        Value::Sequence(values) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value.clone()),
+                _ => Err("pool parameters must be string values".into()),
+            })
+            .collect(),
+        _ => Err("pool parameters must be a list of strings".into()),
     }
 }
 
@@ -673,6 +742,31 @@ params:
         .expect_err("mismatched config should fail");
 
         assert!(err.to_string().contains("must match"));
+    }
+
+    #[test]
+    fn substreams_params_support_route_format_with_pool_token_metadata() {
+        let (start_block, params) = parse_substreams_params_yaml(
+            r#"
+start_block: 25377208
+params:
+  routes:
+    - token0: "0x6f40d4a6237c257fff2db00fa0510deeecd303eb"
+      token1: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+      routers:
+        - pool: "0x6f40d4a6237c257fff2db00fa0510deeecd303eb"
+          protocol: uniswap_v2
+        - pool: "0x8710039d5de6840ede452a85672b32270a709ae2"
+          protocol: uniswap_v2
+"#,
+        )
+        .expect("route-format substreams params should parse");
+
+        assert_eq!(start_block, Some(25377208));
+        assert_eq!(
+            params,
+            "bootstrap_block=25377208&pool_tokens=0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0x8710039d5de6840ede452a85672b32270a709ae2:0x6f40d4a6237c257fff2db00fa0510deeecd303eb:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2&pools=0x6f40d4a6237c257fff2db00fa0510deeecd303eb,0x8710039d5de6840ede452a85672b32270a709ae2"
+        );
     }
 }
 
