@@ -57,6 +57,7 @@ pub fn build_pool_events(
 ) -> Events {
     let filter = parse_event_filter(params);
     let block_ts = block.timestamp_seconds();
+    let mut discovered_pools = HashMap::<String, PoolMetadata>::new();
     let mut pool_events = block
         .transaction_traces
         .into_iter()
@@ -70,7 +71,9 @@ pub fn build_pool_events(
             receipt
                 .logs
                 .iter()
-                .filter_map(|log| log_to_event(log, &tx, &filter, pools_store))
+                .filter_map(|log| {
+                    log_to_event(log, &tx, &filter, pools_store, &mut discovered_pools)
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -307,6 +310,12 @@ struct EventFilter {
     allowed_pools: HashSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PoolMetadata {
+    token0: String,
+    token1: String,
+}
+
 fn collect_new_pools(
     block: &eth::Block,
     new_pools: &mut Vec<TransactionEntityChanges>,
@@ -392,15 +401,20 @@ fn log_to_event(
     tx: &TransactionTrace,
     filter: &EventFilter,
     pools_store: &StoreGetProto<Pool>,
+    discovered_pools: &mut HashMap<String, PoolMetadata>,
 ) -> Option<PoolEvent> {
     let log_address = event.address.to_hex();
 
     if log_address.eq_ignore_ascii_case(&filter.factory_address) {
         if let Some(created) = PoolCreated::match_and_decode(event) {
             let pool_address = created.pool.to_hex().to_lowercase();
-            if !filter.allows_pool(&pool_address) {
-                return None;
-            }
+            discovered_pools.insert(
+                pool_address.clone(),
+                PoolMetadata {
+                    token0: created.token0.to_hex(),
+                    token1: created.token1.to_hex(),
+                },
+            );
 
             return Some(PoolEvent {
                 log_ordinal: event.ordinal,
@@ -416,18 +430,20 @@ fn log_to_event(
         }
     }
 
-    if !filter.allows_pool(&log_address) {
+    let metadata = pools_store
+        .get_last(format!("Pool:{}", &log_address))
+        .map(|pool| PoolMetadata {
+            token0: Hex(pool.token0).to_string(),
+            token1: Hex(pool.token1).to_string(),
+        })
+        .or_else(|| discovered_pools.get(&log_address).cloned());
+
+    if !filter.allows_pool_log(&log_address, metadata.is_some()) {
         return None;
     }
 
-    let (token0, token1) = pools_store
-        .get_last(format!("Pool:{}", &log_address))
-        .map(|pool| {
-            (
-                Hex(pool.token0.clone()).to_string(),
-                Hex(pool.token1.clone()).to_string(),
-            )
-        })
+    let (token0, token1) = metadata
+        .map(|pool| (pool.token0, pool.token1))
         .unwrap_or_else(|| (String::new(), String::new()));
 
     if let Some(init) = Initialize::match_and_decode(event) {
@@ -924,6 +940,10 @@ impl EventFilter {
     fn allows_pool(&self, pool_address: &str) -> bool {
         self.allowed_pools.is_empty() || self.allowed_pools.contains(&pool_address.to_lowercase())
     }
+
+    fn allows_pool_log(&self, pool_address: &str, is_known_pool: bool) -> bool {
+        self.allows_pool(pool_address) || is_known_pool
+    }
 }
 
 impl PoolEvent {
@@ -958,5 +978,22 @@ mod tests {
         assert!(filter.allowed_pools.contains("0x1111111111111111111111111111111111111111"));
         assert!(filter.allowed_pools.contains("0x2222222222222222222222222222222222222222"));
         assert!(!filter.allows_pool("0x3333333333333333333333333333333333333333"));
+    }
+
+    #[test]
+    fn known_pool_logs_are_allowed_even_if_not_in_bootstrap_allowlist() {
+        let filter = parse_event_filter(
+            "factory=0x1F98431c8aD98523631AE4a59f267346ea31F984&pools=0x1111111111111111111111111111111111111111",
+        );
+
+        assert!(!filter.allows_pool("0x2222222222222222222222222222222222222222"));
+        assert!(filter.allows_pool_log(
+            "0x2222222222222222222222222222222222222222",
+            true
+        ));
+        assert!(!filter.allows_pool_log(
+            "0x2222222222222222222222222222222222222222",
+            false
+        ));
     }
 }
