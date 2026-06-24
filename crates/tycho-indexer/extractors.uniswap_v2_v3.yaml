@@ -1,32 +1,4 @@
-extractors:
-  uniswap_v2:
-    name: "uniswap_v2"
-    chain: "ethereum"
-    implementation_type: "Custom"
-    sync_batch_size: 1000
-    protocol_types:
-      - name: "uniswap_v2_pool"
-        financial_type: "Swap"
-    spkg: "protocols/substreams/ethereum-uniswap-v2/ethereum-uniswap-v2-v0.3.2.spkg"
-    module_name: "map_pool_events"
-    substreams_params:
-      map_pool_events: "@config/uniswap_v2_bootstrap.yaml"
-    bootstrap:
-      strategy: "uniswap_v2_rpc"
-      params: "@config/uniswap_v2_bootstrap.yaml"
-
-  uniswap_v3:
-    name: "uniswap_v3"
-    chain: "ethereum"
-    implementation_type: "Custom"
-    sync_batch_size: 1000
-    protocol_types:
-      - name: "uniswap_v3_pool"
-        financial_type: "Swap"
-    spkg: "protocols/substreams/ethereum-uniswap-v3-logs-only/ethereum-uniswap-v3-logs-only-v0.1.2.spkg"
-    module_name: "map_events"
-    substreams_params:
-      map_events: "factory=0x1F98431c8aD98523631AE4a59f267346ea31F984"
-    bootstrap:
-      strategy: "uniswap_v3_rpc"
-      params: "@config/uniswap_v3_bootstrap.yaml"
+includes:
+  - "extractors.fragments/uniswap_v2.yaml"
+  - "extractors.fragments/uniswap_v3_events.yaml"
+extractors: {}

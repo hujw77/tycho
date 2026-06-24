@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package uniswap.v3;
+
+message Block {
+  bytes hash = 1;
+  bytes parent_hash = 2;
+  uint64 number = 3;
+  uint64 ts = 4;
+}
+
+message Pool {
+  bytes address = 1;
+  bytes token0 = 2;
+  bytes token1 = 3;
+  bytes created_tx_hash = 4;
+}
+
+message Transaction {
+  bytes hash = 1;
+  bytes from = 2;
+  bytes to = 3;
+  uint64 index = 4;
+}
+
+message TickDelta {
+  bytes pool_address = 1;
+  int32 tick_index = 2;
+  bytes liquidity_net_delta = 3;
+  uint64 ordinal = 4;
+  Transaction transaction = 5;
+}
+
+message TickDeltas {
+  repeated TickDelta deltas = 1;
+}
+
+message LiquidityChange {
+  bytes pool_address = 1;
+  bytes value = 2;
+  LiquidityChangeType change_type = 3;
+  uint64 ordinal = 4;
+  Transaction transaction = 5;
+}
+
+message LiquidityChanges {
+  repeated LiquidityChange changes = 1;
+}
+
+enum LiquidityChangeType {
+  DELTA = 0;
+  ABSOLUTE = 1;
+}
+
+message Events {
+  Block block = 1;
+  repeated PoolEvent pool_events = 3;
+
+  message PoolEvent {
+    oneof type {
+      Initialize initialize = 1;
+      Mint mint = 2;
+      Collect collect = 3;
+      Burn burn = 4;
+      Swap swap = 5;
+      Flash flash = 6;
+      SetFeeProtocol set_fee_protocol = 7;
+      CollectProtocol collect_protocol = 8;
+      PoolCreated pool_created = 9;
+    }
+    uint64 log_ordinal = 100;
+    string pool_address = 102;
+    string token0 = 103;
+    string token1 = 104;
+    Transaction transaction = 105;
+
+    message Initialize {
+      string sqrt_price = 1;
+      int32 tick = 2;
+    }
+
+    message Mint {
+      string sender = 1;
+      string owner = 2;
+      int32 tick_lower = 3;
+      int32 tick_upper = 4;
+      string amount = 5;
+      string amount_0 = 6;
+      string amount_1 = 7;
+    }
+
+    message Collect {
+      string owner = 1;
+      string recipient = 2;
+      int32 tick_lower = 3;
+      int32 tick_upper = 4;
+      string amount_0 = 5;
+      string amount_1 = 6;
+    }
+
+    message Burn {
+      string owner = 1;
+      int32 tick_lower = 2;
+      int32 tick_upper = 3;
+      string amount = 4;
+      string amount_0 = 5;
+      string amount_1 = 6;
+    }
+
+    message Swap {
+      string sender = 1;
+      string recipient = 2;
+      string amount_0 = 3;
+      string amount_1 = 4;
+      string sqrt_price = 6;
+      string liquidity = 7;
+      int32 tick = 8;
+    }
+
+    message Flash {
+      string sender = 1;
+      string recipient = 2;
+      string amount_0 = 3;
+      string amount_1 = 4;
+      string paid_0 = 5;
+      string paid_1 = 6;
+    }
+
+    message SetFeeProtocol {
+      uint64 fee_protocol_0_old = 1;
+      uint64 fee_protocol_1_old = 2;
+      uint64 fee_protocol_0_new = 3;
+      uint64 fee_protocol_1_new = 4;
+    }
+
+    message CollectProtocol {
+      string sender = 1;
+      string recipient = 2;
+      string amount_0 = 3;
+      string amount_1 = 4;
+    }
+
+    message PoolCreated {
+      uint64 fee = 1;
+      int32 tick_spacing = 2;
+    }
+  }
+}
