@@ -18,6 +18,8 @@ pub(crate) struct ExtractorConfigs {
 
 #[derive(Debug, Deserialize)]
 struct RawExtractorConfigs {
+    #[serde(default)]
+    includes: Vec<String>,
     extractors: HashMap<String, RawExtractorConfig>,
 }
 
@@ -60,13 +62,8 @@ impl ExtractorConfigs {
     }
 
     pub(crate) fn from_yaml(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut file = File::open(path)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        let mut config: RawExtractorConfigs = serde_yaml::from_str(&contents)?;
-        let base_dir = Path::new(path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
+        let mut config = load_raw_extractor_configs(Path::new(path), &mut HashSet::new())?;
+        let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
         config.resolve_substreams_params(base_dir)?;
         config.try_into()
     }
@@ -595,6 +592,52 @@ fn canonicalize_for_include_tracking(path: &Path) -> Result<PathBuf, Box<dyn std
         .map_err(|err| format!("failed to resolve config path `{}`: {err}", path.display()).into())
 }
 
+fn load_raw_extractor_configs(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<RawExtractorConfigs, Box<dyn std::error::Error>> {
+    let resolved_path = canonicalize_for_include_tracking(path)?;
+    if !visited.insert(resolved_path.clone()) {
+        return Err(format!(
+            "cyclic extractor config include detected at `{}`",
+            resolved_path.display()
+        )
+        .into());
+    }
+
+    let mut file = File::open(&resolved_path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let parsed: RawExtractorConfigs = serde_yaml::from_str(&contents)?;
+    let base_dir = resolved_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut merged = RawExtractorConfigs { includes: vec![], extractors: HashMap::new() };
+
+    for include in &parsed.includes {
+        let included = load_raw_extractor_configs(&base_dir.join(normalize_include_path(include)), visited)?;
+        merge_raw_extractor_configs(&mut merged, included)?;
+    }
+
+    merge_raw_extractor_configs(
+        &mut merged,
+        RawExtractorConfigs { includes: vec![], extractors: parsed.extractors },
+    )?;
+
+    visited.remove(&resolved_path);
+    Ok(merged)
+}
+
+fn merge_raw_extractor_configs(
+    target: &mut RawExtractorConfigs,
+    incoming: RawExtractorConfigs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (extractor_id, extractor) in incoming.extractors {
+        if target.extractors.insert(extractor_id.clone(), extractor).is_some() {
+            return Err(format!("duplicate extractor definition for `{extractor_id}`").into());
+        }
+    }
+    Ok(())
+}
+
 fn render_substreams_param_value(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
     match value {
         Value::Bool(value) => Ok(value.to_string()),
@@ -853,6 +896,86 @@ extractors:
                 .and_then(|extractor| extractor.bootstrap.as_ref())
                 .map(|bootstrap| bootstrap.params.as_str()),
             Some("bootstrap_block=1&pools=0xabc")
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn extractor_configs_support_recursive_includes() {
+        let temp_root =
+            std::env::temp_dir().join(format!("tycho-indexer-extractor-includes-{}", process::id()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(temp_root.join("fragments")).expect("create temp fragment dir");
+
+        fs::write(
+            temp_root.join("fragments/uniswap_v2.yaml"),
+            r#"
+extractors:
+  uniswap_v2:
+    name: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 42
+    protocol_types:
+      - name: "uniswap_v2_pool"
+        financial_type: "Swap"
+    spkg: "stream.spkg"
+    module_name: "map_pool_events"
+"#,
+        )
+        .expect("write v2 fragment");
+        fs::write(
+            temp_root.join("fragments/uniswap_v3.yaml"),
+            r#"
+extractors:
+  uniswap_v3:
+    name: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 43
+    protocol_types:
+      - name: "uniswap_v3_pool"
+        financial_type: "Swap"
+    spkg: "stream.spkg"
+    module_name: "map_events"
+"#,
+        )
+        .expect("write v3 fragment");
+        fs::write(
+            temp_root.join("extractors.yaml"),
+            r#"
+includes:
+  - "fragments/uniswap_v2.yaml"
+  - "fragments/uniswap_v3.yaml"
+extractors: {}
+"#,
+        )
+        .expect("write extractor root");
+
+        let config = ExtractorConfigs::from_yaml(
+            temp_root
+                .join("extractors.yaml")
+                .to_str()
+                .expect("utf8 temp path"),
+        )
+        .expect("load included extractor configs");
+
+        assert_eq!(
+            config
+                .extractors
+                .get("uniswap_v2")
+                .map(ExtractorConfig::start_block),
+            Some(42)
+        );
+        assert_eq!(
+            config
+                .extractors
+                .get("uniswap_v3")
+                .map(ExtractorConfig::start_block),
+            Some(43)
         );
 
         let _ = fs::remove_dir_all(temp_root);
@@ -1582,5 +1705,47 @@ extractors:
             .expect("v3 bootstrap start_block present");
 
         assert_eq!(v2_start_block, v3_start_block);
+    }
+
+    #[test]
+    fn repo_uniswap_v3_configs_stay_consistent_across_entrypoints() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let default_config = ExtractorConfigs::from_yaml(
+            root.join("extractors.yaml")
+                .to_str()
+                .expect("utf8 default config path"),
+        )
+        .expect("load default extractors config");
+        let combined_config = ExtractorConfigs::from_yaml(
+            root.join("extractors.uniswap_v2_v3.yaml")
+                .to_str()
+                .expect("utf8 combined config path"),
+        )
+        .expect("load combined extractors config");
+
+        let default_v3 = default_config
+            .extractors
+            .get("uniswap_v3")
+            .expect("default v3 extractor present");
+        let combined_v3 = combined_config
+            .extractors
+            .get("uniswap_v3")
+            .expect("combined v3 extractor present");
+
+        assert_eq!(default_v3.start_block(), combined_v3.start_block());
+        assert_eq!(
+            default_v3
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone()),
+            combined_v3
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone())
+        );
+        assert_eq!(
+            default_v3.bootstrap.as_ref().map(|bootstrap| bootstrap.start_block),
+            combined_v3.bootstrap.as_ref().map(|bootstrap| bootstrap.start_block)
+        );
     }
 }
