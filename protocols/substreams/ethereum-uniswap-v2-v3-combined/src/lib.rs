@@ -24,26 +24,6 @@ use substreams::store::{
 use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::{models::BlockBalanceDeltas, prelude::*};
 
-fn block_entity_changes_to_block_changes(input: BlockEntityChanges) -> BlockChanges {
-    BlockChanges {
-        block: input.block,
-        changes: input
-            .changes
-            .into_iter()
-            .map(|change| TransactionChanges {
-                tx: change.tx,
-                contract_changes: vec![],
-                entity_changes: change.entity_changes,
-                component_changes: change.component_changes,
-                balance_changes: change.balance_changes,
-                entrypoints: vec![],
-                entrypoint_params: vec![],
-            })
-            .collect(),
-        storage_changes: vec![],
-    }
-}
-
 #[substreams::handlers::map]
 pub fn v2_map_pools_created(
     params: String,
@@ -85,26 +65,11 @@ pub fn v2_map_pool_events(
 }
 
 #[substreams::handlers::map]
-pub fn v2_map_pools_created_after_store(
-    pools_created: BlockChanges,
-    _pools_store: StoreGetProto<ProtocolComponent>,
-) -> Result<BlockChanges, substreams::errors::Error> {
-    Ok(pools_created)
-}
-
-#[substreams::handlers::map]
 pub fn v3_map_pools_created(
     params: String,
     block: eth::Block,
 ) -> Result<BlockEntityChanges, substreams::errors::Error> {
     Ok(build_v3_pool_created_block_entity_changes(&params, &block))
-}
-
-#[substreams::handlers::map]
-pub fn v3_map_pools_created_as_block_changes(
-    pools_created: BlockEntityChanges,
-) -> Result<BlockChanges, substreams::errors::Error> {
-    Ok(block_entity_changes_to_block_changes(pools_created))
 }
 
 #[substreams::handlers::store]
@@ -133,14 +98,6 @@ pub fn v3_map_events(
     pools_store: StoreGetProto<V3Pool>,
 ) -> Result<V3Events, anyhow::Error> {
     Ok(build_v3_pool_events(&params, block, &pools_store))
-}
-
-#[substreams::handlers::map]
-pub fn v3_map_pools_created_after_store(
-    pools_created: BlockEntityChanges,
-    _pools_store: StoreGetProto<V3Pool>,
-) -> Result<BlockChanges, substreams::errors::Error> {
-    Ok(block_entity_changes_to_block_changes(pools_created))
 }
 
 #[substreams::handlers::map]

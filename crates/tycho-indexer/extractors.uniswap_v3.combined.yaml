@@ -1,3 +1,0 @@
-includes:
-  - "extractors.fragments/uniswap_v3_combined_protocol_changes.yaml"
-extractors: {}
