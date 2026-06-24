@@ -1,0 +1,12 @@
+extractors:
+  uniswap_v2:
+    name: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 25384601
+    protocol_types:
+      - name: "uniswap_v2_pool"
+        financial_type: "Swap"
+    spkg: "protocols/substreams/ethereum-uniswap-v2-v3-combined/ethereum-uniswap-v2-v3-v2-created-only-v0.1.0.spkg"
+    module_name: "v2_map_pools_created"

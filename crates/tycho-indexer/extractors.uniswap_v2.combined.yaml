@@ -1,0 +1,3 @@
+includes:
+  - "extractors.fragments/uniswap_v2_combined.yaml"
+extractors: {}

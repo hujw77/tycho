@@ -1641,6 +1641,12 @@ extractors:
                 .expect("utf8 combined config path"),
         )
         .expect("load combined extractors config");
+        let combined_substream_config = ExtractorConfigs::from_yaml(
+            root.join("extractors.uniswap_v2_v3.combined.yaml")
+                .to_str()
+                .expect("utf8 combined-substream config path"),
+        )
+        .expect("load combined-substream extractors config");
 
         let default_v2 = default_config
             .extractors
@@ -1654,9 +1660,14 @@ extractors:
             .extractors
             .get("uniswap_v2")
             .expect("combined v2 extractor present");
+        let combined_substream_v2 = combined_substream_config
+            .extractors
+            .get("uniswap_v2")
+            .expect("combined-substream v2 extractor present");
 
         assert_eq!(default_v2.start_block(), v2_only.start_block());
         assert_eq!(default_v2.start_block(), combined_v2.start_block());
+        assert_eq!(default_v2.start_block(), combined_substream_v2.start_block());
         assert_eq!(
             default_v2
                 .bootstrap
@@ -1678,12 +1689,48 @@ extractors:
                 .map(|bootstrap| bootstrap.params.clone())
         );
         assert_eq!(
+            default_v2
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone()),
+            combined_substream_v2
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone())
+        );
+        assert_eq!(
             default_v2.substreams_params.get("map_pool_events"),
             v2_only.substreams_params.get("map_pool_events")
         );
         assert_eq!(
             default_v2.substreams_params.get("map_pool_events"),
             combined_v2.substreams_params.get("map_pool_events")
+        );
+        assert_eq!(
+            default_v2.substreams_params.get("map_pool_events"),
+            combined_substream_v2.substreams_params.get("v2_map_pool_events")
+        );
+
+        let combined_substream_yaml = fs::read_to_string(
+            root.join("extractors.uniswap_v2_v3.combined.yaml"),
+        )
+        .expect("read combined-substream config");
+        let combined_v2_fragment = fs::read_to_string(
+            root.join("extractors.fragments/uniswap_v2_combined.yaml"),
+        )
+        .expect("read combined-substream v2 fragment");
+
+        assert!(
+            combined_substream_yaml.contains("extractors.fragments/uniswap_v2_combined.yaml"),
+            "combined-substream config should include the v2 combined fragment"
+        );
+        assert!(
+            combined_v2_fragment.contains("module_name: \"v2_map_pool_events\""),
+            "combined-substream v2 fragment should point at the combined package module"
+        );
+        assert!(
+            combined_v2_fragment.contains("ethereum-uniswap-v2-v3-combined"),
+            "combined-substream v2 fragment should point at the combined package"
         );
     }
 
@@ -1722,6 +1769,12 @@ extractors:
                 .expect("utf8 combined config path"),
         )
         .expect("load combined extractors config");
+        let combined_substream_config = ExtractorConfigs::from_yaml(
+            root.join("extractors.uniswap_v2_v3.combined.yaml")
+                .to_str()
+                .expect("utf8 combined-substream config path"),
+        )
+        .expect("load combined-substream extractors config");
 
         let default_v3 = default_config
             .extractors
@@ -1731,8 +1784,13 @@ extractors:
             .extractors
             .get("uniswap_v3")
             .expect("combined v3 extractor present");
+        let combined_substream_v3 = combined_substream_config
+            .extractors
+            .get("uniswap_v3")
+            .expect("combined-substream v3 extractor present");
 
         assert_eq!(default_v3.start_block(), combined_v3.start_block());
+        assert_eq!(default_v3.start_block(), combined_substream_v3.start_block());
         assert_eq!(
             default_v3
                 .bootstrap
@@ -1744,8 +1802,72 @@ extractors:
                 .map(|bootstrap| bootstrap.params.clone())
         );
         assert_eq!(
+            default_v3
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone()),
+            combined_substream_v3
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.params.clone())
+        );
+        assert_eq!(
             default_v3.bootstrap.as_ref().map(|bootstrap| bootstrap.start_block),
             combined_v3.bootstrap.as_ref().map(|bootstrap| bootstrap.start_block)
+        );
+        assert_eq!(
+            default_v3.bootstrap.as_ref().map(|bootstrap| bootstrap.start_block),
+            combined_substream_v3
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.start_block)
+        );
+        let combined_v3_events_params = combined_substream_v3
+            .substreams_params
+            .get("v3_map_events")
+            .expect("combined-substream v3 map_events params present");
+        assert!(
+            combined_v3_events_params.contains("factory=0x1F98431c8aD98523631AE4a59f267346ea31F984"),
+            "combined-substream v3 map_events params should preserve the factory filter"
+        );
+        assert!(
+            combined_v3_events_params.contains("&pools="),
+            "combined-substream v3 map_events params should add an explicit pool allowlist"
+        );
+
+        let combined_substream_yaml = fs::read_to_string(
+            root.join("extractors.uniswap_v2_v3.combined.yaml"),
+        )
+        .expect("read combined-substream config");
+        let combined_v3_fragment = fs::read_to_string(
+            root.join("extractors.fragments/uniswap_v3_combined_protocol_changes.yaml"),
+        )
+        .expect("read combined-substream v3 fragment");
+        let combined_v3_substreams = fs::read_to_string(
+            root.join("config/uniswap_v3_substreams.yaml"),
+        )
+        .expect("read combined-substream v3 substreams config");
+
+        assert!(
+            combined_substream_yaml
+                .contains("extractors.fragments/uniswap_v3_combined_protocol_changes.yaml"),
+            "combined-substream config should include the v3 combined fragment"
+        );
+        assert!(
+            combined_v3_fragment.contains("v3_map_events"),
+            "combined-substream v3 fragment should pass params to the v3_map_events module"
+        );
+        assert!(
+            combined_v3_fragment.contains("module_name: \"v3_map_protocol_changes\""),
+            "combined-substream v3 fragment should point at the combined package module"
+        );
+        assert!(
+            combined_v3_fragment.contains("ethereum-uniswap-v2-v3-combined"),
+            "combined-substream v3 fragment should point at the combined package"
+        );
+        assert!(
+            combined_v3_substreams.contains("shared_uniswap_bootstrap.yaml"),
+            "combined-substream v3 substreams config should derive its pool filter from the shared bootstrap"
         );
     }
 }

@@ -3,9 +3,13 @@ name = "ethereum-uniswap-v3-logs-only"
 version = "0.1.2"
 edition = "2021"
 
+[features]
+default = ["standalone-handlers"]
+standalone-handlers = []
+
 [lib]
 name = "ethereum_uniswap_v3_logs_only"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0.75"

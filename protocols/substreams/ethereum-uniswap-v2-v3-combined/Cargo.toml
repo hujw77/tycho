@@ -1,0 +1,20 @@
+[package]
+name = "ethereum-uniswap-v2-v3-combined"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ethereum_uniswap_v2_v3_combined"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.75"
+substreams = "0.5.22"
+substreams-ethereum = "0.9.9"
+hex = "0.4.3"
+ethereum-uniswap-v2 = { path = "../ethereum-uniswap-v2", default-features = false }
+ethereum-uniswap-v3-logs-only = { path = "../ethereum-uniswap-v3-logs-only", default-features = false }
+tycho-substreams = { path = "../crates/tycho-substreams" }
+
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }

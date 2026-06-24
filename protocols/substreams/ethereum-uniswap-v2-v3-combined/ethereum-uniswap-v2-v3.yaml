@@ -1,0 +1,159 @@
+specVersion: v0.1.0
+package:
+  name: "ethereum_uniswap_v2_v3_combined"
+  version: v0.1.0
+  url: "https://github.com/propeller-heads/tycho-protocol-sdk/tree/main/substreams/ethereum-uniswap-v2-v3-combined"
+
+protobuf:
+  files:
+    - tycho/evm/v1/common.proto
+    - tycho/evm/v1/entity.proto
+    - tycho/evm/v1/utils.proto
+    - uniswap_v2.proto
+    - uniswap_v3.proto
+  importPaths:
+    - ./proto/v1
+    - ../../../proto/
+
+binaries:
+  default:
+    type: wasm/rust-v1
+    file: ../target/wasm32-unknown-unknown/release/ethereum_uniswap_v2_v3_combined.wasm
+
+modules:
+  - name: v2_map_pools_created
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - params: string
+      - source: sf.ethereum.type.v2.Block
+    output:
+      type: proto:tycho.evm.v1.BlockChanges
+
+  - name: v2_store_pools
+    kind: store
+    initialBlock: 25384601
+    updatePolicy: set_if_not_exists
+    valueType: proto:tycho.evm.v1.ProtocolComponent
+    inputs:
+      - map: v2_map_pools_created
+
+  - name: v2_map_pool_events
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - params: string
+      - source: sf.ethereum.type.v2.Block
+      - map: v2_map_pools_created
+      - store: v2_store_pools
+    output:
+      type: proto:tycho.evm.v1.BlockChanges
+
+  - name: v3_map_pools_created
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - params: string
+      - source: sf.ethereum.type.v2.Block
+    output:
+      type: proto:tycho.evm.v1.BlockEntityChanges
+
+  - name: v3_store_pools
+    kind: store
+    initialBlock: 25384601
+    updatePolicy: set_if_not_exists
+    valueType: proto:uniswap.v3.Pool
+    inputs:
+      - map: v3_map_pools_created
+
+  - name: v3_map_events
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - params: string
+      - source: sf.ethereum.type.v2.Block
+      - store: v3_store_pools
+    output:
+      type: proto:uniswap.v3.Events
+
+  - name: v3_map_balance_changes
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - map: v3_map_events
+      - store: v3_store_pools
+    output:
+      type: proto:tycho.evm.v1.BlockBalanceDeltas
+
+  - name: v3_store_pools_balances
+    kind: store
+    initialBlock: 25384601
+    updatePolicy: add
+    valueType: bigint
+    inputs:
+      - map: v3_map_balance_changes
+
+  - name: v3_map_ticks_changes
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - map: v3_map_events
+    output:
+      type: proto:uniswap.v3.TickDeltas
+
+  - name: v3_store_ticks_liquidity
+    kind: store
+    initialBlock: 25384601
+    updatePolicy: add
+    valueType: bigint
+    inputs:
+      - map: v3_map_ticks_changes
+
+  - name: v3_store_pool_current_tick
+    kind: store
+    initialBlock: 25384601
+    updatePolicy: set
+    valueType: int64
+    inputs:
+      - map: v3_map_events
+
+  - name: v3_map_liquidity_changes
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - map: v3_map_events
+      - store: v3_store_pool_current_tick
+    output:
+      type: proto:uniswap.v3.LiquidityChanges
+
+  - name: v3_store_liquidity
+    kind: store
+    initialBlock: 25384601
+    updatePolicy: set_sum
+    valueType: bigint
+    inputs:
+      - map: v3_map_liquidity_changes
+
+  - name: v3_map_protocol_changes
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - source: sf.ethereum.type.v2.Block
+      - map: v3_map_pools_created
+      - map: v3_map_events
+      - map: v3_map_balance_changes
+      - store: v3_store_pools_balances
+        mode: deltas
+      - map: v3_map_ticks_changes
+      - store: v3_store_ticks_liquidity
+        mode: deltas
+      - map: v3_map_liquidity_changes
+      - store: v3_store_liquidity
+        mode: deltas
+    output:
+      type: proto:tycho.evm.v1.BlockChanges
+
+params:
+  v2_map_pools_created: factory_address=5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f&protocol_type_name=uniswap_v2_pool
+  v3_map_pools_created: "1F98431c8aD98523631AE4a59f267346ea31F984"
+  v3_map_events: "1F98431c8aD98523631AE4a59f267346ea31F984"
