@@ -67,6 +67,13 @@ impl SubstreamsStream {
             )),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_stream(
+        stream: Pin<Box<dyn Stream<Item = Result<BlockResponse, Error>> + Send>>,
+    ) -> Self {
+        Self { stream }
+    }
 }
 
 static DEFAULT_BACKOFF: Lazy<ExponentialBackoff> =
@@ -276,5 +283,134 @@ impl Stream for SubstreamsStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.stream.poll_next_unpin(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use futures03::StreamExt;
+
+    use super::{stream_blocks, BlockResponse};
+    use crate::{
+        pb::sf::substreams::rpc::v2::{
+            response::Message, BlockScopedData, Response, SessionInit,
+        },
+        substreams::{
+            mock::{start_scripted_mock_substreams, MockSubstreamsScript},
+            SubstreamsEndpoint,
+        },
+    };
+
+    fn session_response() -> Response {
+        Response {
+            message: Some(Message::Session(SessionInit {
+                trace_id: "trace-1".to_string(),
+                resolved_start_block: 42,
+                linear_handoff_block: 42,
+                max_parallel_workers: 1,
+                attestation_public_key: String::new(),
+                chain_head: 42,
+                blocks_to_process_before_start_block: 0,
+                effective_blocks_to_process_before_start_block: 0,
+                blocks_to_process_after_start_block: 0,
+                effective_blocks_to_process_after_start_block: 0,
+            })),
+        }
+    }
+
+    fn block_response(number: u64, cursor: &str) -> Response {
+        Response {
+            message: Some(Message::BlockScopedData(BlockScopedData {
+                output: None,
+                clock: Some(crate::pb::sf::substreams::v1::Clock {
+                    id: number.to_string(),
+                    number,
+                    timestamp: None,
+                }),
+                cursor: cursor.to_string(),
+                final_block_height: number,
+                debug_map_outputs: vec![],
+                debug_store_outputs: vec![],
+                attestation: String::new(),
+                is_partial: false,
+                partial_index: None,
+                is_last_partial: None,
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnects_with_latest_cursor_after_stream_error() {
+        let (captured, addr) = start_scripted_mock_substreams(vec![
+            MockSubstreamsScript {
+                responses: vec![session_response(), block_response(42, "cursor@42")],
+                grpc_status: "13",
+                grpc_message: Some("forced-reconnect"),
+            },
+            MockSubstreamsScript {
+                responses: vec![session_response(), block_response(43, "cursor@43")],
+                grpc_status: "0",
+                grpc_message: None,
+            },
+        ])
+        .await;
+
+        let endpoint = Arc::new(
+            SubstreamsEndpoint::new(format!("http://{addr}"), None)
+                .await
+                .expect("endpoint builds"),
+        );
+        let mut stream = Box::pin(stream_blocks(
+            endpoint,
+            None,
+            None,
+            "map_uniswap_family_protocol_changes".to_string(),
+            42,
+            0,
+            false,
+            "ethereum:uniswap_family".to_string(),
+            false,
+            HashMap::new(),
+        ));
+
+        let first = stream
+            .next()
+            .await
+            .expect("first block response exists")
+            .expect("first block response succeeds");
+        let second = stream
+            .next()
+            .await
+            .expect("second block response exists")
+            .expect("second block response succeeds");
+        let ended = stream
+            .next()
+            .await
+            .expect("ended response exists")
+            .expect("ended response succeeds");
+
+        match first {
+            BlockResponse::New(block) => assert_eq!(block.cursor, "cursor@42"),
+            _ => panic!("expected first response to be a new block"),
+        }
+        match second {
+            BlockResponse::New(block) => assert_eq!(block.cursor, "cursor@43"),
+            _ => panic!("expected second response to be a new block"),
+        }
+        assert!(matches!(ended, BlockResponse::Ended));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "expected one initial request and one reconnect");
+        assert_eq!(requests[0].start_block_num, 42);
+        assert!(
+            requests[0].start_cursor.is_empty(),
+            "fresh shared stream should start without cursor"
+        );
+        assert_eq!(
+            requests[1].start_cursor, "cursor@42",
+            "hot reconnect should resume from latest cursor"
+        );
     }
 }

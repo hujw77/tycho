@@ -16,9 +16,9 @@ use tycho_common::{
 };
 
 use crate::extractor::{
-    reorg_buffer::{BufferedProtocolStateValue, ProtocolStateIdType}, AccountStateIdType,
-    AccountStateKeyType, AccountStateValueType, ExtractionError, ProtocolStateKeyType,
-    ProtocolStateValueType, StateUpdateBufferEntry,
+    reorg_buffer::{BufferedProtocolStateValue, ProtocolStateIdType},
+    AccountStateIdType, AccountStateKeyType, AccountStateValueType, ExtractionError,
+    ProtocolStateKeyType, ProtocolStateValueType, StateUpdateBufferEntry,
 };
 
 /// Storage changes grouped by transaction
@@ -156,6 +156,14 @@ impl BlockChanges {
                     .cloned()
             })
             .collect()
+    }
+
+    pub fn extractor_name(&self) -> &str {
+        &self.extractor
+    }
+
+    pub fn chain(&self) -> Chain {
+        self.chain
     }
 
     /// Returns true if the block is a partial block.
@@ -1069,8 +1077,7 @@ mod test {
             },
         ]);
 
-        let filtered = block_changes
-            .get_filtered_protocol_state_update(vec![(&c_id, &attr_tick)]);
+        let filtered = block_changes.get_filtered_protocol_state_update(vec![(&c_id, &attr_tick)]);
         assert_eq!(filtered, HashMap::from([((c_id, attr_tick), None)]));
     }
 

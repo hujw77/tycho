@@ -3,8 +3,6 @@
 //! This module contains a substreams client. Taken from the
 //! Rust Sink template repo.
 pub mod stream;
-
-#[cfg(test)]
 pub mod mock;
 use std::{fmt::Display, sync::Arc, time::Duration};
 

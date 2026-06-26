@@ -5,7 +5,7 @@ use ethabi::ethereum_types::Address;
 use itertools::Itertools;
 use serde::Deserialize;
 use substreams::prelude::BigInt;
-use substreams::store::{StoreGet, StoreGetProto};
+use substreams::store::StoreGet;
 use substreams_ethereum::pb::eth::v2::{self as eth};
 use substreams_helper::{event_handler::EventHandler, hex::Hexable};
 
@@ -77,7 +77,7 @@ pub fn build_pool_event_block_changes(
     params: &str,
     block: &eth::Block,
     mut block_entity_changes: BlockChanges,
-    pools_store: &StoreGetProto<ProtocolComponent>,
+    pools_store: &impl StoreGet<ProtocolComponent>,
 ) -> BlockChanges {
     let bootstrap_pool_tokens = parse_bootstrap_pool_tokens(params);
     let bootstrap_pools = bootstrap_pool_tokens
@@ -108,7 +108,14 @@ fn collect_new_pools(
 
         new_pools.push(TransactionChanges {
             tx: Some(tycho_tx.clone()),
-            contract_changes: vec![],
+            contract_changes: vec![ContractChange {
+                address: event.pair.clone(),
+                slots: vec![],
+                token_balances: vec![],
+                balance: vec![],
+                code: vec![],
+                change: ChangeType::Creation.into(),
+            }],
             entity_changes: vec![EntityChanges {
                 component_id: event.pair.to_hex(),
                 attributes: vec![
@@ -127,7 +134,7 @@ fn collect_new_pools(
             component_changes: vec![ProtocolComponent {
                 id: event.pair.to_hex(),
                 tokens: vec![event.token0.clone(), event.token1.clone()],
-                contracts: vec![],
+                contracts: vec![event.pair.clone()],
                 static_att: vec![
                     Attribute {
                         name: "fee".to_string(),
@@ -171,10 +178,227 @@ fn collect_new_pools(
     eh.handle_events();
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use ethabi::{ethereum_types::{Address, U256}, Token};
+    use substreams::store::StoreGet;
+    use prost_types::Timestamp;
+    use substreams_ethereum::pb::eth::v2::{
+        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
+        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+    };
+
+    use super::{
+        build_pool_created_block_changes, build_pool_event_block_changes, parse_pool_created_params,
+    };
+    use crate::store_key::StoreKey;
+    use tycho_substreams::prelude::{BlockChanges, ProtocolComponent};
+
+    #[derive(Clone, Debug, Default)]
+    struct MockPoolStore {
+        values: HashMap<String, ProtocolComponent>,
+    }
+
+    impl MockPoolStore {
+        fn with_pool<K: Into<String>>(mut self, key: K, value: ProtocolComponent) -> Self {
+            self.values.insert(key.into(), value);
+            self
+        }
+    }
+
+    impl StoreGet<ProtocolComponent> for MockPoolStore {
+        fn new(_idx: u32) -> Self {
+            Self::default()
+        }
+
+        fn get_at<K: AsRef<str>>(&self, _ord: u64, key: K) -> Option<ProtocolComponent> {
+            self.get_last(key)
+        }
+
+        fn get_last<K: AsRef<str>>(&self, key: K) -> Option<ProtocolComponent> {
+            self.values.get(key.as_ref()).cloned()
+        }
+
+        fn get_first<K: AsRef<str>>(&self, key: K) -> Option<ProtocolComponent> {
+            self.get_last(key)
+        }
+
+        fn has_at<K: AsRef<str>>(&self, _ord: u64, key: K) -> bool {
+            self.has_last(key)
+        }
+
+        fn has_last<K: AsRef<str>>(&self, key: K) -> bool {
+            self.values.contains_key(key.as_ref())
+        }
+
+        fn has_first<K: AsRef<str>>(&self, key: K) -> bool {
+            self.has_last(key)
+        }
+    }
+
+    fn address(byte: u8) -> Vec<u8> {
+        vec![byte; 20]
+    }
+
+    fn topic_address(byte: u8) -> Vec<u8> {
+        ethabi::encode(&[Token::Address(Address::from_slice(&address(byte)))])
+    }
+
+    fn pair_created_log(factory: u8, token0: u8, token1: u8, pair: u8) -> Log {
+        let data = ethabi::encode(&[
+            Token::Address(Address::from_slice(&address(pair))),
+            Token::Uint(U256::from(1u64)),
+        ]);
+
+        Log {
+            address: address(factory),
+            topics: vec![
+                vec![
+                    13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217,
+                    211, 21, 240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
+                ],
+                topic_address(token0),
+                topic_address(token1),
+            ],
+            data,
+            index: 0,
+            block_index: 0,
+            ordinal: 1,
+        }
+    }
+
+    fn pair_created_block(factory: u8, token0: u8, token1: u8, pair: u8) -> Block {
+        Block {
+            hash: vec![0xaa; 32],
+            number: 42,
+            size: 0,
+            header: Some(BlockHeader {
+                parent_hash: vec![0xbb; 32],
+                timestamp: Some(Timestamp {
+                    seconds: 1_718_000_000,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }),
+            transaction_traces: vec![TransactionTrace {
+                index: 0,
+                hash: vec![0xcc; 32],
+                from: vec![0x11; 20],
+                to: address(factory),
+                status: TransactionTraceStatus::Succeeded as i32,
+                receipt: Some(TransactionReceipt {
+                    logs: vec![pair_created_log(factory, token0, token1, pair)],
+                    ..Default::default()
+                }),
+                r#type: TransactionType::TrxTypeLegacy as i32,
+                ..Default::default()
+            }],
+            detail_level: DetailLevel::DetaillevelBase as i32,
+            ..Default::default()
+        }
+    }
+
+    fn sync_log(pool: u8, reserve0: u64, reserve1: u64) -> Log {
+        Log {
+            address: address(pool),
+            topics: vec![vec![
+                28, 65, 30, 154, 150, 224, 113, 36, 28, 47, 33, 247, 114, 107, 23, 174, 137,
+                227, 202, 180, 199, 139, 229, 14, 6, 43, 3, 169, 255, 251, 186, 209,
+            ]],
+            data: ethabi::encode(&[
+                Token::Uint(U256::from(reserve0)),
+                Token::Uint(U256::from(reserve1)),
+            ]),
+            index: 0,
+            block_index: 0,
+            ordinal: 1,
+        }
+    }
+
+    fn sync_block(pool: u8, reserve0: u64, reserve1: u64) -> Block {
+        Block {
+            hash: vec![0xdd; 32],
+            number: 43,
+            size: 0,
+            header: Some(BlockHeader {
+                parent_hash: vec![0xaa; 32],
+                timestamp: Some(Timestamp {
+                    seconds: 1_718_000_043,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }),
+            transaction_traces: vec![TransactionTrace {
+                index: 1,
+                hash: vec![0xee; 32],
+                from: vec![0x22; 20],
+                to: address(pool),
+                status: TransactionTraceStatus::Succeeded as i32,
+                receipt: Some(TransactionReceipt {
+                    logs: vec![sync_log(pool, reserve0, reserve1)],
+                    ..Default::default()
+                }),
+                r#type: TransactionType::TrxTypeLegacy as i32,
+                ..Default::default()
+            }],
+            detail_level: DetailLevel::DetaillevelBase as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pool_created_changes_include_pool_contract_address() {
+        let block = pair_created_block(0xf1, 0xa0, 0xc0, 0x45);
+        let params =
+            parse_pool_created_params("factory_address=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1&protocol_type_name=uniswap_v2_pool");
+
+        let changes = build_pool_created_block_changes(&block, &params);
+        let created = &changes.changes[0].component_changes[0];
+
+        assert_eq!(created.id, "0x4545454545454545454545454545454545454545");
+        assert_eq!(created.contracts, vec![vec![0x45; 20]]);
+        assert_eq!(changes.changes[0].contract_changes.len(), 1);
+        assert_eq!(changes.changes[0].contract_changes[0].address, vec![0x45; 20]);
+    }
+
+    #[test]
+    fn pool_event_changes_use_store_backed_tokens_without_pool_tokens_hint() {
+        let created_block = pair_created_block(0xf1, 0xa0, 0xc0, 0x45);
+        let params =
+            parse_pool_created_params("factory_address=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1&protocol_type_name=uniswap_v2_pool");
+        let created_changes = build_pool_created_block_changes(&created_block, &params);
+        let created_pool = created_changes.changes[0].component_changes[0].clone();
+        let pool_id = created_pool.id.clone();
+        let pool_store = MockPoolStore::new(0).with_pool(
+            StoreKey::Pool.get_unique_pool_key(&pool_id),
+            created_pool,
+        );
+        let follow_up_block = sync_block(0x45, 2_000, 3_000);
+
+        let follow_up = build_pool_event_block_changes(
+            &format!("pools={pool_id}"),
+            &follow_up_block,
+            BlockChanges {
+                block: Some((&follow_up_block).into()),
+                changes: vec![],
+                storage_changes: vec![],
+            },
+            &pool_store,
+        );
+
+        assert_eq!(follow_up.changes.len(), 1);
+        assert_eq!(follow_up.changes[0].balance_changes.len(), 2);
+        assert_eq!(follow_up.changes[0].entity_changes.len(), 1);
+        assert_eq!(follow_up.changes[0].entity_changes[0].component_id, pool_id);
+    }
+}
+
 fn handle_sync(
     block: &eth::Block,
     tx_changes: &mut HashMap<Vec<u8>, PartialChanges>,
-    store: &StoreGetProto<ProtocolComponent>,
+    store: &impl StoreGet<ProtocolComponent>,
     bootstrap_pool_tokens: &HashMap<String, PoolMetadata>,
     bootstrap_pools: &HashSet<String>,
 ) {

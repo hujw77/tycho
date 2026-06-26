@@ -1,5 +1,5 @@
 use ethabi::ethereum_types::Address;
-use substreams::store::{StoreGet, StoreGetProto};
+use substreams::store::StoreGet;
 use std::collections::HashSet;
 
 use substreams_helper::{common::HasAddresser, hex::Hexable};
@@ -8,12 +8,15 @@ use tycho_substreams::prelude::*;
 
 use crate::store_key::StoreKey;
 
-pub struct PoolAddresser<'a> {
-    pub store: &'a StoreGetProto<ProtocolComponent>,
+pub struct PoolAddresser<'a, S> {
+    pub store: &'a S,
     pub bootstrap_pools: &'a HashSet<String>,
 }
 
-impl HasAddresser for PoolAddresser<'_> {
+impl<S> HasAddresser for PoolAddresser<'_, S>
+where
+    S: StoreGet<ProtocolComponent>,
+{
     fn has_address(&self, key: Address) -> bool {
         let key_hex = key.to_hex();
         if self.bootstrap_pools.contains(&key_hex) {

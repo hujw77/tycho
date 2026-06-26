@@ -1105,10 +1105,12 @@ name = "ethereum-uniswap-v2-v3-combined"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ethabi 18.0.0",
  "ethereum-uniswap-v2",
  "ethereum-uniswap-v3-logs-only",
  "getrandom 0.2.17",
  "hex",
+ "prost-types 0.11.9",
  "substreams 0.5.22",
  "substreams-ethereum 0.9.13",
  "tycho-substreams 0.8.0",

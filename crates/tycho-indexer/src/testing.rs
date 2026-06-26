@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
@@ -675,8 +672,244 @@ pub fn block(version: u64) -> Block {
         Chain::Ethereum,
         Bytes::from(version).lpad(32, 0),
         Bytes::from(version - 1).lpad(32, 0),
-        ts + Duration::from_secs(version * 12),
+        ts + std::time::Duration::from_secs(version * 12),
     )
+}
+
+#[cfg(test)]
+pub fn scripted_session_response(
+    trace_prefix: &str,
+    start_block: u64,
+) -> crate::pb::sf::substreams::rpc::v2::Response {
+    use crate::pb::sf::substreams::rpc::v2::{response::Message, Response, SessionInit};
+
+    Response {
+        message: Some(Message::Session(SessionInit {
+            trace_id: format!("{trace_prefix}-{start_block}"),
+            resolved_start_block: start_block,
+            linear_handoff_block: start_block,
+            max_parallel_workers: 1,
+            attestation_public_key: String::new(),
+            chain_head: start_block,
+            blocks_to_process_before_start_block: 0,
+            effective_blocks_to_process_before_start_block: 0,
+            blocks_to_process_after_start_block: 0,
+            effective_blocks_to_process_after_start_block: 0,
+        })),
+    }
+}
+
+pub fn family_block_response_from_block_changes(
+    cursor_label: &str,
+    family_changes: tycho_substreams::pb::tycho::evm::v1::BlockChanges,
+) -> crate::pb::sf::substreams::rpc::v2::Response {
+    use prost::Message;
+
+    use crate::pb::sf::substreams::{
+        rpc::v2::{response::Message as ResponseMessage, BlockScopedData, MapModuleOutput, Response},
+        v1::Clock,
+    };
+
+    let number = family_changes
+        .block
+        .as_ref()
+        .expect("family block present")
+        .number;
+    Response {
+        message: Some(ResponseMessage::BlockScopedData(BlockScopedData {
+            output: Some(MapModuleOutput {
+                name: "map_uniswap_family_protocol_changes".to_string(),
+                map_output: Some(prost_types::Any {
+                    type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
+                    value: family_changes.encode_to_vec(),
+                }),
+                debug_info: None,
+            }),
+            clock: Some(Clock {
+                id: number.to_string(),
+                number,
+                timestamp: None,
+            }),
+            cursor: format!("{cursor_label}@{number}"),
+            final_block_height: number,
+            debug_map_outputs: vec![],
+            debug_store_outputs: vec![],
+            attestation: String::new(),
+            is_partial: false,
+            partial_index: None,
+            is_last_partial: None,
+        })),
+    }
+}
+
+pub fn family_block_response(
+    cursor_label: &str,
+    number: u64,
+    block_timestamp: u64,
+    changes: Vec<tycho_substreams::pb::tycho::evm::v1::TransactionChanges>,
+) -> crate::pb::sf::substreams::rpc::v2::Response {
+    family_block_response_from_block_changes(
+        cursor_label,
+        tycho_substreams::pb::tycho::evm::v1::BlockChanges {
+            block: Some(tycho_substreams::pb::tycho::evm::v1::Block {
+                number,
+                hash: vec![number as u8; 32],
+                parent_hash: vec![number.saturating_sub(1) as u8; 32],
+                ts: block_timestamp,
+            }),
+            changes,
+            storage_changes: vec![],
+        },
+    )
+}
+
+pub fn address(byte: u8) -> Vec<u8> {
+    vec![byte; 20]
+}
+
+pub fn topic_address(byte: u8) -> Vec<u8> {
+    use ethabi::{ethereum_types::Address, Token};
+
+    ethabi::encode(&[Token::Address(Address::from_slice(&address(byte)))])
+}
+
+pub fn topic_uint24(value: u32) -> Vec<u8> {
+    use ethabi::{ethereum_types::U256, Token};
+
+    ethabi::encode(&[Token::Uint(U256::from(value))])
+}
+
+pub fn v2_pair_created_block(
+    number: u64,
+    block_timestamp: i64,
+    factory: u8,
+    token0: u8,
+    token1: u8,
+    pair: u8,
+) -> substreams_ethereum::pb::eth::v2::Block {
+    use ethabi::{ethereum_types::{Address, U256}, Token};
+    use prost_types::Timestamp;
+    use substreams_ethereum::pb::eth::v2::{
+        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
+        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+    };
+
+    let data = ethabi::encode(&[
+        Token::Address(Address::from_slice(&address(pair))),
+        Token::Uint(U256::from(1u64)),
+    ]);
+    let log = Log {
+        address: address(factory),
+        topics: vec![
+            vec![
+                13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217, 211,
+                21, 240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
+            ],
+            topic_address(token0),
+            topic_address(token1),
+        ],
+        data,
+        index: 0,
+        block_index: 0,
+        ordinal: 1,
+    };
+
+    Block {
+        hash: vec![number as u8; 32],
+        number,
+        size: 0,
+        header: Some(BlockHeader {
+            parent_hash: vec![number.saturating_sub(1) as u8; 32],
+            timestamp: Some(Timestamp {
+                seconds: block_timestamp,
+                nanos: 0,
+            }),
+            ..Default::default()
+        }),
+        transaction_traces: vec![TransactionTrace {
+            index: 0,
+            hash: vec![0xaa; 32],
+            from: vec![0x01; 20],
+            to: address(factory),
+            status: TransactionTraceStatus::Succeeded as i32,
+            receipt: Some(TransactionReceipt {
+                logs: vec![log],
+                ..Default::default()
+            }),
+            r#type: TransactionType::TrxTypeLegacy as i32,
+            ..Default::default()
+        }],
+        detail_level: DetailLevel::DetaillevelBase as i32,
+        ..Default::default()
+    }
+}
+
+pub fn v3_pool_created_block(
+    number: u64,
+    block_timestamp: i64,
+    factory: u8,
+    token0: u8,
+    token1: u8,
+    fee: u32,
+    tick_spacing: i32,
+    pool: u8,
+) -> substreams_ethereum::pb::eth::v2::Block {
+    use ethabi::{ethereum_types::Address, Token};
+    use prost_types::Timestamp;
+    use substreams_ethereum::pb::eth::v2::{
+        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
+        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+    };
+
+    let data = ethabi::encode(&[
+        Token::Int(tick_spacing.into()),
+        Token::Address(Address::from_slice(&address(pool))),
+    ]);
+    let log = Log {
+        address: address(factory),
+        topics: vec![
+            vec![
+                120, 60, 202, 28, 4, 18, 221, 13, 105, 94, 120, 69, 104, 201, 109, 162, 233,
+                194, 47, 249, 137, 53, 122, 46, 139, 29, 155, 43, 78, 107, 113, 24,
+            ],
+            topic_address(token0),
+            topic_address(token1),
+            topic_uint24(fee),
+        ],
+        data,
+        index: 0,
+        block_index: 0,
+        ordinal: 1,
+    };
+
+    Block {
+        hash: vec![number as u8; 32],
+        number,
+        size: 0,
+        header: Some(BlockHeader {
+            parent_hash: vec![number.saturating_sub(1) as u8; 32],
+            timestamp: Some(Timestamp {
+                seconds: block_timestamp,
+                nanos: 0,
+            }),
+            ..Default::default()
+        }),
+        transaction_traces: vec![TransactionTrace {
+            index: 0,
+            hash: vec![0xcd; 32],
+            from: vec![0x01; 20],
+            to: address(factory),
+            status: TransactionTraceStatus::Succeeded as i32,
+            receipt: Some(TransactionReceipt {
+                logs: vec![log],
+                ..Default::default()
+            }),
+            r#type: TransactionType::TrxTypeLegacy as i32,
+            ..Default::default()
+        }],
+        detail_level: DetailLevel::DetaillevelBase as i32,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -688,7 +921,7 @@ pub mod fixtures {
     use tycho_storage::postgres::db_fixtures::yesterday_midnight;
     use tycho_substreams::pb::tycho::evm::v1::*;
 
-    use crate::extractor::models::fixtures::HASH_256_0;
+    const HASH_256_0: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     pub fn pb_state_changes() -> EntityChanges {
         let res1_value = Bytes::from(1_000u64)
@@ -827,7 +1060,7 @@ pub mod fixtures {
                 debug_info: None,
             }),
             clock: Some(Clock {
-                id: HASH_256_0.to_owned(),
+                id: HASH_256_0.to_string(),
                 number: 420,
                 timestamp: Some(prost_types::Timestamp { seconds: 1000, nanos: 0 }),
             }),

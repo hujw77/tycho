@@ -5,9 +5,9 @@ pub mod pb;
 pub mod services;
 pub mod substreams;
 
-#[cfg(test)]
 #[allow(clippy::extra_unused_lifetimes)]
-mod testing;
+#[cfg(test)]
+pub mod testing;
 
 #[cfg(test)]
 #[macro_use]

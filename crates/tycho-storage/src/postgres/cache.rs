@@ -49,8 +49,8 @@ pub(crate) enum WriteOp {
     UpsertBlock(Vec<models::blockchain::Block>),
     // Simply merge
     UpsertTx(Vec<models::blockchain::Transaction>),
-    // Simply keep last
-    SaveExtractionState(ExtractionState),
+    // Batch states, overriding only duplicate names within the transaction
+    SaveExtractionState(Vec<ExtractionState>),
     // Support saving a batch
     InsertContract(Vec<models::contract::Account>),
     // Simply merge
@@ -175,7 +175,17 @@ impl DBTransaction {
                     return Ok(());
                 }
                 (WriteOp::SaveExtractionState(l), WriteOp::SaveExtractionState(r)) => {
-                    l.clone_from(r);
+                    for new_state in r.iter() {
+                        if let Some(existing) = l
+                            .iter_mut()
+                            .find(|existing| existing.name == new_state.name)
+                        {
+                            existing.clone_from(new_state);
+                        } else {
+                            self.size += 1;
+                            l.push(new_state.clone());
+                        }
+                    }
                     return Ok(());
                 }
                 (WriteOp::InsertContract(l), WriteOp::InsertContract(r)) => {
@@ -468,10 +478,12 @@ impl DBCacheWriteExecutor {
                     .upsert_tx(transaction, conn)
                     .await?
             }
-            WriteOp::SaveExtractionState(state) => {
-                self.state_gateway
-                    .save_state(state, conn)
-                    .await?
+            WriteOp::SaveExtractionState(states) => {
+                for state in states.iter() {
+                    self.state_gateway
+                        .save_state(state, conn)
+                        .await?;
+                }
             }
             WriteOp::InsertContract(contracts) => {
                 for contract in contracts.iter() {
@@ -773,7 +785,7 @@ impl ExtractionStateGateway for CachedGateway {
     }
     #[instrument(skip_all)]
     async fn save_state(&self, new: &ExtractionState) -> Result<(), StorageError> {
-        self.add_op(WriteOp::SaveExtractionState(new.clone()))
+        self.add_op(WriteOp::SaveExtractionState(vec![new.clone()]))
             .await?;
         Ok(())
     }
@@ -1428,7 +1440,7 @@ mod test_serial_db {
                 vec![
                     WriteOp::UpsertBlock(vec![block_1.clone()]),
                     WriteOp::UpsertTx(vec![tx_1.clone()]),
-                    WriteOp::SaveExtractionState(extraction_state_1.clone()),
+                    WriteOp::SaveExtractionState(vec![extraction_state_1.clone()]),
                     WriteOp::InsertTokens(vec![token]),
                     WriteOp::InsertProtocolComponents(vec![protocol_component]),
                     WriteOp::InsertComponentBalances(vec![component_balance]),
@@ -1705,6 +1717,151 @@ mod test_serial_db {
             ),
             _ => panic!("Block version not found"),
         }
+    }
+
+    #[test]
+    fn db_transaction_keeps_distinct_extraction_states_per_name() {
+        let block = get_sample_block(1);
+        let (tx, _rx) = oneshot::channel();
+        let mut db_transaction = DBTransaction {
+            block_range: BlockRange::new(&block, &block),
+            size: 0,
+            operations: vec![],
+            tx,
+            owner: None,
+            caller_span: tracing::Span::none(),
+        };
+
+        let v1 = get_sample_extraction(1);
+        let v2 = ExtractionState::new(
+            "vm:test:v2".to_string(),
+            Chain::Ethereum,
+            None,
+            "cursor@421".as_bytes(),
+            Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
+                .expect("valid hash"),
+        );
+        let v1_updated = ExtractionState::new(
+            "vm:test".to_string(),
+            Chain::Ethereum,
+            None,
+            "cursor@422".as_bytes(),
+            Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
+                .expect("valid hash"),
+        );
+
+        db_transaction
+            .add_operation(WriteOp::SaveExtractionState(vec![v1.clone()]))
+            .expect("first state added");
+        db_transaction
+            .add_operation(WriteOp::SaveExtractionState(vec![v2.clone()]))
+            .expect("second distinct state added");
+        db_transaction
+            .add_operation(WriteOp::SaveExtractionState(vec![v1_updated.clone()]))
+            .expect("updated duplicate-name state added");
+
+        let saved_states = match &db_transaction.operations[0] {
+            WriteOp::SaveExtractionState(states) => states,
+            other => panic!("expected SaveExtractionState op, got {other:?}"),
+        };
+
+        assert_eq!(saved_states.len(), 2);
+        assert!(saved_states.iter().any(|state| state.name == "vm:test:v2"));
+        assert!(saved_states.iter().any(|state| {
+            state.name == "vm:test" && state.cursor == v1_updated.cursor
+        }));
+    }
+
+    #[tokio::test]
+    async fn cached_gateway_persists_multiple_extraction_states_in_one_transaction() {
+        let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:mypassword@localhost:5431/tycho_indexer_0".to_string()
+        });
+        std::env::set_var("DATABASE_URL", &db_url);
+
+        run_against_db(|connection_pool| async move {
+            let mut connection = connection_pool
+                .get()
+                .await
+                .expect("Failed to get a connection from the pool");
+            let chain_id = db_fixtures::insert_chain(&mut connection, "ethereum").await;
+            db_fixtures::insert_token(
+                &mut connection,
+                chain_id,
+                "0000000000000000000000000000000000000000",
+                "ETH",
+                18,
+                Some(100),
+            )
+            .await;
+            let state_gateway: PostgresGateway =
+                PostgresGateway::from_connection(&mut connection).await;
+            let (tx, rx) = mpsc::channel(10);
+            let write_executor = DBCacheWriteExecutor::new(
+                "ethereum".to_owned(),
+                Chain::Ethereum,
+                connection_pool.clone(),
+                state_gateway.clone(),
+                rx,
+            )
+            .await;
+            let executor_handle = write_executor.run();
+            let cached_gateway = CachedGateway::new(tx.clone(), connection_pool.clone(), state_gateway);
+            let block = get_sample_block(1);
+
+            let state_a = ExtractionState::new(
+                "vm:test:a".to_string(),
+                Chain::Ethereum,
+                None,
+                "cursor@a".as_bytes(),
+                block.hash.clone(),
+            );
+            let state_b = ExtractionState::new(
+                "vm:test:b".to_string(),
+                Chain::Ethereum,
+                None,
+                "cursor@b".as_bytes(),
+                block.hash.clone(),
+            );
+
+            cached_gateway
+                .start_transaction(&block, Some("test"))
+                .await;
+            cached_gateway
+                .upsert_block(slice::from_ref(&block))
+                .await
+                .expect("persist block");
+            cached_gateway
+                .save_state(&state_a)
+                .await
+                .expect("save state a");
+            cached_gateway
+                .save_state(&state_b)
+                .await
+                .expect("save state b");
+            cached_gateway
+                .commit_transaction(0)
+                .await
+                .expect("commit transaction");
+
+            let fetched_a = cached_gateway
+                .get_state("vm:test:a", &Chain::Ethereum)
+                .await
+                .expect("fetch state a");
+            let fetched_b = cached_gateway
+                .get_state("vm:test:b", &Chain::Ethereum)
+                .await
+                .expect("fetch state b");
+
+            assert_eq!(fetched_a.cursor, b"cursor@a");
+            assert_eq!(fetched_b.cursor, b"cursor@b");
+            assert_eq!(fetched_a.chain, Chain::Ethereum);
+            assert_eq!(fetched_b.chain, Chain::Ethereum);
+
+            drop(tx);
+            executor_handle.abort();
+        })
+        .await;
     }
 
     async fn send_write_message(

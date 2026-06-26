@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use chrono::{Duration, Local, NaiveDateTime};
@@ -147,6 +150,54 @@ impl ProtocolMemoryCache {
                 .deep_size_of()
             + size_of::<Duration>()
             + size_of_val(&self.gateway)
+    }
+
+    pub async fn component_protocol_systems(
+        &self,
+        protocol_systems: &HashSet<String>,
+    ) -> HashMap<ComponentId, String> {
+        let components = self.components.read().await;
+        protocol_systems
+            .iter()
+            .filter_map(|protocol_system| {
+                components
+                    .get(protocol_system)
+                    .map(|components| (protocol_system, components))
+            })
+            .flat_map(|(protocol_system, components)| {
+                components
+                    .keys()
+                    .cloned()
+                    .map(|component_id| (component_id, protocol_system.clone()))
+            })
+            .collect()
+    }
+
+    pub async fn contract_protocol_systems(
+        &self,
+        protocol_systems: &HashSet<String>,
+    ) -> HashMap<Address, String> {
+        let components = self.components.read().await;
+        protocol_systems
+            .iter()
+            .filter_map(|protocol_system| {
+                components
+                    .get(protocol_system)
+                    .map(|components| (protocol_system, components))
+            })
+            .flat_map(|(protocol_system, components)| {
+                components
+                    .values()
+                    .flat_map(|component| {
+                        component
+                            .contract_addresses
+                            .iter()
+                            .cloned()
+                            .map(|contract| (contract, protocol_system.clone()))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .collect()
     }
 }
 
@@ -485,5 +536,109 @@ mod tests {
         assert_eq!(cached_prices, exp_prices);
         let cached_components = cache.components.read().await.clone();
         assert_eq!(cached_components, exp_components);
+    }
+
+    #[tokio::test]
+    async fn test_component_protocol_systems_snapshots_cached_components() {
+        let chain = Chain::Ethereum;
+        let max_price_age = Duration::seconds(60);
+        let mut gateway = MockGateway::new();
+        gateway
+            .expect_get_tokens()
+            .return_once(|_, _, _, _, _| {
+                Box::pin(async { Ok(WithTotal { entity: tokens(), total: Some(2) }) })
+            });
+        gateway
+            .expect_get_protocol_components()
+            .return_once(|_, _, _, _, _| {
+                Box::pin(async { Ok(WithTotal { entity: components(), total: Some(2) }) })
+            });
+        gateway
+            .expect_get_token_prices()
+            .with(eq(chain))
+            .times(1)
+            .return_once(|_| Box::pin(async { Ok(prices()) }));
+
+        let cache = ProtocolMemoryCache::new(chain, max_price_age, Arc::new(gateway));
+        cache.populate().await.unwrap();
+
+        let systems = HashSet::from(["sys1".to_string()]);
+        let component_systems = cache
+            .component_protocol_systems(&systems)
+            .await;
+
+        assert_eq!(component_systems.len(), 2);
+        assert_eq!(component_systems.get("component1"), Some(&"sys1".to_string()));
+        assert_eq!(component_systems.get("component2"), Some(&"sys1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_contract_protocol_systems_snapshots_cached_component_contracts() {
+        let chain = Chain::Ethereum;
+        let max_price_age = Duration::seconds(60);
+        let mut gateway = MockGateway::new();
+        gateway
+            .expect_get_tokens()
+            .return_once(|_, _, _, _, _| {
+                Box::pin(async { Ok(WithTotal { entity: tokens(), total: Some(2) }) })
+            });
+        gateway
+            .expect_get_protocol_components()
+            .return_once(|_, _, _, _, _| {
+                Box::pin(async {
+                    Ok(WithTotal {
+                        entity: vec![
+                            ProtocolComponent::new(
+                                "component1",
+                                "sys1",
+                                "pool1",
+                                Chain::Ethereum,
+                                Vec::new(),
+                                vec![Bytes::from(vec![0x11; 20])],
+                                HashMap::new(),
+                                ChangeType::Creation,
+                                Bytes::default(),
+                                NaiveDateTime::default(),
+                            ),
+                            ProtocolComponent::new(
+                                "component2",
+                                "sys2",
+                                "pool2",
+                                Chain::Ethereum,
+                                Vec::new(),
+                                vec![Bytes::from(vec![0x22; 20])],
+                                HashMap::new(),
+                                ChangeType::Creation,
+                                Bytes::default(),
+                                NaiveDateTime::default(),
+                            ),
+                        ],
+                        total: Some(2),
+                    })
+                })
+            });
+        gateway
+            .expect_get_token_prices()
+            .with(eq(chain))
+            .times(1)
+            .return_once(|_| Box::pin(async { Ok(prices()) }));
+
+        let cache = ProtocolMemoryCache::new(chain, max_price_age, Arc::new(gateway));
+        cache.populate().await.unwrap();
+
+        let systems = HashSet::from(["sys1".to_string(), "sys2".to_string()]);
+        let contract_systems = cache
+            .contract_protocol_systems(&systems)
+            .await;
+
+        assert_eq!(contract_systems.len(), 2);
+        assert_eq!(
+            contract_systems.get(&Bytes::from(vec![0x11; 20])),
+            Some(&"sys1".to_string())
+        );
+        assert_eq!(
+            contract_systems.get(&Bytes::from(vec![0x22; 20])),
+            Some(&"sys2".to_string())
+        );
     }
 }

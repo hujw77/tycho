@@ -128,10 +128,17 @@
 //! into a single transaction. This guarantees preservation of valid state
 //! throughout the application lifetime, even if the process panics during
 //! database operations.
-use std::{collections::HashMap, hash::Hash, ops::Deref, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    hash::Hash,
+    ops::Deref,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::NaiveDateTime;
-use diesel::prelude::*;
+use diesel::{prelude::*, sql_query};
 use diesel_async::{
     pooled_connection::{deadpool::Pool, AsyncDieselConnectionManager},
     AsyncPgConnection, RunQueryDsl,
@@ -444,6 +451,51 @@ async fn maybe_lookup_version_ts(
         )));
     }
     maybe_lookup_block_ts(&version.0, conn).await
+}
+
+pub(crate) async fn ensure_daily_partition_for_valid_to(
+    parent_table: &str,
+    valid_to: NaiveDateTime,
+    conn: &mut AsyncPgConnection,
+) -> Result<(), StorageError> {
+    if valid_to >= MAX_TS {
+        return Ok(());
+    }
+
+    let start = valid_to
+        .date()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight should be valid");
+    let end = start + chrono::Duration::days(1);
+    let partition_name = format!("{parent_table}_p{}", start.format("%Y_%m_%d"));
+    let statement = format!(
+        "CREATE TABLE IF NOT EXISTS public.{partition_name} \
+         PARTITION OF public.{parent_table} \
+         FOR VALUES FROM ('{start}+00') TO ('{end}+00')"
+    );
+
+    sql_query(statement)
+        .execute(conn)
+        .await
+        .map_err(|err| storage_error_from_diesel(err, parent_table, &partition_name, None))?;
+    Ok(())
+}
+
+pub(crate) async fn ensure_daily_partitions_for_valid_tos(
+    parent_table: &str,
+    valid_tos: impl IntoIterator<Item = NaiveDateTime>,
+    conn: &mut AsyncPgConnection,
+) -> Result<(), StorageError> {
+    let valid_tos = valid_tos
+        .into_iter()
+        .filter(|valid_to| *valid_to < MAX_TS)
+        .collect::<BTreeSet<_>>();
+
+    for valid_to in valid_tos {
+        ensure_daily_partition_for_valid_to(parent_table, valid_to, conn).await?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]

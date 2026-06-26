@@ -67,22 +67,26 @@ pub fn parse_bootstrap_params(params: &str) -> Result<BootstrapParams, Extractio
     let mut bootstrap_block = None;
     let mut pools = Vec::new();
 
-    for pair in params.split('&').filter(|part| !part.is_empty()) {
+    for pair in params
+        .split('&')
+        .filter(|part| !part.is_empty())
+    {
         let Some((key, value)) = pair.split_once('=') else {
             return Err(ExtractionError::Setup(format!("invalid bootstrap param `{pair}`")));
         };
 
         match key {
             "bootstrap_block" => {
-                bootstrap_block = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|err| ExtractionError::Setup(format!("parse bootstrap_block: {err}")))?,
-                );
+                bootstrap_block = Some(value.parse::<u64>().map_err(|err| {
+                    ExtractionError::Setup(format!("parse bootstrap_block: {err}"))
+                })?);
             }
             "pool" => pools.push(parse_address(value)?),
             "pools" => {
-                for pool in value.split(',').filter(|pool| !pool.is_empty()) {
+                for pool in value
+                    .split(',')
+                    .filter(|pool| !pool.is_empty())
+                {
                     pools.push(parse_address(pool)?);
                 }
             }
@@ -109,7 +113,10 @@ pub async fn build_uniswap_v2_bootstrap_block(
 ) -> Result<BlockChanges, ExtractionError> {
     let block = fetch_block(rpc, chain, bootstrap_block).await?;
     let block_tag = BlockNumberOrTag::Number(bootstrap_block);
-    let pool_addresses = pools.iter().map(to_alloy_address).collect::<Result<Vec<_>, _>>()?;
+    let pool_addresses = pools
+        .iter()
+        .map(to_alloy_address)
+        .collect::<Result<Vec<_>, _>>()?;
     let seeds = fetch_pool_snapshot_seeds(rpc, block_tag, &pool_addresses).await?;
 
     let tx = synthetic_bootstrap_transaction(&block);
@@ -180,7 +187,9 @@ async fn fetch_block(
     let block = rpc
         .get_block_by_number(BlockId::Number(BlockNumberOrTag::Number(block_number)))
         .await
-        .map_err(|err| ExtractionError::Setup(format!("failed to fetch block {block_number}: {err}")))?;
+        .map_err(|err| {
+            ExtractionError::Setup(format!("failed to fetch block {block_number}: {err}"))
+        })?;
 
     Ok(Block {
         number: block.header.number,
@@ -218,7 +227,8 @@ async fn fetch_pool_snapshot_seeds(
 
         for (pool_index, pool) in pools_chunk.iter().enumerate() {
             let offset = pool_index * POOL_STATIC_CALLS_PER_POOL;
-            let token0 = decode_address_response::<token0Call>(&responses[offset], pool, "token0()")?;
+            let token0 =
+                decode_address_response::<token0Call>(&responses[offset], pool, "token0()")?;
             let token1 =
                 decode_address_response::<token1Call>(&responses[offset + 1], pool, "token1()")?;
             let reserves = getReservesCall::abi_decode_returns_validate(&responses[offset + 2])
@@ -255,7 +265,9 @@ fn build_protocol_component(
         HashMap::from([
             (
                 "fee".to_string(),
-                BigInt::from(TRADING_FEE_BPS).to_signed_bytes_be().into(),
+                BigInt::from(TRADING_FEE_BPS)
+                    .to_signed_bytes_be()
+                    .into(),
             ),
             ("pool_address".to_string(), seed.pool.to_bytes().into()),
         ]),
@@ -270,7 +282,10 @@ fn build_state_update(component_id: &str, seed: &PoolSnapshotSeed) -> ProtocolCo
         ("reserve0".to_string(), seed.reserve0.clone()),
         ("reserve1".to_string(), seed.reserve1.clone()),
     ]);
-    let created_attributes = updated_attributes.keys().cloned().collect();
+    let created_attributes = updated_attributes
+        .keys()
+        .cloned()
+        .collect();
 
     ProtocolComponentStateDelta {
         component_id: component_id.to_string(),
@@ -352,8 +367,7 @@ fn decode_address_response<C>(
 where
     C: SolCall<Return = AlloyAddress>,
 {
-    C::abi_decode_returns_validate(response)
-        .map_err(|err| decode_error(pool, call_name, err))
+    C::abi_decode_returns_validate(response).map_err(|err| decode_error(pool, call_name, err))
 }
 
 fn decode_error(
@@ -366,7 +380,10 @@ fn decode_error(
 
 fn uint_to_bytes(value: U256) -> Bytes {
     let bytes = value.to_be_bytes::<32>();
-    let first_non_zero = bytes.iter().position(|byte| *byte != 0).unwrap_or(bytes.len() - 1);
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
     bytes[first_non_zero..].to_vec().into()
 }
 

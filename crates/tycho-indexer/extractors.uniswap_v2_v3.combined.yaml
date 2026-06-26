@@ -1,3 +1,16 @@
+family_runtimes:
+  uniswap:
+    shared_spkg: "protocols/substreams/ethereum-uniswap-v2-v3-combined/ethereum-uniswap-v2-v3-combined-v0.1.0.spkg"
+    shared_module: "map_uniswap_family_protocol_changes"
+    bootstrap:
+      params: "@config/shared_uniswap_bootstrap.yaml"
+    members:
+      uniswap_v2:
+        substreams_params:
+          v2_map_pool_events: "@config/uniswap_v2_substreams.yaml"
+      uniswap_v3:
+        substreams_params:
+          v3_map_events: "@config/uniswap_v3_substreams.yaml"
 includes:
   - "extractors.fragments/uniswap_v2_combined.yaml"
   - "extractors.fragments/uniswap_v3_combined_protocol_changes.yaml"

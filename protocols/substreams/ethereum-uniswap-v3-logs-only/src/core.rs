@@ -173,7 +173,15 @@ pub fn build_protocol_changes(
         change
             .component_changes
             .iter()
-            .for_each(|component| builder.add_protocol_component(component));
+            .for_each(|component| {
+                builder.add_protocol_component(component);
+                component
+                    .contracts
+                    .iter()
+                    .for_each(|contract| {
+                        builder.add_contract_changes(&InterimContractChange::new(contract, true))
+                    });
+            });
         change
             .entity_changes
             .iter()
@@ -349,7 +357,7 @@ fn collect_new_pools(
             component_changes: vec![ProtocolComponent {
                 id: event.pool.to_hex(),
                 tokens: vec![event.token0.clone(), event.token1.clone()],
-                contracts: vec![],
+                contracts: vec![event.pool.clone()],
                 static_att: vec![
                     Attribute {
                         name: "fee".to_string(),
@@ -957,7 +965,22 @@ impl PoolEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_event_filter;
+    use ethabi::{ethereum_types::{Address, U256}, Token};
+    use prost_types::Timestamp;
+    use substreams::pb::substreams::StoreDeltas;
+    use substreams_ethereum::pb::eth::v2::{
+        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
+        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+    };
+    use tycho_substreams::models::BlockBalanceDeltas;
+
+    use crate::{
+        pb::uniswap::v3::{Events, LiquidityChanges, TickDeltas},
+    };
+
+    use super::{
+        build_pool_created_block_entity_changes, build_protocol_changes, parse_event_filter,
+    };
 
     #[test]
     fn parse_event_filter_supports_legacy_factory_only_param() {
@@ -995,5 +1018,131 @@ mod tests {
             "0x2222222222222222222222222222222222222222",
             false
         ));
+    }
+
+    fn address(byte: u8) -> Vec<u8> {
+        vec![byte; 20]
+    }
+
+    fn topic_address(byte: u8) -> Vec<u8> {
+        ethabi::encode(&[Token::Address(Address::from_slice(&address(byte)))])
+    }
+
+    fn topic_uint24(value: u32) -> Vec<u8> {
+        ethabi::encode(&[Token::Uint(U256::from(value))])
+    }
+
+    fn pool_created_log(factory: u8, token0: u8, token1: u8, fee: u32, tick_spacing: i32, pool: u8) -> Log {
+        let data = ethabi::encode(&[
+            Token::Int(tick_spacing.into()),
+            Token::Address(Address::from_slice(&address(pool))),
+        ]);
+
+        Log {
+            address: address(factory),
+            topics: vec![
+                vec![
+                    120, 60, 202, 28, 4, 18, 221, 13, 105, 94, 120, 69, 104, 201, 109, 162, 233,
+                    194, 47, 249, 137, 53, 122, 46, 139, 29, 155, 43, 78, 107, 113, 24,
+                ],
+                topic_address(token0),
+                topic_address(token1),
+                topic_uint24(fee),
+            ],
+            data,
+            index: 0,
+            block_index: 0,
+            ordinal: 1,
+        }
+    }
+
+    fn pool_created_block(
+        factory: u8,
+        token0: u8,
+        token1: u8,
+        fee: u32,
+        tick_spacing: i32,
+        pool: u8,
+    ) -> Block {
+        Block {
+            hash: vec![0xaa; 32],
+            number: 42,
+            size: 0,
+            header: Some(BlockHeader {
+                parent_hash: vec![0xbb; 32],
+                timestamp: Some(Timestamp {
+                    seconds: 1_718_000_000,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }),
+            transaction_traces: vec![TransactionTrace {
+                index: 0,
+                hash: vec![0xcc; 32],
+                from: vec![0x11; 20],
+                to: address(factory),
+                status: TransactionTraceStatus::Succeeded as i32,
+                receipt: Some(TransactionReceipt {
+                    logs: vec![pool_created_log(
+                        factory,
+                        token0,
+                        token1,
+                        fee,
+                        tick_spacing,
+                        pool,
+                    )],
+                    ..Default::default()
+                }),
+                r#type: TransactionType::TrxTypeLegacy as i32,
+                ..Default::default()
+            }],
+            detail_level: DetailLevel::DetaillevelBase as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pool_created_changes_include_pool_contract_address() {
+        let block = pool_created_block(0xf1, 0xa0, 0xc0, 500, 10, 0x45);
+        let changes = build_pool_created_block_entity_changes(
+            "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+            &block,
+        );
+        let created = &changes.changes[0].component_changes[0];
+
+        assert_eq!(created.id, "0x4545454545454545454545454545454545454545");
+        assert_eq!(created.contracts, vec![vec![0x45; 20]]);
+    }
+
+    #[test]
+    fn protocol_changes_promote_created_pool_contracts_into_contract_changes() {
+        let block = pool_created_block(0xf1, 0xa0, 0xc0, 500, 10, 0x45);
+        let created_pools = build_pool_created_block_entity_changes(
+            "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+            &block,
+        );
+        let protocol_changes = build_protocol_changes(
+            block,
+            created_pools,
+            Events {
+                block: None,
+                pool_events: vec![],
+            },
+            BlockBalanceDeltas {
+                balance_deltas: vec![],
+            },
+            StoreDeltas { deltas: vec![] },
+            TickDeltas { deltas: vec![] },
+            StoreDeltas { deltas: vec![] },
+            LiquidityChanges { changes: vec![] },
+            StoreDeltas { deltas: vec![] },
+        );
+
+        assert_eq!(protocol_changes.changes.len(), 1);
+        assert_eq!(protocol_changes.changes[0].contract_changes.len(), 1);
+        assert_eq!(
+            protocol_changes.changes[0].contract_changes[0].address,
+            vec![0x45; 20]
+        );
     }
 }

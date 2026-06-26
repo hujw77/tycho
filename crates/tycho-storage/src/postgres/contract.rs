@@ -23,7 +23,8 @@ use tycho_common::{
 };
 
 use super::{
-    maybe_lookup_block_ts, maybe_lookup_version_ts, orm, schema, storage_error_from_diesel,
+    ensure_daily_partitions_for_valid_tos, maybe_lookup_block_ts, maybe_lookup_version_ts, orm,
+    schema, storage_error_from_diesel,
     versioning::{apply_partitioned_versioning, apply_versioning, VersioningEntry},
     PostgresError, PostgresGateway, WithOrdinal, WithTxHash, MAX_TS, MAX_VERSION_TS,
 };
@@ -576,6 +577,15 @@ impl PostgresGateway {
             .into_iter()
             .map(orm::NewSlotLatest::from)
             .collect::<Vec<_>>();
+
+        if !to_archive.is_empty() {
+            ensure_daily_partitions_for_valid_tos(
+                "contract_storage",
+                to_archive.iter().map(|row| row.valid_to),
+                conn,
+            )
+            .await?;
+        }
 
         for chunk in latest.chunks(1_000) {
             diesel::insert_into(schema::contract_storage_default::table)

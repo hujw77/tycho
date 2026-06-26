@@ -97,6 +97,8 @@ pretty_assertions.workspace = true
 tokio-tungstenite.workspace = true
 rstest.workspace = true
 mockito.workspace = true
+reqwest.workspace = true
+ethabi.workspace = true
 actix-rt = "2.9.0"
 actix-test = "0.1.2"
 test-log = { version = "0.2.14", features = ["trace"] }
@@ -104,3 +106,9 @@ float_eq = "1.0.1"
 tycho-common = { workspace = true, features = ["test-utils"] }
 metrics-util = { version = "0.20.0", features = ["debugging"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
+substreams-ethereum = "0.9.9"
+substreams = "0.5.22"
+ethereum-uniswap-v2 = { path = "../../protocols/substreams/ethereum-uniswap-v2", default-features = false }
+ethereum-uniswap-v2-v3-combined = { path = "../../protocols/substreams/ethereum-uniswap-v2-v3-combined" }
+ethereum-uniswap-v3-logs-only = { path = "../../protocols/substreams/ethereum-uniswap-v3-logs-only", default-features = false }
+tycho-substreams-local = { package = "tycho-substreams", path = "../../protocols/substreams/crates/tycho-substreams" }

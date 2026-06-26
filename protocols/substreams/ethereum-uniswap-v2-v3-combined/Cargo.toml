@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "ethereum_uniswap_v2_v3_combined"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0.75"
@@ -18,3 +18,7 @@ tycho-substreams = { path = "../crates/tycho-substreams" }
 
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2", features = ["custom"] }
+
+[dev-dependencies]
+ethabi = "18.0.0"
+prost-types = "0.11.9"

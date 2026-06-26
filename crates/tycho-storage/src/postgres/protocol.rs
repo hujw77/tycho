@@ -23,14 +23,61 @@ use tycho_common::{
 };
 
 use super::{
-    maybe_lookup_block_ts, maybe_lookup_version_ts, orm, schema, storage_error_from_diesel,
+    ensure_daily_partitions_for_valid_tos, maybe_lookup_block_ts, maybe_lookup_version_ts, orm,
+    schema, storage_error_from_diesel,
     truncate_to_byte_limit,
     versioning::{apply_partitioned_versioning, PartitionedVersionedRow, VersioningEntry},
     PostgresError, PostgresGateway, WithOrdinal, WithTxHash, MAX_TS, MAX_VERSION_TS,
 };
 
+fn dedupe_latest_protocol_state_rows(
+    rows: Vec<orm::NewProtocolStateLatest>,
+) -> Vec<orm::NewProtocolStateLatest> {
+    let mut deduped = HashMap::with_capacity(rows.len());
+    for row in rows {
+        deduped.insert(
+            (row.protocol_component_id, row.attribute_name.clone()),
+            row,
+        );
+    }
+    deduped.into_values().collect()
+}
+
+fn duplicate_protocol_state_latest_keys(rows: &[orm::NewProtocolStateLatest]) -> Vec<(i64, String)> {
+    let mut seen = HashSet::with_capacity(rows.len());
+    let mut duplicates = BTreeSet::new();
+
+    for row in rows {
+        let key = (row.protocol_component_id, row.attribute_name.clone());
+        if !seen.insert(key.clone()) {
+            duplicates.insert(key);
+        }
+    }
+
+    duplicates.into_iter().collect()
+}
+
 // Private methods
 impl PostgresGateway {
+    async fn use_latest_protocol_view(
+        &self,
+        chain: &Chain,
+        at: Option<&Version>,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<bool, StorageError> {
+        let Some(version) = at else {
+            return Ok(true);
+        };
+
+        let requested_ts = maybe_lookup_version_ts(version, conn).await?;
+        let latest_block_ts = orm::Block::most_recent(*chain, conn)
+            .await
+            .map_err(|err| storage_error_from_diesel(err, "Block", "latest", None))?
+            .ts;
+
+        Ok(requested_ts >= latest_block_ts)
+    }
+
     #[instrument(level = Level::DEBUG, skip(self, keys, conn))]
     pub async fn get_protocol_state_values(
         &self,
@@ -782,13 +829,19 @@ impl PostgresGateway {
         conn: &mut AsyncPgConnection,
     ) -> Result<WithTotal<Vec<ProtocolComponentState>>, StorageError> {
         let chain_db_id = self.get_chain_id(chain)?;
-        let version_ts = match &at {
-            Some(version) => Some(maybe_lookup_version_ts(version, conn).await?),
-            None => None,
+        let use_latest_view = self.use_latest_protocol_view(chain, at.as_ref(), conn).await?;
+        let version_ts = if use_latest_view {
+            None
+        } else {
+            match &at {
+                Some(version) => Some(maybe_lookup_version_ts(version, conn).await?),
+                None => None,
+            }
         };
 
         let balances = if retrieve_balances {
-            self.get_component_balances(chain, ids, at.as_ref(), conn)
+            let balances_version = if use_latest_view { None } else { at.as_ref() };
+            self.get_component_balances(chain, ids, balances_version, conn)
                 .await?
         } else {
             HashMap::new()
@@ -882,6 +935,8 @@ impl PostgresGateway {
         .collect();
 
         let mut state_data = Vec::new();
+        let mut seen_state_keys = HashSet::new();
+        let mut duplicate_state_keys = HashSet::new();
         for state in new {
             let tx = state
                 .tx
@@ -905,6 +960,10 @@ impl PostgresGateway {
                     .updated_attributes
                     .iter()
                     .map(|(attribute, value)| {
+                        let state_key = (component_db_id, attribute.clone(), *tx_ts);
+                        if !seen_state_keys.insert(state_key.clone()) {
+                            duplicate_state_keys.insert(state_key);
+                        }
                         WithOrdinal::new(
                             VersioningEntry::Update(orm::NewProtocolState::new(
                                 component_db_id,
@@ -923,12 +982,20 @@ impl PostgresGateway {
                     .deleted_attributes
                     .iter()
                     .map(|attr| {
+                        let state_key = (component_db_id, attr.clone(), *tx_ts);
+                        if !seen_state_keys.insert(state_key.clone()) {
+                            duplicate_state_keys.insert(state_key);
+                        }
                         WithOrdinal::new(
                             VersioningEntry::Deletion(((component_db_id, attr.clone()), *tx_ts)),
                             (component_db_id, attr, tx_ts, tx_index),
                         )
                     }),
             );
+        }
+
+        if !duplicate_state_keys.is_empty() {
+            warn!(?duplicate_state_keys, "Duplicate protocol state keys detected before versioning");
         }
 
         // insert the prepared protocol state deltas
@@ -948,6 +1015,12 @@ impl PostgresGateway {
             async {
                 // Insert to_archive in batches if needed
                 if !to_archive.is_empty() {
+                    ensure_daily_partitions_for_valid_tos(
+                        "protocol_state",
+                        to_archive.iter().map(PartitionedVersionedRow::get_valid_to),
+                        conn,
+                    )
+                    .await?;
                     trace!(records=?&to_archive, "Inserting archival records!");
                     for chunk in to_archive.chunks(orm::NewProtocolState::MAX_BATCH_SIZE) {
                         diesel::insert_into(schema::protocol_state::table)
@@ -959,14 +1032,28 @@ impl PostgresGateway {
                 }
 
                 // Insert latest in batches if needed
-                let latest: Vec<orm::NewProtocolStateLatest> = latest
-                    .into_iter()
-                    .map(Into::into)
-                    .collect();
+                let latest: Vec<orm::NewProtocolStateLatest> =
+                    latest.into_iter().map(Into::into).collect();
+                let latest_len = latest.len();
+                let latest = dedupe_latest_protocol_state_rows(latest);
+                if latest.len() != latest_len {
+                    warn!(
+                        before = latest_len,
+                        after = latest.len(),
+                        "Deduped latest protocol state rows before default upsert"
+                    );
+                }
 
                 if !latest.is_empty() {
                     trace!(new_state=?&latest, "Updating active state!");
                     for chunk in latest.chunks(orm::NewProtocolStateLatest::MAX_BATCH_SIZE) {
+                        let duplicate_keys = duplicate_protocol_state_latest_keys(chunk);
+                        if !duplicate_keys.is_empty() {
+                            return Err(StorageError::Unexpected(format!(
+                                "Duplicate latest protocol state rows before default upsert: {:?}; rows: {:?}",
+                                duplicate_keys, chunk
+                            )));
+                        }
                         diesel::insert_into(schema::protocol_state_default::table)
                             .values(chunk)
                             .on_conflict(on_constraint("protocol_state_default_unique_pk"))
@@ -1383,6 +1470,12 @@ impl PostgresGateway {
             // Insert to_archive in batches if needed
             async {
                 if !to_archive.is_empty() {
+                    ensure_daily_partitions_for_valid_tos(
+                        "component_balance",
+                        to_archive.iter().map(PartitionedVersionedRow::get_valid_to),
+                        conn,
+                    )
+                    .await?;
                     for chunk in to_archive.chunks(orm::NewComponentBalance::MAX_BATCH_SIZE) {
                         diesel::insert_into(schema::component_balance::table)
                             .values(chunk)
@@ -1553,9 +1646,13 @@ impl PostgresGateway {
         // the caller does not need them. It is planned for `modify_tx` to be removed from
         // the ComponentBalance
 
-        let version_ts = match &at {
-            Some(version) => Some(maybe_lookup_version_ts(version, conn).await?),
-            None => None,
+        let version_ts = if self.use_latest_protocol_view(chain, at, conn).await? {
+            None
+        } else {
+            match &at {
+                Some(version) => Some(maybe_lookup_version_ts(version, conn).await?),
+                None => None,
+            }
         };
         let chain_id = self.get_chain_id(chain)?;
 

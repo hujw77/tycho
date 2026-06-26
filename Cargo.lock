@@ -3895,6 +3895,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethereum-uniswap-v2"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "ethabi 18.0.0",
+ "getrandom 0.2.16",
+ "itertools 0.12.1",
+ "num-bigint",
+ "prost 0.11.9",
+ "prost-types 0.11.9",
+ "serde",
+ "serde_qs",
+ "substreams",
+ "substreams-ethereum",
+ "substreams-helper",
+ "tycho-substreams 0.8.0",
+]
+
+[[package]]
+name = "ethereum-uniswap-v2-v3-combined"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ethabi 18.0.0",
+ "ethereum-uniswap-v2",
+ "ethereum-uniswap-v3-logs-only",
+ "getrandom 0.2.16",
+ "hex",
+ "prost-types 0.11.9",
+ "substreams",
+ "substreams-ethereum",
+ "tycho-substreams 0.8.0",
+]
+
+[[package]]
+name = "ethereum-uniswap-v3-logs-only"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "ethabi 18.0.0",
+ "getrandom 0.2.16",
+ "hex",
+ "itertools 0.13.0",
+ "num-bigint",
+ "prost 0.11.9",
+ "prost-types 0.11.9",
+ "substreams",
+ "substreams-ethereum",
+ "substreams-helper",
+ "tycho-substreams 0.8.0",
+]
+
+[[package]]
 name = "evm_ekubo_sdk"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8191,6 +8244,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_qs"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd34f36fe4c5ba9654417139a9b3a20d2e1de6012ee678ad14d240c22c78d8d6"
+dependencies = [
+ "percent-encoding",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8704,6 +8768,18 @@ dependencies = [
  "quote",
  "substreams-ethereum-abigen",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "substreams-helper"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "ethabi 18.0.0",
+ "hex",
+ "prost 0.11.9",
+ "substreams",
+ "substreams-ethereum",
 ]
 
 [[package]]
@@ -9885,6 +9961,10 @@ dependencies = [
  "console-subscriber",
  "deepsize",
  "diesel-async",
+ "ethabi 18.0.0",
+ "ethereum-uniswap-v2",
+ "ethereum-uniswap-v2-v3-combined",
+ "ethereum-uniswap-v3-logs-only",
  "float_eq",
  "futures 0.3.31",
  "hex",
@@ -9906,10 +9986,13 @@ dependencies = [
  "prost 0.11.9",
  "prost-types 0.11.9",
  "rand 0.8.5",
+ "reqwest 0.12.23",
  "rstest 0.24.0",
  "serde",
  "serde_json",
  "serde_yaml",
+ "substreams",
+ "substreams-ethereum",
  "test-log",
  "thiserror 1.0.69",
  "tikv-jemalloc-ctl",
@@ -9925,7 +10008,8 @@ dependencies = [
  "tycho-common",
  "tycho-ethereum",
  "tycho-storage",
- "tycho-substreams",
+ "tycho-substreams 0.6.0",
+ "tycho-substreams 0.8.0",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
@@ -10060,6 +10144,23 @@ dependencies = [
  "itertools 0.12.1",
  "num-bigint",
  "prost 0.11.9",
+ "serde",
+ "serde_json",
+ "substreams",
+ "substreams-ethereum",
+]
+
+[[package]]
+name = "tycho-substreams"
+version = "0.8.0"
+dependencies = [
+ "base64 0.22.1",
+ "ethabi 18.0.0",
+ "hex",
+ "itertools 0.12.1",
+ "num-bigint",
+ "prost 0.11.9",
+ "rstest 0.24.0",
  "serde",
  "serde_json",
  "substreams",

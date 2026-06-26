@@ -153,6 +153,15 @@ modules:
     output:
       type: proto:tycho.evm.v1.BlockChanges
 
+  - name: map_uniswap_family_protocol_changes
+    kind: map
+    initialBlock: 25384601
+    inputs:
+      - map: v2_map_pool_events
+      - map: v3_map_protocol_changes
+    output:
+      type: proto:tycho.evm.v1.BlockChanges
+
 params:
   v2_map_pools_created: factory_address=5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f&protocol_type_name=uniswap_v2_pool
   v3_map_pools_created: "1F98431c8aD98523631AE4a59f267346ea31F984"
