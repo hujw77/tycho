@@ -779,59 +779,58 @@ impl ProtocolState {
                 .await
         };
 
-        let current = if let Some(ts) = version_ts {
-            let query = protocol_state_default::table
-                .inner_join(
-                    protocol_component::table
-                        .on(protocol_state_default::protocol_component_id.eq(protocol_component::id)),
-                )
-                .filter(protocol_component::id.eq_any(&component_ids))
-                .filter(protocol_state_default::valid_to.gt(ts))
-                .filter(protocol_state_default::valid_from.le(ts))
-                .order_by(protocol_component::external_id)
-                .select((
-                    (
-                        protocol_state_default::protocol_component_id,
-                        protocol_state_default::attribute_name,
-                        protocol_state_default::attribute_value,
-                        protocol_state_default::previous_value,
-                        protocol_state_default::modify_tx,
-                        protocol_state_default::valid_from,
-                        protocol_state_default::valid_to,
-                        protocol_state_default::inserted_ts,
-                        protocol_state_default::modified_ts,
-                    ),
-                    protocol_component::external_id,
-                ));
-            query
-                .get_results::<(Self, String)>(conn)
-                .await
-        } else {
-            let query = protocol_state_default::table
-                .inner_join(
-                    protocol_component::table
-                        .on(protocol_state_default::protocol_component_id.eq(protocol_component::id)),
-                )
-                .filter(protocol_component::id.eq_any(&component_ids))
-                .order_by(protocol_component::external_id)
-                .select((
-                    (
-                        protocol_state_default::protocol_component_id,
-                        protocol_state_default::attribute_name,
-                        protocol_state_default::attribute_value,
-                        protocol_state_default::previous_value,
-                        protocol_state_default::modify_tx,
-                        protocol_state_default::valid_from,
-                        protocol_state_default::valid_to,
-                        protocol_state_default::inserted_ts,
-                        protocol_state_default::modified_ts,
-                    ),
-                    protocol_component::external_id,
-                ));
-            query
-                .get_results::<(Self, String)>(conn)
-                .await
-        };
+        let current =
+            if let Some(ts) = version_ts {
+                let query = protocol_state_default::table
+                    .inner_join(protocol_component::table.on(
+                        protocol_state_default::protocol_component_id.eq(protocol_component::id),
+                    ))
+                    .filter(protocol_component::id.eq_any(&component_ids))
+                    .filter(protocol_state_default::valid_to.gt(ts))
+                    .filter(protocol_state_default::valid_from.le(ts))
+                    .order_by(protocol_component::external_id)
+                    .select((
+                        (
+                            protocol_state_default::protocol_component_id,
+                            protocol_state_default::attribute_name,
+                            protocol_state_default::attribute_value,
+                            protocol_state_default::previous_value,
+                            protocol_state_default::modify_tx,
+                            protocol_state_default::valid_from,
+                            protocol_state_default::valid_to,
+                            protocol_state_default::inserted_ts,
+                            protocol_state_default::modified_ts,
+                        ),
+                        protocol_component::external_id,
+                    ));
+                query
+                    .get_results::<(Self, String)>(conn)
+                    .await
+            } else {
+                let query = protocol_state_default::table
+                    .inner_join(protocol_component::table.on(
+                        protocol_state_default::protocol_component_id.eq(protocol_component::id),
+                    ))
+                    .filter(protocol_component::id.eq_any(&component_ids))
+                    .order_by(protocol_component::external_id)
+                    .select((
+                        (
+                            protocol_state_default::protocol_component_id,
+                            protocol_state_default::attribute_name,
+                            protocol_state_default::attribute_value,
+                            protocol_state_default::previous_value,
+                            protocol_state_default::modify_tx,
+                            protocol_state_default::valid_from,
+                            protocol_state_default::valid_to,
+                            protocol_state_default::inserted_ts,
+                            protocol_state_default::modified_ts,
+                        ),
+                        protocol_component::external_id,
+                    ));
+                query
+                    .get_results::<(Self, String)>(conn)
+                    .await
+            };
 
         let res = historical.and_then(|historical| {
             current.map(|current| merge_protocol_state_rows(historical, current))
@@ -934,59 +933,58 @@ impl ProtocolState {
                 .await
         };
 
-        let current = if let Some(ts) = version_ts {
-            let query = protocol_state_default::table
-                .inner_join(
-                    protocol_component::table
-                        .on(protocol_state_default::protocol_component_id.eq(protocol_component::id)),
-                )
-                .filter(protocol_component::id.eq_any(&component_ids))
-                .filter(protocol_state_default::valid_to.gt(ts))
-                .filter(protocol_state_default::valid_from.le(ts))
-                .order_by(protocol_state_default::protocol_component_id)
-                .select((
-                    (
-                        protocol_state_default::protocol_component_id,
-                        protocol_state_default::attribute_name,
-                        protocol_state_default::attribute_value,
-                        protocol_state_default::previous_value,
-                        protocol_state_default::modify_tx,
-                        protocol_state_default::valid_from,
-                        protocol_state_default::valid_to,
-                        protocol_state_default::inserted_ts,
-                        protocol_state_default::modified_ts,
-                    ),
-                    protocol_component::external_id,
-                ));
-            query
-                .get_results::<(Self, String)>(conn)
-                .await
-        } else {
-            let query = protocol_state_default::table
-                .inner_join(
-                    protocol_component::table
-                        .on(protocol_state_default::protocol_component_id.eq(protocol_component::id)),
-                )
-                .filter(protocol_component::id.eq_any(&component_ids))
-                .order_by(protocol_state_default::protocol_component_id)
-                .select((
-                    (
-                        protocol_state_default::protocol_component_id,
-                        protocol_state_default::attribute_name,
-                        protocol_state_default::attribute_value,
-                        protocol_state_default::previous_value,
-                        protocol_state_default::modify_tx,
-                        protocol_state_default::valid_from,
-                        protocol_state_default::valid_to,
-                        protocol_state_default::inserted_ts,
-                        protocol_state_default::modified_ts,
-                    ),
-                    protocol_component::external_id,
-                ));
-            query
-                .get_results::<(Self, String)>(conn)
-                .await
-        };
+        let current =
+            if let Some(ts) = version_ts {
+                let query = protocol_state_default::table
+                    .inner_join(protocol_component::table.on(
+                        protocol_state_default::protocol_component_id.eq(protocol_component::id),
+                    ))
+                    .filter(protocol_component::id.eq_any(&component_ids))
+                    .filter(protocol_state_default::valid_to.gt(ts))
+                    .filter(protocol_state_default::valid_from.le(ts))
+                    .order_by(protocol_state_default::protocol_component_id)
+                    .select((
+                        (
+                            protocol_state_default::protocol_component_id,
+                            protocol_state_default::attribute_name,
+                            protocol_state_default::attribute_value,
+                            protocol_state_default::previous_value,
+                            protocol_state_default::modify_tx,
+                            protocol_state_default::valid_from,
+                            protocol_state_default::valid_to,
+                            protocol_state_default::inserted_ts,
+                            protocol_state_default::modified_ts,
+                        ),
+                        protocol_component::external_id,
+                    ));
+                query
+                    .get_results::<(Self, String)>(conn)
+                    .await
+            } else {
+                let query = protocol_state_default::table
+                    .inner_join(protocol_component::table.on(
+                        protocol_state_default::protocol_component_id.eq(protocol_component::id),
+                    ))
+                    .filter(protocol_component::id.eq_any(&component_ids))
+                    .order_by(protocol_state_default::protocol_component_id)
+                    .select((
+                        (
+                            protocol_state_default::protocol_component_id,
+                            protocol_state_default::attribute_name,
+                            protocol_state_default::attribute_value,
+                            protocol_state_default::previous_value,
+                            protocol_state_default::modify_tx,
+                            protocol_state_default::valid_from,
+                            protocol_state_default::valid_to,
+                            protocol_state_default::inserted_ts,
+                            protocol_state_default::modified_ts,
+                        ),
+                        protocol_component::external_id,
+                    ));
+                query
+                    .get_results::<(Self, String)>(conn)
+                    .await
+            };
 
         let res = historical.and_then(|historical| {
             current.map(|current| merge_protocol_state_rows(historical, current))
@@ -1012,32 +1010,48 @@ impl ProtocolState {
         let (count_query, mut component_ids_query) = if let Some(ts) = version_ts {
             let count_query = protocol_component::table
                 .filter(protocol_component::chain_id.eq(chain_id))
-                .filter(exists(
-                    protocol_state::table
-                        .filter(protocol_state::protocol_component_id.eq(protocol_component::id))
-                        .filter(protocol_state::valid_to.gt(ts))
-                        .filter(protocol_state::valid_from.le(ts)),
-                ).or(exists(
-                    protocol_state_default::table
-                        .filter(protocol_state_default::protocol_component_id.eq(protocol_component::id))
-                        .filter(protocol_state_default::valid_to.gt(ts))
-                        .filter(protocol_state_default::valid_from.le(ts)),
-                )))
+                .filter(
+                    exists(
+                        protocol_state::table
+                            .filter(
+                                protocol_state::protocol_component_id.eq(protocol_component::id),
+                            )
+                            .filter(protocol_state::valid_to.gt(ts))
+                            .filter(protocol_state::valid_from.le(ts)),
+                    )
+                    .or(exists(
+                        protocol_state_default::table
+                            .filter(
+                                protocol_state_default::protocol_component_id
+                                    .eq(protocol_component::id),
+                            )
+                            .filter(protocol_state_default::valid_to.gt(ts))
+                            .filter(protocol_state_default::valid_from.le(ts)),
+                    )),
+                )
                 .into_boxed();
 
             let component_ids_query = protocol_component::table
                 .filter(protocol_component::chain_id.eq(chain_id))
-                .filter(exists(
-                    protocol_state::table
-                        .filter(protocol_state::protocol_component_id.eq(protocol_component::id))
-                        .filter(protocol_state::valid_to.gt(ts))
-                        .filter(protocol_state::valid_from.le(ts)),
-                ).or(exists(
-                    protocol_state_default::table
-                        .filter(protocol_state_default::protocol_component_id.eq(protocol_component::id))
-                        .filter(protocol_state_default::valid_to.gt(ts))
-                        .filter(protocol_state_default::valid_from.le(ts)),
-                )))
+                .filter(
+                    exists(
+                        protocol_state::table
+                            .filter(
+                                protocol_state::protocol_component_id.eq(protocol_component::id),
+                            )
+                            .filter(protocol_state::valid_to.gt(ts))
+                            .filter(protocol_state::valid_from.le(ts)),
+                    )
+                    .or(exists(
+                        protocol_state_default::table
+                            .filter(
+                                protocol_state_default::protocol_component_id
+                                    .eq(protocol_component::id),
+                            )
+                            .filter(protocol_state_default::valid_to.gt(ts))
+                            .filter(protocol_state_default::valid_from.le(ts)),
+                    )),
+                )
                 .select(protocol_component::id)
                 .order_by(protocol_component::id)
                 .into_boxed();
@@ -1045,28 +1059,38 @@ impl ProtocolState {
         } else {
             let count_query = protocol_component::table
                 .filter(protocol_component::chain_id.eq(chain_id))
-                .filter(exists(
-                    protocol_state::table
-                        .filter(protocol_state::protocol_component_id.eq(protocol_component::id))
-                        .filter(protocol_state::valid_to.gt(MAX_TS - chrono::Duration::seconds(1))),
-                ).or(exists(
-                    protocol_state_default::table.filter(
+                .filter(
+                    exists(
+                        protocol_state::table
+                            .filter(
+                                protocol_state::protocol_component_id.eq(protocol_component::id),
+                            )
+                            .filter(
+                                protocol_state::valid_to.gt(MAX_TS - chrono::Duration::seconds(1)),
+                            ),
+                    )
+                    .or(exists(protocol_state_default::table.filter(
                         protocol_state_default::protocol_component_id.eq(protocol_component::id),
-                    ),
-                )))
+                    ))),
+                )
                 .into_boxed();
 
             let component_ids_query = protocol_component::table
                 .filter(protocol_component::chain_id.eq(chain_id))
-                .filter(exists(
-                    protocol_state::table
-                        .filter(protocol_state::protocol_component_id.eq(protocol_component::id))
-                        .filter(protocol_state::valid_to.gt(MAX_TS - chrono::Duration::seconds(1))),
-                ).or(exists(
-                    protocol_state_default::table.filter(
+                .filter(
+                    exists(
+                        protocol_state::table
+                            .filter(
+                                protocol_state::protocol_component_id.eq(protocol_component::id),
+                            )
+                            .filter(
+                                protocol_state::valid_to.gt(MAX_TS - chrono::Duration::seconds(1)),
+                            ),
+                    )
+                    .or(exists(protocol_state_default::table.filter(
                         protocol_state_default::protocol_component_id.eq(protocol_component::id),
-                    ),
-                )))
+                    ))),
+                )
                 .select(protocol_component::id)
                 .order_by(protocol_component::id)
                 .into_boxed();
@@ -1135,59 +1159,58 @@ impl ProtocolState {
                 .await
         };
 
-        let current = if let Some(ts) = version_ts {
-            let query = protocol_state_default::table
-                .inner_join(
-                    protocol_component::table
-                        .on(protocol_state_default::protocol_component_id.eq(protocol_component::id)),
-                )
-                .filter(protocol_component::id.eq_any(&component_ids))
-                .filter(protocol_state_default::valid_to.gt(ts))
-                .filter(protocol_state_default::valid_from.le(ts))
-                .order_by(protocol_state_default::protocol_component_id)
-                .select((
-                    (
-                        protocol_state_default::protocol_component_id,
-                        protocol_state_default::attribute_name,
-                        protocol_state_default::attribute_value,
-                        protocol_state_default::previous_value,
-                        protocol_state_default::modify_tx,
-                        protocol_state_default::valid_from,
-                        protocol_state_default::valid_to,
-                        protocol_state_default::inserted_ts,
-                        protocol_state_default::modified_ts,
-                    ),
-                    protocol_component::external_id,
-                ));
-            query
-                .get_results::<(Self, String)>(conn)
-                .await
-        } else {
-            let query = protocol_state_default::table
-                .inner_join(
-                    protocol_component::table
-                        .on(protocol_state_default::protocol_component_id.eq(protocol_component::id)),
-                )
-                .filter(protocol_component::id.eq_any(&component_ids))
-                .order_by(protocol_state_default::protocol_component_id)
-                .select((
-                    (
-                        protocol_state_default::protocol_component_id,
-                        protocol_state_default::attribute_name,
-                        protocol_state_default::attribute_value,
-                        protocol_state_default::previous_value,
-                        protocol_state_default::modify_tx,
-                        protocol_state_default::valid_from,
-                        protocol_state_default::valid_to,
-                        protocol_state_default::inserted_ts,
-                        protocol_state_default::modified_ts,
-                    ),
-                    protocol_component::external_id,
-                ));
-            query
-                .get_results::<(Self, String)>(conn)
-                .await
-        };
+        let current =
+            if let Some(ts) = version_ts {
+                let query = protocol_state_default::table
+                    .inner_join(protocol_component::table.on(
+                        protocol_state_default::protocol_component_id.eq(protocol_component::id),
+                    ))
+                    .filter(protocol_component::id.eq_any(&component_ids))
+                    .filter(protocol_state_default::valid_to.gt(ts))
+                    .filter(protocol_state_default::valid_from.le(ts))
+                    .order_by(protocol_state_default::protocol_component_id)
+                    .select((
+                        (
+                            protocol_state_default::protocol_component_id,
+                            protocol_state_default::attribute_name,
+                            protocol_state_default::attribute_value,
+                            protocol_state_default::previous_value,
+                            protocol_state_default::modify_tx,
+                            protocol_state_default::valid_from,
+                            protocol_state_default::valid_to,
+                            protocol_state_default::inserted_ts,
+                            protocol_state_default::modified_ts,
+                        ),
+                        protocol_component::external_id,
+                    ));
+                query
+                    .get_results::<(Self, String)>(conn)
+                    .await
+            } else {
+                let query = protocol_state_default::table
+                    .inner_join(protocol_component::table.on(
+                        protocol_state_default::protocol_component_id.eq(protocol_component::id),
+                    ))
+                    .filter(protocol_component::id.eq_any(&component_ids))
+                    .order_by(protocol_state_default::protocol_component_id)
+                    .select((
+                        (
+                            protocol_state_default::protocol_component_id,
+                            protocol_state_default::attribute_name,
+                            protocol_state_default::attribute_value,
+                            protocol_state_default::previous_value,
+                            protocol_state_default::modify_tx,
+                            protocol_state_default::valid_from,
+                            protocol_state_default::valid_to,
+                            protocol_state_default::inserted_ts,
+                            protocol_state_default::modified_ts,
+                        ),
+                        protocol_component::external_id,
+                    ));
+                query
+                    .get_results::<(Self, String)>(conn)
+                    .await
+            };
 
         let res = historical.and_then(|historical| {
             current.map(|current| merge_protocol_state_rows(historical, current))

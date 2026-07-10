@@ -1794,7 +1794,13 @@ where
 
     #[cfg(test)]
     pub(crate) async fn await_pending_commit_for_test(&self) -> Result<(), ExtractionError> {
-        if let Some(handle) = self.gateway.commit_handle.lock().await.take() {
+        if let Some(handle) = self
+            .gateway
+            .commit_handle
+            .lock()
+            .await
+            .take()
+        {
             match handle.await {
                 Ok(result) => result,
                 Err(join_err) => Err(ExtractionError::Storage(StorageError::Unexpected(format!(
@@ -2046,6 +2052,10 @@ where
 {
     fn get_id(&self) -> ExtractorIdentity {
         ExtractorIdentity::new(self.chain, &self.name)
+    }
+
+    fn protocol_system(&self) -> String {
+        self.protocol_system.clone()
     }
 
     /// Make sure that the protocol types are present in the database.
@@ -2789,7 +2799,13 @@ pub struct ExtractorPgGateway {
     chain: Chain,
     db_tx_batch_size: usize,
     state_gateway: CachedGateway,
-    bootstrap_state_scope: Option<String>,
+    shared_state_scope: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtractorStateKind {
+    Cursor,
+    Bootstrap,
 }
 
 #[automock]
@@ -2907,62 +2923,38 @@ pub trait ExtractorGateway: Send + Sync {
 }
 
 impl ExtractorPgGateway {
-    fn legacy_bootstrap_state_name(&self) -> String {
-        format!("{}::bootstrap", self.name)
-    }
-
-    fn bootstrap_state_name(&self) -> String {
-        match &self.bootstrap_state_scope {
-            Some(scope) => format!("{scope}::bootstrap"),
-            None => self.legacy_bootstrap_state_name(),
+    fn legacy_state_name_for(name: &str, kind: ExtractorStateKind) -> String {
+        match kind {
+            ExtractorStateKind::Cursor => name.to_string(),
+            ExtractorStateKind::Bootstrap => format!("{name}::bootstrap"),
         }
     }
 
-    pub fn new(
+    fn state_name_for(
         name: &str,
-        chain: Chain,
-        db_tx_batch_size: usize,
-        state_gateway: CachedGateway,
-        bootstrap_state_scope: Option<String>,
-    ) -> Self {
-        Self {
-            name: name.to_owned(),
-            chain,
-            db_tx_batch_size,
-            state_gateway,
-            bootstrap_state_scope,
+        shared_state_scope: Option<&str>,
+        kind: ExtractorStateKind,
+    ) -> String {
+        match (shared_state_scope, kind) {
+            (Some(scope), ExtractorStateKind::Cursor) => scope.to_string(),
+            (Some(scope), ExtractorStateKind::Bootstrap) => format!("{scope}::bootstrap"),
+            (None, kind) => Self::legacy_state_name_for(name, kind),
         }
     }
 
-    #[instrument(skip_all)]
-    async fn save_cursor(
+    fn legacy_state_name(&self, kind: ExtractorStateKind) -> String {
+        Self::legacy_state_name_for(&self.name, kind)
+    }
+
+    fn state_name(&self, kind: ExtractorStateKind) -> String {
+        Self::state_name_for(&self.name, self.shared_state_scope.as_deref(), kind)
+    }
+
+    async fn get_state_with_legacy_fallback(
         &self,
-        new_cursor: &str,
-        block_hash: BlockHash,
-    ) -> Result<(), StorageError> {
-        let state = ExtractionState::new(
-            self.name.to_string(),
-            self.chain,
-            None,
-            new_cursor.as_bytes(),
-            block_hash,
-        );
-        self.state_gateway
-            .save_state(&state)
-            .await?;
-        Ok(())
-    }
-
-    async fn get_last_extraction_state(&self) -> Result<ExtractionState, StorageError> {
-        let state = self
-            .state_gateway
-            .get_state(&self.name, &self.chain)
-            .await?;
-        Ok(state)
-    }
-
-    async fn get_saved_bootstrap_state(&self) -> Result<Option<ExtractionState>, StorageError> {
-        let primary_state_name = self.bootstrap_state_name();
+        kind: ExtractorStateKind,
+    ) -> Result<Option<ExtractionState>, StorageError> {
+        let primary_state_name = self.state_name(kind);
         match self
             .state_gateway
             .get_state(&primary_state_name, &self.chain)
@@ -2970,7 +2962,7 @@ impl ExtractorPgGateway {
         {
             Ok(state) => Ok(Some(state)),
             Err(StorageError::NotFound(_, _)) => {
-                let legacy_state_name = self.legacy_bootstrap_state_name();
+                let legacy_state_name = self.legacy_state_name(kind);
                 if primary_state_name == legacy_state_name {
                     return Ok(None);
                 }
@@ -2989,6 +2981,51 @@ impl ExtractorPgGateway {
         }
     }
 
+    pub fn new(
+        name: &str,
+        chain: Chain,
+        db_tx_batch_size: usize,
+        state_gateway: CachedGateway,
+        shared_state_scope: Option<String>,
+    ) -> Self {
+        Self { name: name.to_owned(), chain, db_tx_batch_size, state_gateway, shared_state_scope }
+    }
+
+    #[instrument(skip_all)]
+    async fn save_cursor(
+        &self,
+        new_cursor: &str,
+        block_hash: BlockHash,
+    ) -> Result<(), StorageError> {
+        let state = ExtractionState::new(
+            self.state_name(ExtractorStateKind::Cursor),
+            self.chain,
+            None,
+            new_cursor.as_bytes(),
+            block_hash,
+        );
+        self.state_gateway
+            .save_state(&state)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_last_extraction_state(&self) -> Result<ExtractionState, StorageError> {
+        self.get_state_with_legacy_fallback(ExtractorStateKind::Cursor)
+            .await?
+            .ok_or_else(|| {
+                StorageError::NotFound(
+                    self.legacy_state_name(ExtractorStateKind::Cursor),
+                    self.chain.to_string(),
+                )
+            })
+    }
+
+    async fn get_saved_bootstrap_state(&self) -> Result<Option<ExtractionState>, StorageError> {
+        self.get_state_with_legacy_fallback(ExtractorStateKind::Bootstrap)
+            .await
+    }
+
     async fn persist_bootstrap_state(
         &self,
         bootstrap_block: u64,
@@ -2999,7 +3036,7 @@ impl ExtractorPgGateway {
             .get_block(&BlockIdentifier::Hash(block_hash.clone()))
             .await?;
         let state = ExtractionState::new(
-            self.bootstrap_state_name(),
+            self.state_name(ExtractorStateKind::Bootstrap),
             self.chain,
             Some(json!({
                 "bootstrap_block": bootstrap_block,
@@ -5528,6 +5565,54 @@ mod test_serial_db {
         .await;
     }
 
+    #[test]
+    fn extractor_pg_gateway_uses_legacy_state_names_without_shared_scope() {
+        assert_eq!(
+            ExtractorPgGateway::state_name_for("test", None, ExtractorStateKind::Cursor),
+            "test"
+        );
+        assert_eq!(
+            ExtractorPgGateway::state_name_for("test", None, ExtractorStateKind::Bootstrap),
+            "test::bootstrap"
+        );
+        assert_eq!(
+            ExtractorPgGateway::legacy_state_name_for("test", ExtractorStateKind::Cursor),
+            "test"
+        );
+        assert_eq!(
+            ExtractorPgGateway::legacy_state_name_for("test", ExtractorStateKind::Bootstrap),
+            "test::bootstrap"
+        );
+    }
+
+    #[test]
+    fn extractor_pg_gateway_uses_shared_state_scope_for_cursor_and_bootstrap() {
+        assert_eq!(
+            ExtractorPgGateway::state_name_for(
+                "test",
+                Some("family::uniswap"),
+                ExtractorStateKind::Cursor,
+            ),
+            "family::uniswap"
+        );
+        assert_eq!(
+            ExtractorPgGateway::state_name_for(
+                "test",
+                Some("family::uniswap"),
+                ExtractorStateKind::Bootstrap,
+            ),
+            "family::uniswap::bootstrap"
+        );
+        assert_eq!(
+            ExtractorPgGateway::legacy_state_name_for("test", ExtractorStateKind::Cursor),
+            "test"
+        );
+        assert_eq!(
+            ExtractorPgGateway::legacy_state_name_for("test", ExtractorStateKind::Bootstrap),
+            "test::bootstrap"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_bootstrap_state_falls_back_to_legacy_scope() {
         run_against_db(|pool| async move {
@@ -5588,11 +5673,72 @@ mod test_serial_db {
 
             assert_eq!(state.name, "test::bootstrap");
             assert_eq!(
-                state.attributes
+                state
+                    .attributes
                     .get("bootstrap_block")
                     .and_then(|value| value.as_u64()),
                 Some(42)
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_cursor_falls_back_to_legacy_scope() {
+        run_against_db(|pool| async move {
+            let (legacy_gw, _) = setup_gw(pool, ImplementationType::Vm).await;
+            let shared_gw = ExtractorPgGateway::new(
+                "test",
+                Chain::Ethereum,
+                1000,
+                legacy_gw.state_gateway.clone(),
+                Some("family::uniswap".to_string()),
+            );
+            let block_hash =
+                Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
+                    .unwrap();
+            let block = Block {
+                number: 42,
+                chain: Chain::Ethereum,
+                hash: block_hash.clone(),
+                parent_hash: Bytes::default(),
+                ts: db_fixtures::yesterday_half_past_midnight(),
+            };
+            let legacy_state = ExtractionState::new(
+                "test".to_string(),
+                Chain::Ethereum,
+                None,
+                b"cursor@42",
+                block_hash,
+            );
+
+            legacy_gw
+                .state_gateway
+                .start_transaction(&block, None)
+                .await;
+            legacy_gw
+                .state_gateway
+                .upsert_block(&[block])
+                .await
+                .expect("block insertion succeeded");
+            legacy_gw
+                .state_gateway
+                .save_state(&legacy_state)
+                .await
+                .expect("legacy cursor state insertion succeeded");
+            legacy_gw
+                .state_gateway
+                .commit_transaction(0)
+                .await
+                .expect("gw transaction failed");
+
+            let state = shared_gw
+                .get_last_extraction_state()
+                .await
+                .expect("cursor lookup should succeed");
+
+            assert_eq!(state.name, "test");
+            assert_eq!(state.cursor, b"cursor@42");
         })
         .await;
     }
@@ -5649,6 +5795,63 @@ mod test_serial_db {
             let legacy_state = shared_gw
                 .state_gateway
                 .get_state("test::bootstrap", &Chain::Ethereum)
+                .await;
+            assert!(matches!(legacy_state, Err(StorageError::NotFound(_, _))));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_save_cursor_uses_shared_scope_when_configured() {
+        run_against_db(|pool| async move {
+            let (legacy_gw, _) = setup_gw(pool, ImplementationType::Vm).await;
+            let shared_gw = ExtractorPgGateway::new(
+                "test",
+                Chain::Ethereum,
+                1000,
+                legacy_gw.state_gateway.clone(),
+                Some("family::uniswap".to_string()),
+            );
+            let block_hash =
+                Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
+                    .unwrap();
+            let block = Block {
+                number: 42,
+                chain: Chain::Ethereum,
+                hash: block_hash.clone(),
+                parent_hash: Bytes::default(),
+                ts: db_fixtures::yesterday_half_past_midnight(),
+            };
+
+            shared_gw
+                .state_gateway
+                .start_transaction(&block, None)
+                .await;
+            shared_gw
+                .state_gateway
+                .upsert_block(&[block])
+                .await
+                .expect("block insertion succeeded");
+            shared_gw
+                .save_cursor("cursor@42", block_hash)
+                .await
+                .expect("shared cursor state save should succeed");
+            shared_gw
+                .state_gateway
+                .commit_transaction(0)
+                .await
+                .expect("gw transaction failed");
+
+            let shared_state = shared_gw
+                .state_gateway
+                .get_state("family::uniswap", &Chain::Ethereum)
+                .await
+                .expect("shared-scope cursor state should exist");
+            assert_eq!(shared_state.cursor, b"cursor@42");
+
+            let legacy_state = shared_gw
+                .state_gateway
+                .get_state("test", &Chain::Ethereum)
                 .await;
             assert!(matches!(legacy_state, Err(StorageError::NotFound(_, _))));
         })

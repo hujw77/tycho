@@ -3,10 +3,10 @@ use std::{future::Future, pin::Pin};
 use tycho_ethereum::rpc::EthereumRpcClient;
 
 use crate::extractor::{
-    family_runtime::FamilyRuntimeRegistry,
+    family_runtime::ResolvedSharedBootstrapBranchRuntime,
     models::BlockChanges,
     shared_bootstrap::{
-        materialize_plan_by_registered_branches, BootstrapBranchDescriptor, SharedBootstrapPlan,
+        materialize_plan_by_branch_runtimes, BootstrapBranchDescriptor, SharedBootstrapPlan,
     },
     uniswap_v2_bootstrap, uniswap_v3_bootstrap, ExtractionError,
 };
@@ -48,7 +48,7 @@ pub(crate) fn materialize_uniswap_v3_branch<'a>(
 pub(crate) fn materialize_uniswap_family_plan<'a>(
     rpc: &'a EthereumRpcClient,
     plan: &'a SharedBootstrapPlan,
-    registry: FamilyRuntimeRegistry<'a>,
+    branch_runtimes: &'a [ResolvedSharedBootstrapBranchRuntime],
 ) -> Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>> {
-    Box::pin(async move { materialize_plan_by_registered_branches(rpc, plan, registry).await })
+    Box::pin(async move { materialize_plan_by_branch_runtimes(rpc, plan, branch_runtimes).await })
 }

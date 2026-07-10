@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     fs::File,
     io::Read,
@@ -9,6 +9,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use tycho_common::models::{Chain, ImplementationType};
+use tycho_indexer::extractor::family_runtime::{
+    build_resolved_runtime_targets_with_registry, FamilyRuntimeRegistry, ResolvedRuntimeTarget,
+};
 use tycho_indexer::extractor::runner::{
     BootstrapConfig, BootstrapStrategy, DCIType, ExtractorConfig, FamilyRuntimeConfig,
     ProtocolTypeConfig,
@@ -17,6 +20,13 @@ use tycho_indexer::extractor::runner::{
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExtractorConfigs {
     pub(crate) extractors: HashMap<String, ExtractorConfig>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedIndexerRuntime<'a> {
+    pub(crate) protocol_systems: Vec<String>,
+    pub(crate) dci_protocol_systems: Vec<String>,
+    pub(crate) runtime_targets: Vec<ResolvedRuntimeTarget<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,11 +45,32 @@ struct RawFamilyRuntimeDefaults {
     #[serde(default)]
     shared_module: Option<String>,
     #[serde(default)]
+    durability_scope: Option<String>,
+    #[serde(default)]
     stop_block: Option<i64>,
     #[serde(default)]
     bootstrap: Option<RawFamilyBootstrapDefaults>,
     #[serde(default)]
     members: HashMap<String, RawFamilyMemberDefaults>,
+}
+
+impl RawFamilyRuntimeDefaults {
+    fn resolve_family_runtime_config(
+        &self,
+        protocol_system: &str,
+        family_runtime: FamilyRuntimeConfig,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<FamilyRuntimeConfig, Box<dyn std::error::Error>> {
+        registry
+            .resolve_family_runtime_config(
+                protocol_system,
+                family_runtime,
+                self.shared_spkg.clone(),
+                self.shared_module.clone(),
+                self.durability_scope.clone(),
+            )
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -96,25 +127,115 @@ impl ExtractorConfigs {
         Self { extractors }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn protocol_systems(&self) -> Vec<String> {
+        self.extractors
+            .values()
+            .map(|config| config.protocol_system().to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn dci_protocol_systems(&self) -> Vec<String> {
+        self.extractors
+            .values()
+            .filter(|config| config.dci_plugin.is_some())
+            .map(|config| config.protocol_system().to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolved_runtime_targets(
+        &self,
+    ) -> Result<Vec<ResolvedRuntimeTarget<'_>>, tycho_indexer::extractor::ExtractionError> {
+        self.resolved_runtime_targets_with_registry(
+            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+        )
+    }
+
+    pub(crate) fn resolved_indexer_runtime(
+        &self,
+    ) -> Result<ResolvedIndexerRuntime<'_>, tycho_indexer::extractor::ExtractionError> {
+        self.resolved_indexer_runtime_with_registry(
+            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+        )
+    }
+
     pub(crate) fn from_yaml(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_yaml_with_registry(
+            path,
+            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+        )
+    }
+
+    pub(crate) fn from_yaml_with_registry(
+        path: &str,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config = load_raw_extractor_configs(Path::new(path), &mut HashSet::new())?;
-        config.validate_family_runtime_defaults()?;
+        config.validate_family_runtime_defaults(registry)?;
         let base_dir = Path::new(path)
             .parent()
             .unwrap_or_else(|| Path::new("."));
-        config.resolve_substreams_params(base_dir)?;
-        let config: Self = config.try_into()?;
-        tycho_indexer::extractor::family_runtime::build_resolved_runtime_targets(
-            &config.extractors,
-        )
-        .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
+        config.resolve_substreams_params(base_dir, registry)?;
+        let config = config.try_into_with_registry(registry)?;
+        config
+            .resolved_runtime_targets_with_registry(registry)
+            .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
         Ok(config)
+    }
+
+    pub(crate) fn resolved_runtime_targets_with_registry(
+        &self,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<Vec<ResolvedRuntimeTarget<'_>>, tycho_indexer::extractor::ExtractionError> {
+        build_resolved_runtime_targets_with_registry(&self.extractors, registry)
+    }
+
+    pub(crate) fn resolved_indexer_runtime_with_registry(
+        &self,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<ResolvedIndexerRuntime<'_>, tycho_indexer::extractor::ExtractionError> {
+        let runtime_targets = self.resolved_runtime_targets_with_registry(registry)?;
+
+        Ok(ResolvedIndexerRuntime {
+            protocol_systems: protocol_systems_from_runtime_targets(&runtime_targets),
+            dci_protocol_systems: dci_protocol_systems_from_runtime_targets(&runtime_targets),
+            runtime_targets,
+        })
     }
 }
 
+fn protocol_systems_from_runtime_targets(targets: &[ResolvedRuntimeTarget<'_>]) -> Vec<String> {
+    targets
+        .iter()
+        .flat_map(ResolvedRuntimeTarget::extractor_configs)
+        .map(|config| config.protocol_system().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn dci_protocol_systems_from_runtime_targets(targets: &[ResolvedRuntimeTarget<'_>]) -> Vec<String> {
+    targets
+        .iter()
+        .flat_map(ResolvedRuntimeTarget::extractor_configs)
+        .filter(|config| config.dci_plugin.is_some())
+        .map(|config| config.protocol_system().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 impl RawExtractorConfigs {
-    fn validate_family_runtime_defaults(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
+    fn validate_family_runtime_defaults(
+        &self,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         registry.validate()?;
 
         for (family_name, defaults) in &self.family_runtimes {
@@ -124,7 +245,10 @@ impl RawExtractorConfigs {
             }
             registry.validate_family_member_defaults_for_family(
                 family_name,
-                defaults.members.keys().map(String::as_str),
+                defaults
+                    .members
+                    .keys()
+                    .map(String::as_str),
             )?;
         }
 
@@ -134,6 +258,7 @@ impl RawExtractorConfigs {
     fn resolve_substreams_params(
         &mut self,
         base_dir: &Path,
+        registry: FamilyRuntimeRegistry<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let family_runtime_defaults = self.family_runtimes.clone();
 
@@ -142,10 +267,7 @@ impl RawExtractorConfigs {
                 .protocol_system
                 .as_deref()
                 .unwrap_or(&extractor.name);
-            let route_protocol_filter = extractor
-                .family_runtime
-                .as_ref()
-                .map(|_| protocol_system);
+            let route_protocol_filter = Some(protocol_system);
             let mut resolved_start_block = extractor.start_block;
             merge_family_member_substreams_params_defaults(
                 protocol_system,
@@ -158,6 +280,7 @@ impl RawExtractorConfigs {
                 &mut resolved_start_block,
                 &mut extractor.substreams_params,
                 base_dir,
+                registry,
             )?;
 
             merge_family_bootstrap_defaults(
@@ -165,6 +288,7 @@ impl RawExtractorConfigs {
                 extractor.family_runtime.as_ref(),
                 &family_runtime_defaults,
                 &mut extractor.bootstrap,
+                registry,
             )?;
             merge_family_stop_block_defaults(
                 extractor.family_runtime.as_ref(),
@@ -177,6 +301,7 @@ impl RawExtractorConfigs {
                     route_protocol_filter,
                     &mut bootstrap.params,
                     base_dir,
+                    registry,
                 )?);
 
                 if let Some(start_block) = bootstrap.start_block {
@@ -223,6 +348,7 @@ fn merge_family_bootstrap_defaults(
     family_runtime: Option<&FamilyRuntimeConfig>,
     family_defaults: &HashMap<String, RawFamilyRuntimeDefaults>,
     bootstrap: &mut Option<RawBootstrapConfig>,
+    registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if bootstrap.is_some() {
         return Ok(());
@@ -237,8 +363,6 @@ fn merge_family_bootstrap_defaults(
     let Some(family_bootstrap) = defaults.bootstrap.as_ref() else {
         return Ok(());
     };
-    let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
-
     let strategy = registry.shared_bootstrap_strategy_for_family_member(
         &family_runtime.family,
         protocol_system,
@@ -280,22 +404,32 @@ impl TryFrom<RawExtractorConfigs> for ExtractorConfigs {
     type Error = Box<dyn std::error::Error>;
 
     fn try_from(value: RawExtractorConfigs) -> Result<Self, Self::Error> {
-        let mut extractors = HashMap::with_capacity(value.extractors.len());
+        value.try_into_with_registry(
+            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+        )
+    }
+}
 
-        for (extractor_id, extractor) in value.extractors {
+impl RawExtractorConfigs {
+    fn try_into_with_registry(
+        self,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<ExtractorConfigs, Box<dyn std::error::Error>> {
+        let RawExtractorConfigs { includes: _, family_runtimes, extractors: raw_extractors } = self;
+        let mut extractors = HashMap::with_capacity(raw_extractors.len());
+
+        for (extractor_id, extractor) in raw_extractors {
             let protocol_system = extractor
                 .protocol_system
                 .unwrap_or_else(|| extractor.name.clone());
             let family_runtime = merge_family_runtime_config(
                 &protocol_system,
                 extractor.family_runtime,
-                &value.family_runtimes,
+                &family_runtimes,
+                registry,
             )?;
-            let spkg = resolve_extractor_spkg(
-                &protocol_system,
-                extractor.spkg,
-                family_runtime.as_ref(),
-            )?;
+            let spkg =
+                resolve_extractor_spkg(&protocol_system, extractor.spkg, family_runtime.as_ref())?;
             let start_block = extractor
                 .start_block
                 .ok_or_else(|| format!("extractor `{extractor_id}` is missing `start_block`"))?;
@@ -345,7 +479,10 @@ fn resolve_extractor_spkg(
         return Ok(spkg);
     }
 
-    if let Some(shared_spkg) = family_runtime.and_then(|runtime| runtime.shared_spkg.clone()) {
+    if let Some(shared_spkg) = family_runtime
+        .and_then(FamilyRuntimeConfig::shared_spkg)
+        .map(str::to_string)
+    {
         return Ok(shared_spkg);
     }
 
@@ -359,21 +496,27 @@ fn merge_family_runtime_config(
     protocol_system: &str,
     family_runtime: Option<FamilyRuntimeConfig>,
     family_defaults: &HashMap<String, RawFamilyRuntimeDefaults>,
+    registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<Option<FamilyRuntimeConfig>, Box<dyn std::error::Error>> {
     let Some(family_runtime) = family_runtime else {
         return Ok(None);
     };
-    let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
     let defaults = family_defaults.get(&family_runtime.family);
 
-    Ok(Some(
-        registry.resolve_family_runtime_config(
+    match defaults {
+        Some(defaults) => Ok(Some(defaults.resolve_family_runtime_config(
             protocol_system,
             family_runtime,
-            defaults.and_then(|defaults| defaults.shared_spkg.clone()),
-            defaults.and_then(|defaults| defaults.shared_module.clone()),
-        )?,
-    ))
+            registry,
+        )?)),
+        None => Ok(Some(registry.resolve_family_runtime_config(
+            protocol_system,
+            family_runtime,
+            None,
+            None,
+            None,
+        )?)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,7 +569,11 @@ pub(crate) fn parse_substreams_params_yaml(
     contents: &str,
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let parsed: SubstreamsParamsFile = serde_yaml::from_str(contents)?;
-    let (start_block, params) = normalize_substreams_params(Some(extractor_name), parsed)?;
+    let (start_block, params) = normalize_substreams_params(
+        Some(extractor_name),
+        parsed,
+        tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+    )?;
     let mut substreams_params = Vec::with_capacity(params.len());
 
     for (key, value) in params {
@@ -442,6 +589,7 @@ fn resolve_substreams_params_map(
     resolved_start_block: &mut Option<i64>,
     substreams_params: &mut HashMap<String, String>,
     base_dir: &Path,
+    registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (module_name, value) in substreams_params {
         let Some(path) = value.strip_prefix('@') else {
@@ -449,26 +597,24 @@ fn resolve_substreams_params_map(
         };
 
         let params_path = base_dir.join(path);
-        let (start_block, resolved_params) = parse_substreams_params_file(
-            route_protocol_filter,
-            &params_path,
-        )
-        .map_err(|err| {
-                format!(
-                    "failed to parse substreams config file for extractor `{}` \
+        let (start_block, resolved_params) =
+            parse_substreams_params_file(route_protocol_filter, &params_path, registry).map_err(
+                |err| {
+                    format!(
+                        "failed to parse substreams config file for extractor `{}` \
                      module `{module_name}` at `{}`: {err}",
-                    route_protocol_filter.unwrap_or("<unfiltered>"),
-                    params_path.display()
-                )
-            })?;
+                        route_protocol_filter.unwrap_or("<unfiltered>"),
+                        params_path.display()
+                    )
+                },
+            )?;
 
         if let Some(start_block) = start_block {
             if let Some(existing_start_block) = resolved_start_block {
                 if *existing_start_block != start_block {
                     return Err(format!(
                         "conflicting start_block values for extractor `{}`: \
-                         {existing_start_block} vs {start_block} from module `{module_name}`"
-                        ,
+                         {existing_start_block} vs {start_block} from module `{module_name}`",
                         route_protocol_filter.unwrap_or("<unfiltered>")
                     )
                     .into());
@@ -488,6 +634,7 @@ fn resolve_bootstrap_params(
     route_protocol_filter: Option<&str>,
     params_value: &mut String,
     base_dir: &Path,
+    registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let Some(path) = params_value.strip_prefix('@') else {
         return extract_bootstrap_block_from_query(params_value).map_err(Into::into);
@@ -495,15 +642,16 @@ fn resolve_bootstrap_params(
 
     let params_path = base_dir.join(path);
     let (start_block, resolved_params) =
-        parse_bootstrap_params_file(route_protocol_filter, &params_path)
-        .map_err(|err| {
-            format!(
-                "failed to parse bootstrap config file for extractor `{}` at `{}`: \
+        parse_bootstrap_params_file(route_protocol_filter, &params_path, registry).map_err(
+            |err| {
+                format!(
+                    "failed to parse bootstrap config file for extractor `{}` at `{}`: \
                  {err}",
-                route_protocol_filter.unwrap_or("<unfiltered>"),
-                params_path.display()
-            )
-        })?;
+                    route_protocol_filter.unwrap_or("<unfiltered>"),
+                    params_path.display()
+                )
+            },
+        )?;
 
     let start_block = start_block.ok_or_else(|| {
         format!(
@@ -531,6 +679,19 @@ fn parse_bootstrap_params_yaml_with_filter(
     route_protocol_filter: Option<&str>,
     contents: &str,
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
+    parse_bootstrap_params_yaml_with_filter_and_registry(
+        route_protocol_filter,
+        contents,
+        tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+    )
+}
+
+#[cfg(test)]
+fn parse_bootstrap_params_yaml_with_filter_and_registry(
+    route_protocol_filter: Option<&str>,
+    contents: &str,
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let parsed: BootstrapParamsFile = serde_yaml::from_str(contents)?;
     let bootstrap_block = match (parsed.start_block, parsed.params.bootstrap_block) {
         (Some(start_block), Some(bootstrap_block)) => {
@@ -552,7 +713,8 @@ fn parse_bootstrap_params_yaml_with_filter(
         }
     };
 
-    let protocol_filter = route_protocol_filter.and_then(protocol_filter_for_protocol_system);
+    let protocol_filter = route_protocol_filter
+        .and_then(|protocol| protocol_filter_for_protocol_system(protocol, registry));
     let all_pools = collect_bootstrap_pools(&parsed.params, protocol_filter.as_ref())?;
 
     if all_pools.is_empty() {
@@ -568,9 +730,11 @@ fn parse_bootstrap_params_yaml_with_filter(
 fn normalize_substreams_params(
     route_protocol_filter: Option<&str>,
     mut parsed: SubstreamsParamsFile,
+    registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<(Option<i64>, BTreeMap<String, Value>), Box<dyn std::error::Error>> {
     if parsed.params.contains_key("routes") {
-        let protocol_filter = route_protocol_filter.and_then(protocol_filter_for_protocol_system);
+        let protocol_filter = route_protocol_filter
+            .and_then(|protocol| protocol_filter_for_protocol_system(protocol, registry));
         let (pools, pool_tokens) =
             collect_bootstrap_pool_metadata(&parsed.params, protocol_filter.as_ref())?;
         if !pools.is_empty() {
@@ -632,9 +796,11 @@ fn normalize_substreams_params(
 fn parse_substreams_params_file(
     route_protocol_filter: Option<&str>,
     path: &Path,
+    registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let parsed = load_substreams_params_file(path, &mut HashSet::new())?;
-    let (start_block, params) = normalize_substreams_params(route_protocol_filter, parsed)?;
+    let (start_block, params) =
+        normalize_substreams_params(route_protocol_filter, parsed, registry)?;
     let mut substreams_params = Vec::with_capacity(params.len());
 
     for (key, value) in params {
@@ -648,6 +814,7 @@ fn parse_substreams_params_file(
 fn parse_bootstrap_params_file(
     route_protocol_filter: Option<&str>,
     path: &Path,
+    registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
     let parsed = load_bootstrap_params_file(path, &mut HashSet::new())?;
     let bootstrap_block = match (parsed.start_block, parsed.params.bootstrap_block) {
@@ -670,7 +837,8 @@ fn parse_bootstrap_params_file(
         }
     };
 
-    let protocol_filter = route_protocol_filter.and_then(protocol_filter_for_protocol_system);
+    let protocol_filter = route_protocol_filter
+        .and_then(|protocol| protocol_filter_for_protocol_system(protocol, registry));
     let all_pools = collect_bootstrap_pools(&parsed.params, protocol_filter.as_ref())?;
 
     if all_pools.is_empty() {
@@ -1039,9 +1207,11 @@ fn collect_bootstrap_pools_from_parts(
     Ok(all_pools)
 }
 
-fn protocol_filter_for_protocol_system(protocol_system: &str) -> Option<HashSet<String>> {
-    tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
-        .normalized_shared_route_protocol_filter_for_protocol_system(protocol_system)
+fn protocol_filter_for_protocol_system(
+    protocol_system: &str,
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Option<HashSet<String>> {
+    registry.normalized_shared_route_protocol_filter_for_protocol_system(protocol_system)
 }
 
 fn router_matches_allowed_protocols(
@@ -1110,6 +1280,34 @@ mod tests {
     use std::{fs, process};
 
     use super::*;
+    use tycho_common::models::FinancialType;
+    use tycho_ethereum::rpc::EthereumRpcClient;
+    use tycho_indexer::extractor::family_runtime::{
+        FamilyMemberSpec, FamilyRuntimeSpec, SharedBootstrapMemberRuntime,
+        SharedBootstrapParamsParser,
+    };
+    use tycho_indexer::extractor::models::BlockChanges;
+    use tycho_indexer::extractor::shared_bootstrap::BootstrapBranchDescriptor;
+    use tycho_indexer::extractor::ExtractionError;
+
+    fn future_materialize_branch<'a>(
+        _: &'a EthereumRpcClient,
+        _: &'a BootstrapBranchDescriptor,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(ExtractionError::Setup(
+                "config tests should not materialize future bootstrap branches".to_string(),
+            ))
+        })
+    }
+
+    fn test_registry_with_future_family(
+        future_family: FamilyRuntimeSpec,
+    ) -> FamilyRuntimeRegistry<'static> {
+        FamilyRuntimeRegistry::new(Box::leak(vec![future_family].into_boxed_slice()))
+    }
 
     #[test]
     fn extractor_configs_load_substreams_params_from_file() {
@@ -1185,6 +1383,240 @@ extractors:
     }
 
     #[test]
+    fn extractor_configs_protocol_system_views_prefer_explicit_protocol_systems_over_keys() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2_alias".to_string(),
+                ExtractorConfig::new(
+                    "uniswap_v2_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![],
+                    "protocols/substreams/test-v2.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    Some(DCIType::RPC),
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("uniswap_v2"),
+            ),
+            (
+                "curve_alias".to_string(),
+                ExtractorConfig::new(
+                    "curve_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![],
+                    "protocols/substreams/test-curve.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("curve"),
+            ),
+            (
+                "curve_duplicate_alias".to_string(),
+                ExtractorConfig::new(
+                    "curve_duplicate_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![],
+                    "protocols/substreams/test-curve-2.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("curve"),
+            ),
+        ]);
+        let extractors_config = ExtractorConfigs::new(extractors);
+
+        assert_eq!(
+            extractors_config.protocol_systems(),
+            vec!["curve".to_string(), "uniswap_v2".to_string()]
+        );
+        assert_eq!(extractors_config.dci_protocol_systems(), vec!["uniswap_v2".to_string()]);
+    }
+
+    #[test]
+    fn extractor_configs_resolved_indexer_runtime_reuses_protocol_views_and_targets() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2_alias".to_string(),
+                ExtractorConfig::new(
+                    "uniswap_v2_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![],
+                    "protocols/substreams/test-v2.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    Some(DCIType::RPC),
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("uniswap_v2"),
+            ),
+            (
+                "curve_alias".to_string(),
+                ExtractorConfig::new(
+                    "curve_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![],
+                    "protocols/substreams/test-curve.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("curve"),
+            ),
+        ]);
+        let extractors_config = ExtractorConfigs::new(extractors);
+
+        let resolved = extractors_config
+            .resolved_indexer_runtime()
+            .expect("resolved indexer runtime");
+
+        assert_eq!(resolved.protocol_systems, vec!["curve".to_string(), "uniswap_v2".to_string()]);
+        assert_eq!(resolved.dci_protocol_systems, vec!["uniswap_v2".to_string()]);
+        assert_eq!(resolved.runtime_targets.len(), 2);
+    }
+
+    #[test]
+    fn runtime_target_protocol_views_cover_family_and_standalone_members() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2_alias".to_string(),
+                ExtractorConfig::new(
+                    "uniswap_v2_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![ProtocolTypeConfig::new("pool".to_string(), FinancialType::Swap)],
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+                    "map_protocol_changes".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    Some(DCIType::RPC),
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("uniswap_v2")
+                .with_family_runtime(Some(FamilyRuntimeConfig {
+                    family: "uniswap".to_string(),
+                    shared_spkg: Some(
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                    ),
+                    shared_module: Some("map_uniswap_family_protocol_changes".to_string()),
+                    durability_scope: None,
+                })),
+            ),
+            (
+                "uniswap_v3_alias".to_string(),
+                ExtractorConfig::new(
+                    "uniswap_v3_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![ProtocolTypeConfig::new("pool".to_string(), FinancialType::Swap)],
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+                    "map_protocol_changes".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("uniswap_v3")
+                .with_family_runtime(Some(FamilyRuntimeConfig {
+                    family: "uniswap".to_string(),
+                    shared_spkg: Some(
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                    ),
+                    shared_module: Some("map_uniswap_family_protocol_changes".to_string()),
+                    durability_scope: None,
+                })),
+            ),
+            (
+                "curve_alias".to_string(),
+                ExtractorConfig::new(
+                    "curve_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![ProtocolTypeConfig::new("curve".to_string(), FinancialType::Swap)],
+                    "protocols/substreams/test-curve.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    Some(DCIType::RPC),
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("curve"),
+            ),
+        ]);
+
+        let extractors_config = ExtractorConfigs::new(extractors);
+        let runtime_targets = extractors_config
+            .resolved_runtime_targets()
+            .expect("resolved runtime targets");
+
+        assert_eq!(
+            protocol_systems_from_runtime_targets(&runtime_targets),
+            vec!["curve".to_string(), "uniswap_v2".to_string(), "uniswap_v3".to_string()]
+        );
+        assert_eq!(
+            dci_protocol_systems_from_runtime_targets(&runtime_targets),
+            vec!["curve".to_string(), "uniswap_v2".to_string()]
+        );
+    }
+
+    #[test]
     fn extractor_configs_support_recursive_includes() {
         let temp_root = std::env::temp_dir()
             .join(format!("tycho-indexer-extractor-includes-{}", process::id()));
@@ -1200,7 +1632,7 @@ extractors:
     chain: "ethereum"
     implementation_type: "Custom"
     sync_batch_size: 1000
-    start_block: 42
+    start_block: 25384600
     protocol_types:
       - name: "uniswap_v2_pool"
         financial_type: "Swap"
@@ -1309,12 +1741,18 @@ includes:
         )
         .expect("write shared include");
 
-        let (v2_start_block, v2_params) =
-            parse_bootstrap_params_file(Some("uniswap_v2"), &temp_root.join("config/shared.yaml"))
-                .expect("parse v2 shared include");
-        let (v3_start_block, v3_params) =
-            parse_bootstrap_params_file(Some("uniswap_v3"), &temp_root.join("config/shared.yaml"))
-                .expect("parse v3 shared include");
+        let (v2_start_block, v2_params) = parse_bootstrap_params_file(
+            Some("uniswap_v2"),
+            &temp_root.join("config/shared.yaml"),
+            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+        )
+        .expect("parse v2 shared include");
+        let (v3_start_block, v3_params) = parse_bootstrap_params_file(
+            Some("uniswap_v3"),
+            &temp_root.join("config/shared.yaml"),
+            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+        )
+        .expect("parse v3 shared include");
 
         assert_eq!(v2_start_block, Some(42));
         assert_eq!(v3_start_block, Some(42));
@@ -1361,6 +1799,7 @@ params:
         let (start_block, params) = parse_substreams_params_file(
             Some("uniswap_v2"),
             &temp_root.join("config/v2-substreams.yaml"),
+            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
         )
         .expect("parse v2 substreams include");
 
@@ -2041,14 +2480,20 @@ extractors:
             "combined-substream config should declare top-level family member defaults"
         );
         assert!(
-            combined_substream_yaml.contains("v2_map_pool_events: \"@config/uniswap_v2_substreams.yaml\""),
+            combined_substream_yaml
+                .contains("v2_map_pool_events: \"@config/uniswap_v2_substreams.yaml\""),
             "combined-substream config should centralize v2 substreams params at the family level"
         );
         assert!(
-            combined_substream_yaml.contains("v3_map_events: \"@config/uniswap_v3_substreams.yaml\""),
+            combined_substream_yaml
+                .contains("v3_map_events: \"@config/uniswap_v3_substreams.yaml\""),
             "combined-substream config should centralize v3 substreams params at the family level"
         );
         assert!(combined_substream_yaml.contains("family_runtimes:"));
+        assert!(
+            !combined_substream_yaml.contains("shared_module:"),
+            "combined-substream config should rely on the registry-owned shared module default"
+        );
     }
 
     #[test]
@@ -2095,6 +2540,12 @@ extractors:
             &standard_config.extractors,
         )
         .expect("standard config should build a runtime plan");
+        let combined_targets = combined_config
+            .resolved_runtime_targets()
+            .expect("combined config should build resolved runtime targets");
+        let standard_targets = standard_config
+            .resolved_runtime_targets()
+            .expect("standard config should build resolved runtime targets");
 
         assert_eq!(combined_plan.families.len(), 1);
         assert_eq!(combined_plan.families[0].family_name, "uniswap");
@@ -2109,6 +2560,66 @@ extractors:
         assert!(combined_plan
             .standalone_protocol_systems
             .is_empty());
+        assert_eq!(combined_targets.len(), 1);
+        let tycho_indexer::extractor::family_runtime::ResolvedRuntimeTarget::Family(
+            combined_family,
+        ) = &combined_targets[0]
+        else {
+            panic!("combined config should resolve to one shared family runtime target");
+        };
+        assert_eq!(combined_family.family.family_name, "uniswap");
+        assert_eq!(
+            combined_family
+                .extractor_configs
+                .iter()
+                .map(|config| config.protocol_system().to_string())
+                .collect::<Vec<_>>(),
+            vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()]
+        );
+        let v2_bootstrap = combined_config
+            .extractors
+            .get("uniswap_v2")
+            .and_then(|config| config.bootstrap.as_ref())
+            .expect("combined v2 bootstrap present");
+        let v3_bootstrap = combined_config
+            .extractors
+            .get("uniswap_v3")
+            .and_then(|config| config.bootstrap.as_ref())
+            .expect("combined v3 bootstrap present");
+        let shared_bootstrap_plan =
+            tycho_indexer::extractor::shared_bootstrap::SharedBootstrapPlan::for_extractor_configs(
+                [
+                    (
+                        combined_config
+                            .extractors
+                            .get("uniswap_v2")
+                            .expect("combined v2 config present"),
+                        v2_bootstrap,
+                    ),
+                    (
+                        combined_config
+                            .extractors
+                            .get("uniswap_v3")
+                            .expect("combined v3 config present"),
+                        v3_bootstrap,
+                    ),
+                ],
+            )
+            .expect("combined config should build one shared bootstrap plan");
+        assert_eq!(
+            shared_bootstrap_plan
+                .family_name
+                .as_deref(),
+            Some("uniswap")
+        );
+        assert_eq!(
+            shared_bootstrap_plan
+                .branches
+                .iter()
+                .map(|branch| branch.protocol_system.as_str())
+                .collect::<Vec<_>>(),
+            vec!["uniswap_v2", "uniswap_v3"]
+        );
 
         assert!(
             standard_plan.families.is_empty(),
@@ -2118,6 +2629,13 @@ extractors:
             standard_plan.standalone_protocol_systems,
             vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()]
         );
+        assert_eq!(standard_targets.len(), 2);
+        assert!(standard_targets
+            .iter()
+            .all(|target| matches!(
+                target,
+                tycho_indexer::extractor::family_runtime::ResolvedRuntimeTarget::Standalone(_)
+            )));
     }
 
     #[test]
@@ -2138,7 +2656,7 @@ extractors:
     chain: "ethereum"
     implementation_type: "Custom"
     sync_batch_size: 1000
-    start_block: 42
+    start_block: 25384600
     protocol_types:
       - name: "sample_pool"
         financial_type: "Swap"
@@ -2148,9 +2666,16 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
-        let extractor = config.extractors.get("sample").expect("sample extractor present");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
+        let extractor = config
+            .extractors
+            .get("sample")
+            .expect("sample extractor present");
 
         assert_eq!(extractor.name(), "sample");
         assert_eq!(extractor.protocol_system(), "sample");
@@ -2173,7 +2698,7 @@ extractors:
 family_runtimes:
   uniswap:
     shared_spkg: "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
-    shared_module: "map_uniswap_family_protocol_changes"
+    durability_scope: "family::shared_uniswap_test"
 extractors:
   sample_v2:
     name: "sample_v2"
@@ -2181,7 +2706,7 @@ extractors:
     chain: "ethereum"
     implementation_type: "Custom"
     sync_batch_size: 1000
-    start_block: 42
+    start_block: 25384600
     protocol_types:
       - name: "sample_pool"
         financial_type: "Swap"
@@ -2195,7 +2720,7 @@ extractors:
     chain: "ethereum"
     implementation_type: "Custom"
     sync_batch_size: 1000
-    start_block: 42
+    start_block: 25384600
     protocol_types:
       - name: "sample_pool_v3"
         financial_type: "Swap"
@@ -2207,8 +2732,12 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
         let extractor = config
             .extractors
             .get("sample_v2")
@@ -2226,8 +2755,147 @@ extractors:
             family_runtime.shared_module.as_deref(),
             Some("map_uniswap_family_protocol_changes")
         );
+        assert_eq!(
+            family_runtime
+                .durability_scope
+                .as_deref(),
+            Some("family::shared_uniswap_test")
+        );
 
         let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn aliased_family_member_names_still_resolve_to_one_shared_family_runtime_target() {
+        let config_path = std::env::temp_dir().join(format!(
+            "tycho-indexer-family-runtime-aliased-members-{}-{}.yaml",
+            std::process::id(),
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        fs::write(
+            &config_path,
+            r#"
+family_runtimes:
+  uniswap:
+    shared_spkg: "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+    shared_module: "map_uniswap_family_protocol_changes"
+extractors:
+  alias_v2_member:
+    name: "alias_v2_member"
+    protocol_system: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 25384600
+    protocol_types:
+      - name: "sample_pool_v2"
+        financial_type: "Swap"
+    spkg: "sample-v2.spkg"
+    module_name: "v2_map_pool_events"
+    family_runtime:
+      family: "uniswap"
+  alias_v3_member:
+    name: "alias_v3_member"
+    protocol_system: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 25384600
+    protocol_types:
+      - name: "sample_pool_v3"
+        financial_type: "Swap"
+    spkg: "sample-v3.spkg"
+    module_name: "v3_map_protocol_changes"
+    family_runtime:
+      family: "uniswap"
+"#,
+        )
+        .expect("write config");
+
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
+        let resolved_targets = config
+            .resolved_runtime_targets()
+            .expect("aliased family members should resolve runtime targets");
+
+        assert_eq!(resolved_targets.len(), 1);
+        let tycho_indexer::extractor::family_runtime::ResolvedRuntimeTarget::Family(family) =
+            &resolved_targets[0]
+        else {
+            panic!("aliased family members should collapse to one shared family target");
+        };
+
+        assert_eq!(family.family.family_name, "uniswap");
+        assert_eq!(
+            family.family.member_protocol_systems,
+            vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()]
+        );
+        assert_eq!(
+            family
+                .extractor_configs
+                .iter()
+                .map(|config| config.name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["alias_v2_member".to_string(), "alias_v3_member".to_string()]
+        );
+        assert_eq!(
+            family
+                .extractor_configs
+                .iter()
+                .map(|config| config.protocol_system().to_string())
+                .collect::<Vec<_>>(),
+            vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()]
+        );
+        assert_eq!(
+            family.execution.shared_stream.module,
+            "map_uniswap_family_protocol_changes"
+        );
+        assert!(
+            family.execution.shared_stream.spkg.contains("ethereum-uniswap-v2-v3-combined"),
+            "shared family runtime should still use the combined shared spkg"
+        );
+
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn top_level_family_runtime_defaults_resolve_member_runtime_through_one_entrypoint() {
+        let defaults = RawFamilyRuntimeDefaults {
+            shared_spkg: Some(
+                "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+            ),
+            shared_module: None,
+            durability_scope: Some("family::shared_uniswap_test".to_string()),
+            stop_block: None,
+            bootstrap: None,
+            members: HashMap::new(),
+        };
+
+        let resolved = defaults
+            .resolve_family_runtime_config(
+                "uniswap_v2",
+                FamilyRuntimeConfig {
+                    family: "uniswap".to_string(),
+                    shared_spkg: None,
+                    shared_module: None,
+                    durability_scope: None,
+                },
+                tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+            )
+            .expect("top-level defaults should resolve member runtime");
+
+        assert_eq!(
+            resolved.shared_spkg.as_deref(),
+            Some("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg")
+        );
+        assert_eq!(resolved.shared_module.as_deref(), Some("map_uniswap_family_protocol_changes"));
+        assert_eq!(resolved.durability_scope.as_deref(), Some("family::shared_uniswap_test"));
     }
 
     #[test]
@@ -2253,7 +2921,7 @@ extractors:
     chain: "ethereum"
     implementation_type: "Custom"
     sync_batch_size: 1000
-    start_block: 42
+    start_block: 25384600
     protocol_types:
       - name: "sample_pool"
         financial_type: "Swap"
@@ -2265,7 +2933,7 @@ extractors:
     chain: "ethereum"
     implementation_type: "Custom"
     sync_batch_size: 1000
-    start_block: 42
+    start_block: 25384600
     protocol_types:
       - name: "sample_pool"
         financial_type: "Swap"
@@ -2275,12 +2943,15 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
-        let plan = tycho_indexer::extractor::family_runtime::build_family_runtime_plan(
-            &config.extractors,
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
         )
-        .expect("build runtime plan");
+        .expect("load config");
+        let plan =
+            tycho_indexer::extractor::family_runtime::build_family_runtime_plan(&config.extractors)
+                .expect("build runtime plan");
 
         assert!(
             plan.families.is_empty(),
@@ -2328,8 +2999,12 @@ extractors:
         )
         .expect("write config");
 
-        let err = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect_err("missing family member should fail during config load");
+        let err = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect_err("missing family member should fail during config load");
 
         assert!(err
             .to_string()
@@ -2388,8 +3063,12 @@ extractors:
         )
         .expect("write config");
 
-        let err = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect_err("partial shared bootstrap config should fail during config load");
+        let err = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect_err("partial shared bootstrap config should fail during config load");
 
         assert!(err
             .to_string()
@@ -2432,8 +3111,12 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
         let extractor = config
             .extractors
             .get("sample_v2")
@@ -2482,8 +3165,12 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
         let extractor = config
             .extractors
             .get("sample_v2")
@@ -2530,8 +3217,12 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
         let extractor = config
             .extractors
             .get("sample_v2")
@@ -2580,8 +3271,12 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
         let extractor = config
             .extractors
             .get("alias_v2")
@@ -2634,12 +3329,16 @@ extractors:
         )
         .expect("write config");
 
-        let err = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect_err("unknown family runtime should fail");
+        let err = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect_err("unknown family runtime should fail");
 
-        assert!(err
-            .to_string()
-            .contains("family_runtime `nonexistent_family` does not match any registered family runtime"));
+        assert!(err.to_string().contains(
+            "family_runtime `nonexistent_family` does not match any registered family runtime"
+        ));
 
         let _ = fs::remove_file(config_path);
     }
@@ -2677,12 +3376,16 @@ extractors:
         )
         .expect("write config");
 
-        let err = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect_err("unknown top-level family runtime should fail");
+        let err = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect_err("unknown top-level family runtime should fail");
 
-        assert!(err
-            .to_string()
-            .contains("family_runtime `nonexistent_family` does not match any registered family runtime"));
+        assert!(err.to_string().contains(
+            "family_runtime `nonexistent_family` does not match any registered family runtime"
+        ));
 
         let _ = fs::remove_file(config_path);
     }
@@ -2720,8 +3423,12 @@ extractors:
         )
         .expect("write config");
 
-        let err = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect_err("mismatched protocol family should fail");
+        let err = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect_err("mismatched protocol family should fail");
 
         assert!(err
             .to_string()
@@ -2758,8 +3465,12 @@ extractors:
         )
         .expect("write config");
 
-        let err = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect_err("missing spkg should fail");
+        let err = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect_err("missing spkg should fail");
 
         assert!(err
             .to_string()
@@ -2777,8 +3488,8 @@ extractors:
                 .timestamp_nanos_opt()
                 .unwrap_or_default()
         );
-        let config_path =
-            std::env::temp_dir().join(format!("tycho-indexer-family-bootstrap-config-{unique}.yaml"));
+        let config_path = std::env::temp_dir()
+            .join(format!("tycho-indexer-family-bootstrap-config-{unique}.yaml"));
         let bootstrap_path = std::env::temp_dir()
             .join(format!("tycho-indexer-family-bootstrap-params-{unique}.yaml"));
 
@@ -2842,13 +3553,20 @@ extractors:
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
         let extractor = config
             .extractors
             .get("sample_v2")
             .expect("sample extractor present");
-        let bootstrap = extractor.bootstrap.as_ref().expect("bootstrap present");
+        let bootstrap = extractor
+            .bootstrap
+            .as_ref()
+            .expect("bootstrap present");
         let v3_extractor = config
             .extractors
             .get("sample_v3")
@@ -2934,8 +3652,12 @@ extractors:
         )
         .expect("write config");
 
-        let err = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect_err("protocol outside family should fail");
+        let err = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect_err("protocol outside family should fail");
 
         assert!(err
             .to_string()
@@ -2948,7 +3670,8 @@ extractors:
     #[test]
     fn shared_route_filter_uses_protocol_system_not_extractor_key() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let config_path = root.join(format!(
+        let shared_bootstrap = root.join("config/shared_uniswap_bootstrap.yaml");
+        let config_path = std::env::temp_dir().join(format!(
             "tycho-indexer-protocol-filter-config-{}-{}.yaml",
             std::process::id(),
             chrono::Utc::now()
@@ -2957,14 +3680,16 @@ extractors:
         ));
         fs::write(
             &config_path,
-            r#"
+            format!(
+                r#"
 extractors:
-  alias_v3:
-    name: "alias_v3"
-    protocol_system: "uniswap_v3"
+  uniswap_v2_member:
+    name: "uniswap_v2_member"
+    protocol_system: "uniswap_v2"
     chain: "ethereum"
     implementation_type: "Custom"
     sync_batch_size: 1000
+    start_block: 25384600
     protocol_types:
       - name: "sample_pool"
         financial_type: "Swap"
@@ -2973,15 +3698,35 @@ extractors:
     family_runtime:
       family: "uniswap"
       shared_spkg: "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
-      shared_module: "map_uniswap_family_protocol_changes"
+  alias_v3:
+    name: "alias_v3"
+    protocol_system: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 25384600
+    protocol_types:
+      - name: "sample_pool"
+        financial_type: "Swap"
+    spkg: "sample.spkg"
+    module_name: "map_sample"
+    family_runtime:
+      family: "uniswap"
+      shared_spkg: "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
     substreams_params:
-      v3_map_events: "@config/shared_uniswap_bootstrap.yaml"
+      v3_map_events: "@{}"
 "#,
+                shared_bootstrap.display()
+            ),
         )
         .expect("write config");
 
-        let config = ExtractorConfigs::from_yaml(config_path.to_str().expect("utf8 config path"))
-            .expect("load config");
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
         let extractor = config
             .extractors
             .get("alias_v3")
@@ -3004,16 +3749,275 @@ extractors:
     }
 
     #[test]
+    fn explicit_protocol_system_drives_route_filter_without_family_runtime() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shared_bootstrap = root.join("config/shared_uniswap_bootstrap.yaml");
+        let config_path = std::env::temp_dir().join(format!(
+            "tycho-indexer-protocol-filter-standalone-config-{}-{}.yaml",
+            std::process::id(),
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+extractors:
+  alias_v3:
+    name: "alias_v3"
+    protocol_system: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "sample_pool"
+        financial_type: "Swap"
+    spkg: "sample.spkg"
+    module_name: "map_sample"
+    substreams_params:
+      v3_map_events: "@{}"
+    bootstrap:
+      strategy: "uniswap_v3_rpc"
+      params: "@{}"
+"#,
+                shared_bootstrap.display(),
+                shared_bootstrap.display()
+            ),
+        )
+        .expect("write config");
+
+        let config = ExtractorConfigs::from_yaml(
+            config_path
+                .to_str()
+                .expect("utf8 config path"),
+        )
+        .expect("load config");
+        let extractor = config
+            .extractors
+            .get("alias_v3")
+            .expect("aliased standalone v3 extractor present");
+        let params = extractor
+            .substreams_params
+            .get("v3_map_events")
+            .expect("resolved params present");
+        let bootstrap = extractor
+            .bootstrap
+            .as_ref()
+            .expect("resolved bootstrap present");
+
+        assert!(
+            params.contains("0xe0554a476a092703abdb3ef35c80e0d76d32939f"),
+            "standalone v3 params should keep v3 pools from shared bootstrap routes"
+        );
+        assert!(
+            !params.contains("0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"),
+            "standalone v3 params should exclude v2 pools even when extractor name is aliased"
+        );
+        assert!(
+            bootstrap
+                .params
+                .contains("0xe0554a476a092703abdb3ef35c80e0d76d32939f"),
+            "standalone v3 bootstrap should keep v3 pools from shared bootstrap routes"
+        );
+        assert!(
+            !bootstrap
+                .params
+                .contains("0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"),
+            "standalone v3 bootstrap should exclude v2 pools even when extractor name is aliased"
+        );
+
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
     fn protocol_filter_for_protocol_system_comes_from_family_registry() {
+        let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
         assert_eq!(
-            protocol_filter_for_protocol_system("uniswap_v2"),
+            protocol_filter_for_protocol_system("uniswap_v2", registry),
             Some(HashSet::from(["uniswapv2".to_string()]))
         );
         assert_eq!(
-            protocol_filter_for_protocol_system("uniswap_v3"),
+            protocol_filter_for_protocol_system("uniswap_v3", registry),
             Some(HashSet::from(["uniswapv3".to_string()]))
         );
-        assert_eq!(protocol_filter_for_protocol_system("curve"), None);
+        assert_eq!(protocol_filter_for_protocol_system("curve", registry), None);
+    }
+
+    #[test]
+    fn custom_registry_loads_future_family_from_yaml_entrypoint() {
+        const FUTURE_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec {
+            family_name: "future_swap",
+            members: &[
+                FamilyMemberSpec {
+                    protocol_system: "future_v1",
+                    shared_route_protocols: &["futurev1"],
+                    shared_bootstrap: Some(SharedBootstrapMemberRuntime {
+                        strategy: BootstrapStrategy::UniswapV2Rpc,
+                        params_parser: SharedBootstrapParamsParser::PoolList,
+                        materialize_branch: future_materialize_branch,
+                    }),
+                },
+                FamilyMemberSpec {
+                    protocol_system: "future_v2",
+                    shared_route_protocols: &["futurev2"],
+                    shared_bootstrap: Some(SharedBootstrapMemberRuntime {
+                        strategy: BootstrapStrategy::UniswapV2Rpc,
+                        params_parser: SharedBootstrapParamsParser::PoolList,
+                        materialize_branch: future_materialize_branch,
+                    }),
+                },
+            ],
+            output_module: "map_future_swap_family_protocol_changes",
+            shared_stream_name: "future_swap_family",
+            durability_scope: "family::future_swap_runtime",
+            shared_bootstrap_runtime: None,
+        };
+
+        let registry = test_registry_with_future_family(FUTURE_FAMILY);
+        let temp_root =
+            std::env::temp_dir().join(format!("tycho-indexer-future-family-{}", process::id()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(temp_root.join("config")).expect("create temp config dir");
+
+        fs::write(
+            temp_root.join("config/future_bootstrap.yaml"),
+            r#"
+start_block: 99
+params:
+  routes:
+    - token0: "0x00000000000000000000000000000000000000a1"
+      token1: "0x00000000000000000000000000000000000000b1"
+      routers:
+        - pool: "0x0000000000000000000000000000000000000011"
+          protocol: futurev1
+        - pool: "0x0000000000000000000000000000000000000022"
+          protocol: futurev2
+"#,
+        )
+        .expect("write future bootstrap config");
+        fs::write(
+            temp_root.join("config/future_substreams.yaml"),
+            r#"
+start_block: 99
+params:
+  bootstrap_block: 99
+  routes:
+    - token0: "0x00000000000000000000000000000000000000a1"
+      token1: "0x00000000000000000000000000000000000000b1"
+      routers:
+        - pool: "0x0000000000000000000000000000000000000011"
+          protocol: futurev1
+        - pool: "0x0000000000000000000000000000000000000022"
+          protocol: futurev2
+"#,
+        )
+        .expect("write future substreams config");
+        fs::write(
+            temp_root.join("extractors.yaml"),
+            r#"
+family_runtimes:
+  future_swap:
+    shared_spkg: "protocols/substreams/future-swap-combined/test.spkg"
+    shared_module: "map_future_swap_family_protocol_changes"
+    bootstrap:
+      params: "@config/future_bootstrap.yaml"
+    members:
+      future_v1:
+        substreams_params:
+          future_v1_map_events: "@config/future_substreams.yaml"
+      future_v2:
+        substreams_params:
+          future_v2_map_events: "@config/future_substreams.yaml"
+extractors:
+  future_v1:
+    name: "future_v1"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "future_pool"
+        financial_type: "Swap"
+    module_name: "map_protocol_changes"
+    family_runtime:
+      family: "future_swap"
+  future_v2:
+    name: "future_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "future_pool"
+        financial_type: "Swap"
+    module_name: "map_protocol_changes"
+    family_runtime:
+      family: "future_swap"
+"#,
+        )
+        .expect("write future extractor config");
+
+        let config = ExtractorConfigs::from_yaml_with_registry(
+            temp_root
+                .join("extractors.yaml")
+                .to_str()
+                .expect("utf8 temp path"),
+            registry,
+        )
+        .expect("load future family config through yaml entrypoint");
+
+        for (protocol_system, expected_pool, unexpected_pool) in [
+            (
+                "future_v1",
+                "0x0000000000000000000000000000000000000011",
+                "0x0000000000000000000000000000000000000022",
+            ),
+            (
+                "future_v2",
+                "0x0000000000000000000000000000000000000022",
+                "0x0000000000000000000000000000000000000011",
+            ),
+        ] {
+            let extractor = config
+                .extractors
+                .get(protocol_system)
+                .expect("future extractor present");
+            let runtime = extractor
+                .family_runtime()
+                .expect("future family runtime resolved");
+            let substreams_params = extractor
+                .substreams_params
+                .get(&format!("{protocol_system}_map_events"))
+                .expect("future shared substreams params resolved");
+            let bootstrap = extractor
+                .bootstrap
+                .as_ref()
+                .expect("future shared bootstrap resolved");
+
+            assert_eq!(extractor.start_block(), 99);
+            assert_eq!(
+                runtime.shared_spkg.as_deref(),
+                Some("protocols/substreams/future-swap-combined/test.spkg")
+            );
+            assert_eq!(
+                runtime.shared_module.as_deref(),
+                Some("map_future_swap_family_protocol_changes")
+            );
+            assert_eq!(runtime.durability_scope.as_deref(), Some("family::future_swap_runtime"));
+            assert!(substreams_params.contains(expected_pool));
+            assert!(!substreams_params.contains(unexpected_pool));
+            assert!(substreams_params.contains(&format!(
+                "pool_tokens={expected_pool}:0x00000000000000000000000000000000000000a1:0x00000000000000000000000000000000000000b1"
+            )));
+            assert!(!substreams_params.contains(unexpected_pool));
+            assert_eq!(bootstrap.strategy, BootstrapStrategy::UniswapV2Rpc);
+            assert_eq!(bootstrap.start_block, 99);
+            assert!(bootstrap.params.contains(expected_pool));
+            assert!(!bootstrap
+                .params
+                .contains(unexpected_pool));
+        }
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]

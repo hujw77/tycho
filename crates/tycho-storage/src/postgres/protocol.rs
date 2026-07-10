@@ -24,8 +24,7 @@ use tycho_common::{
 
 use super::{
     ensure_daily_partitions_for_valid_tos, maybe_lookup_block_ts, maybe_lookup_version_ts, orm,
-    schema, storage_error_from_diesel,
-    truncate_to_byte_limit,
+    schema, storage_error_from_diesel, truncate_to_byte_limit,
     versioning::{apply_partitioned_versioning, PartitionedVersionedRow, VersioningEntry},
     PostgresError, PostgresGateway, WithOrdinal, WithTxHash, MAX_TS, MAX_VERSION_TS,
 };
@@ -35,15 +34,14 @@ fn dedupe_latest_protocol_state_rows(
 ) -> Vec<orm::NewProtocolStateLatest> {
     let mut deduped = HashMap::with_capacity(rows.len());
     for row in rows {
-        deduped.insert(
-            (row.protocol_component_id, row.attribute_name.clone()),
-            row,
-        );
+        deduped.insert((row.protocol_component_id, row.attribute_name.clone()), row);
     }
     deduped.into_values().collect()
 }
 
-fn duplicate_protocol_state_latest_keys(rows: &[orm::NewProtocolStateLatest]) -> Vec<(i64, String)> {
+fn duplicate_protocol_state_latest_keys(
+    rows: &[orm::NewProtocolStateLatest],
+) -> Vec<(i64, String)> {
     let mut seen = HashSet::with_capacity(rows.len());
     let mut duplicates = BTreeSet::new();
 
@@ -829,7 +827,9 @@ impl PostgresGateway {
         conn: &mut AsyncPgConnection,
     ) -> Result<WithTotal<Vec<ProtocolComponentState>>, StorageError> {
         let chain_db_id = self.get_chain_id(chain)?;
-        let use_latest_view = self.use_latest_protocol_view(chain, at.as_ref(), conn).await?;
+        let use_latest_view = self
+            .use_latest_protocol_view(chain, at.as_ref(), conn)
+            .await?;
         let version_ts = if use_latest_view {
             None
         } else {
@@ -995,7 +995,10 @@ impl PostgresGateway {
         }
 
         if !duplicate_state_keys.is_empty() {
-            warn!(?duplicate_state_keys, "Duplicate protocol state keys detected before versioning");
+            warn!(
+                ?duplicate_state_keys,
+                "Duplicate protocol state keys detected before versioning"
+            );
         }
 
         // insert the prepared protocol state deltas
@@ -1472,7 +1475,9 @@ impl PostgresGateway {
                 if !to_archive.is_empty() {
                     ensure_daily_partitions_for_valid_tos(
                         "component_balance",
-                        to_archive.iter().map(PartitionedVersionedRow::get_valid_to),
+                        to_archive
+                            .iter()
+                            .map(PartitionedVersionedRow::get_valid_to),
                         conn,
                     )
                     .await?;
@@ -1646,7 +1651,10 @@ impl PostgresGateway {
         // the caller does not need them. It is planned for `modify_tx` to be removed from
         // the ComponentBalance
 
-        let version_ts = if self.use_latest_protocol_view(chain, at, conn).await? {
+        let version_ts = if self
+            .use_latest_protocol_view(chain, at, conn)
+            .await?
+        {
             None
         } else {
             match &at {

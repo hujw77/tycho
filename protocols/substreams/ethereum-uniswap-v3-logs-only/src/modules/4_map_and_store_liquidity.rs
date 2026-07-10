@@ -2,7 +2,10 @@ use substreams::store::{
     StoreGet, StoreGetInt64, StoreSet, StoreSetInt64, StoreSetSum, StoreSetSumBigInt,
 };
 
-use crate::{core::{build_liquidity_changes, collect_current_tick_updates}, pb::uniswap::v3::{Events, LiquidityChangeType, LiquidityChanges}};
+use crate::{
+    core::{build_liquidity_changes, collect_current_tick_updates},
+    pb::uniswap::v3::{Events, LiquidityChangeType, LiquidityChanges},
+};
 
 use substreams::{scalar::BigInt, store::StoreNew};
 

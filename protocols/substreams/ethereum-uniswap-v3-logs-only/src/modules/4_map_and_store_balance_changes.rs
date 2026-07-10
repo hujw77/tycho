@@ -1,9 +1,10 @@
 use tycho_substreams::models::BlockBalanceDeltas;
 
-use crate::{core::build_balance_deltas, pb::uniswap::v3::{Events, Pool}};
-use substreams::{
-    store::{StoreAddBigInt, StoreGet, StoreGetProto, StoreNew},
+use crate::{
+    core::build_balance_deltas,
+    pb::uniswap::v3::{Events, Pool},
 };
+use substreams::store::{StoreAddBigInt, StoreGet, StoreGetProto, StoreNew};
 
 #[substreams::handlers::map]
 pub fn map_balance_changes(

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use crate::extractor::runner::FamilyRuntimeConfig;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use mockall::mock;
@@ -699,14 +701,308 @@ pub fn scripted_session_response(
     }
 }
 
+#[cfg(test)]
+pub fn scripted_undo_response(
+    cursor_label: &str,
+    last_valid_block: u64,
+) -> crate::pb::sf::substreams::rpc::v2::Response {
+    use crate::pb::sf::substreams::rpc::v2::{response::Message, BlockUndoSignal, Response};
+    use crate::pb::sf::substreams::v1::BlockRef;
+
+    let block_id = format!(
+        "0x{}",
+        std::iter::repeat(format!("{:02x}", last_valid_block as u8))
+            .take(32)
+            .collect::<String>()
+    );
+    Response {
+        message: Some(Message::BlockUndoSignal(BlockUndoSignal {
+            last_valid_block: Some(BlockRef { id: block_id, number: last_valid_block }),
+            last_valid_cursor: format!("{cursor_label}@{last_valid_block}"),
+        })),
+    }
+}
+
+#[cfg(test)]
+pub fn family_output_module_for_tests(family_name: &str) -> String {
+    crate::extractor::family_runtime::default_family_runtime_registry()
+        .output_module_for_family(family_name)
+        .unwrap_or_else(|| {
+            panic!("family `{family_name}` must resolve an output module in the runtime registry")
+        })
+        .to_string()
+}
+
+#[cfg(test)]
+pub fn family_member_protocol_systems_for_tests(family_name: &str) -> Vec<String> {
+    crate::extractor::family_runtime::default_family_runtime_registry()
+        .member_protocol_systems_for_family(family_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "family `{family_name}` must resolve member protocol systems in the runtime registry"
+            )
+        })
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn family_detected_runtime_for_tests(
+    family_name: &str,
+    chain: Chain,
+    shared_spkg: impl Into<String>,
+) -> crate::extractor::family_runtime::DetectedFamilyRuntime {
+    crate::extractor::family_runtime::default_family_runtime_registry()
+        .detected_family_runtime(family_name, chain, shared_spkg)
+        .unwrap_or_else(|_| {
+            panic!("family `{family_name}` must resolve a detected runtime in the registry")
+        })
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn family_detected_runtime_with_members_for_tests(
+    family_name: &str,
+    chain: Chain,
+    shared_spkg: impl Into<String>,
+    member_protocol_systems: impl IntoIterator<Item = impl Into<String>>,
+) -> crate::extractor::family_runtime::DetectedFamilyRuntime {
+    let mut family = family_detected_runtime_for_tests(family_name, chain, shared_spkg);
+    family.member_protocol_systems = member_protocol_systems
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    family
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn family_resolved_shared_stream_for_tests(
+    family_name: &str,
+    chain: Chain,
+    shared_spkg: impl Into<String>,
+) -> crate::extractor::family_runtime::ResolvedSharedFamilyStream {
+    family_detected_runtime_for_tests(family_name, chain, shared_spkg).resolved_shared_stream()
+}
+
+#[cfg(test)]
+pub fn write_family_defaults_config_for_tests(
+    file_prefix: &str,
+    unique: &str,
+    family_name: &str,
+    shared_spkg_path: &str,
+    stop_block: Option<i64>,
+    extractor_configs_yaml: &str,
+) -> std::path::PathBuf {
+    let stop_block_yaml = stop_block
+        .map(|value| format!("    stop_block: {value}\n"))
+        .unwrap_or_default();
+    let config_path = std::env::temp_dir().join(format!("{file_prefix}-{unique}.yaml"));
+    let shared_module = family_output_module_for_tests(family_name);
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+family_runtimes:
+  {family_name}:
+    shared_spkg: "{shared_spkg_path}"
+    shared_module: "{shared_module}"
+{stop_block_yaml}extractors:
+{extractor_configs_yaml}
+"#,
+        ),
+    )
+    .expect("write temp family-default config");
+    config_path
+}
+
+#[cfg(test)]
+pub fn write_uniswap_family_defaults_config(
+    file_prefix: &str,
+    unique: &str,
+    shared_spkg_path: &str,
+    start_block: i64,
+    stop_block: Option<i64>,
+) -> std::path::PathBuf {
+    write_uniswap_family_defaults_config_with_member_names(
+        file_prefix,
+        unique,
+        shared_spkg_path,
+        start_block,
+        stop_block,
+        "uniswap_v2",
+        "uniswap_v3",
+    )
+}
+
+#[cfg(test)]
+pub fn write_uniswap_family_defaults_config_with_member_names(
+    file_prefix: &str,
+    unique: &str,
+    shared_spkg_path: &str,
+    start_block: i64,
+    stop_block: Option<i64>,
+    v2_name: &str,
+    v3_name: &str,
+) -> std::path::PathBuf {
+    write_family_defaults_config_for_tests(
+        file_prefix,
+        unique,
+        "uniswap",
+        shared_spkg_path,
+        stop_block,
+        &format!(
+            r#"  {v2_name}:
+    name: "{v2_name}"
+    protocol_system: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1
+    start_block: {start_block}
+    protocol_types:
+      - name: "uniswap_v2_pool"
+        financial_type: "Swap"
+    module_name: "v2_map_pool_events"
+    family_runtime:
+      family: "uniswap"
+  {v3_name}:
+    name: "{v3_name}"
+    protocol_system: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1
+    start_block: {start_block}
+    protocol_types:
+      - name: "uniswap_v3_pool"
+        financial_type: "Swap"
+    module_name: "v3_map_protocol_changes"
+    family_runtime:
+      family: "uniswap""#
+        ),
+    )
+}
+
+#[cfg(test)]
+pub fn write_uniswap_family_defaults_config_with_shared_bootstrap(
+    file_prefix: &str,
+    unique: &str,
+    shared_spkg_path: &str,
+    bootstrap_path: &str,
+    start_block: i64,
+    stop_block: Option<i64>,
+    v2_substreams_params: Option<&str>,
+    v3_substreams_params: Option<&str>,
+) -> std::path::PathBuf {
+    let stop_block_yaml = stop_block
+        .map(|value| format!("    stop_block: {value}\n"))
+        .unwrap_or_default();
+    let v2_member_yaml = v2_substreams_params
+        .map(|params| {
+            format!(
+                r#"      uniswap_v2:
+        substreams_params:
+          v2_map_pool_events: "{params}"
+"#
+            )
+        })
+        .unwrap_or_default();
+    let v3_member_yaml = v3_substreams_params
+        .map(|params| {
+            format!(
+                r#"      uniswap_v3:
+        substreams_params:
+          v3_map_events: "{params}"
+"#
+            )
+        })
+        .unwrap_or_default();
+    let members_yaml = if v2_member_yaml.is_empty() && v3_member_yaml.is_empty() {
+        String::new()
+    } else {
+        format!("    members:\n{v2_member_yaml}{v3_member_yaml}")
+    };
+    let config_path = std::env::temp_dir().join(format!("{file_prefix}-{unique}.yaml"));
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+family_runtimes:
+  uniswap:
+    shared_spkg: "{shared_spkg_path}"
+    shared_module: "{shared_module}"
+{stop_block_yaml}    bootstrap:
+      params: "@{bootstrap_path}"
+{members_yaml}extractors:
+  uniswap_v2:
+    name: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1
+    start_block: {start_block}
+    protocol_types:
+      - name: "uniswap_v2_pool"
+        financial_type: "Swap"
+    module_name: "v2_map_pool_events"
+    family_runtime:
+      family: "uniswap"
+  uniswap_v3:
+    name: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1
+    start_block: {start_block}
+    protocol_types:
+      - name: "uniswap_v3_pool"
+        financial_type: "Swap"
+    module_name: "v3_map_protocol_changes"
+    family_runtime:
+      family: "uniswap"
+"#,
+            shared_module = family_output_module_for_tests("uniswap"),
+        ),
+    )
+    .expect("write temp family-default bootstrap config");
+    config_path
+}
+
+#[cfg(test)]
+pub fn family_shared_module_for_tests(family_name: &str) -> String {
+    family_output_module_for_tests(family_name)
+}
+
+#[cfg(test)]
+pub fn family_runtime_config_for_tests(
+    family_name: &str,
+    shared_spkg: impl Into<String>,
+) -> FamilyRuntimeConfig {
+    FamilyRuntimeConfig {
+        family: family_name.to_string(),
+        shared_spkg: Some(shared_spkg.into()),
+        shared_module: Some(family_shared_module_for_tests(family_name)),
+        durability_scope: None,
+    }
+}
+
 pub fn family_block_response_from_block_changes(
+    cursor_label: &str,
+    family_changes: tycho_substreams::pb::tycho::evm::v1::BlockChanges,
+) -> crate::pb::sf::substreams::rpc::v2::Response {
+    family_block_response_from_block_changes_for_family("uniswap", cursor_label, family_changes)
+}
+
+pub fn family_block_response_from_block_changes_for_family(
+    family_name: &str,
     cursor_label: &str,
     family_changes: tycho_substreams::pb::tycho::evm::v1::BlockChanges,
 ) -> crate::pb::sf::substreams::rpc::v2::Response {
     use prost::Message;
 
     use crate::pb::sf::substreams::{
-        rpc::v2::{response::Message as ResponseMessage, BlockScopedData, MapModuleOutput, Response},
+        rpc::v2::{
+            response::Message as ResponseMessage, BlockScopedData, MapModuleOutput, Response,
+        },
         v1::Clock,
     };
 
@@ -715,21 +1011,18 @@ pub fn family_block_response_from_block_changes(
         .as_ref()
         .expect("family block present")
         .number;
+    let output_module = family_output_module_for_tests(family_name);
     Response {
         message: Some(ResponseMessage::BlockScopedData(BlockScopedData {
             output: Some(MapModuleOutput {
-                name: "map_uniswap_family_protocol_changes".to_string(),
+                name: output_module,
                 map_output: Some(prost_types::Any {
                     type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
                     value: family_changes.encode_to_vec(),
                 }),
                 debug_info: None,
             }),
-            clock: Some(Clock {
-                id: number.to_string(),
-                number,
-                timestamp: None,
-            }),
+            clock: Some(Clock { id: number.to_string(), number, timestamp: None }),
             cursor: format!("{cursor_label}@{number}"),
             final_block_height: number,
             debug_map_outputs: vec![],
@@ -748,7 +1041,18 @@ pub fn family_block_response(
     block_timestamp: u64,
     changes: Vec<tycho_substreams::pb::tycho::evm::v1::TransactionChanges>,
 ) -> crate::pb::sf::substreams::rpc::v2::Response {
-    family_block_response_from_block_changes(
+    family_block_response_for_family("uniswap", cursor_label, number, block_timestamp, changes)
+}
+
+pub fn family_block_response_for_family(
+    family_name: &str,
+    cursor_label: &str,
+    number: u64,
+    block_timestamp: u64,
+    changes: Vec<tycho_substreams::pb::tycho::evm::v1::TransactionChanges>,
+) -> crate::pb::sf::substreams::rpc::v2::Response {
+    family_block_response_from_block_changes_for_family(
+        family_name,
         cursor_label,
         tycho_substreams::pb::tycho::evm::v1::BlockChanges {
             block: Some(tycho_substreams::pb::tycho::evm::v1::Block {
@@ -787,11 +1091,14 @@ pub fn v2_pair_created_block(
     token1: u8,
     pair: u8,
 ) -> substreams_ethereum::pb::eth::v2::Block {
-    use ethabi::{ethereum_types::{Address, U256}, Token};
+    use ethabi::{
+        ethereum_types::{Address, U256},
+        Token,
+    };
     use prost_types::Timestamp;
     use substreams_ethereum::pb::eth::v2::{
-        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
-        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+        block::DetailLevel, transaction_trace::Type as TransactionType, Block, BlockHeader, Log,
+        TransactionReceipt, TransactionTrace, TransactionTraceStatus,
     };
 
     let data = ethabi::encode(&[
@@ -802,8 +1109,8 @@ pub fn v2_pair_created_block(
         address: address(factory),
         topics: vec![
             vec![
-                13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217, 211,
-                21, 240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
+                13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217, 211, 21,
+                240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
             ],
             topic_address(token0),
             topic_address(token1),
@@ -820,10 +1127,7 @@ pub fn v2_pair_created_block(
         size: 0,
         header: Some(BlockHeader {
             parent_hash: vec![number.saturating_sub(1) as u8; 32],
-            timestamp: Some(Timestamp {
-                seconds: block_timestamp,
-                nanos: 0,
-            }),
+            timestamp: Some(Timestamp { seconds: block_timestamp, nanos: 0 }),
             ..Default::default()
         }),
         transaction_traces: vec![TransactionTrace {
@@ -832,10 +1136,7 @@ pub fn v2_pair_created_block(
             from: vec![0x01; 20],
             to: address(factory),
             status: TransactionTraceStatus::Succeeded as i32,
-            receipt: Some(TransactionReceipt {
-                logs: vec![log],
-                ..Default::default()
-            }),
+            receipt: Some(TransactionReceipt { logs: vec![log], ..Default::default() }),
             r#type: TransactionType::TrxTypeLegacy as i32,
             ..Default::default()
         }],
@@ -857,8 +1158,8 @@ pub fn v3_pool_created_block(
     use ethabi::{ethereum_types::Address, Token};
     use prost_types::Timestamp;
     use substreams_ethereum::pb::eth::v2::{
-        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
-        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+        block::DetailLevel, transaction_trace::Type as TransactionType, Block, BlockHeader, Log,
+        TransactionReceipt, TransactionTrace, TransactionTraceStatus,
     };
 
     let data = ethabi::encode(&[
@@ -869,8 +1170,8 @@ pub fn v3_pool_created_block(
         address: address(factory),
         topics: vec![
             vec![
-                120, 60, 202, 28, 4, 18, 221, 13, 105, 94, 120, 69, 104, 201, 109, 162, 233,
-                194, 47, 249, 137, 53, 122, 46, 139, 29, 155, 43, 78, 107, 113, 24,
+                120, 60, 202, 28, 4, 18, 221, 13, 105, 94, 120, 69, 104, 201, 109, 162, 233, 194,
+                47, 249, 137, 53, 122, 46, 139, 29, 155, 43, 78, 107, 113, 24,
             ],
             topic_address(token0),
             topic_address(token1),
@@ -888,10 +1189,7 @@ pub fn v3_pool_created_block(
         size: 0,
         header: Some(BlockHeader {
             parent_hash: vec![number.saturating_sub(1) as u8; 32],
-            timestamp: Some(Timestamp {
-                seconds: block_timestamp,
-                nanos: 0,
-            }),
+            timestamp: Some(Timestamp { seconds: block_timestamp, nanos: 0 }),
             ..Default::default()
         }),
         transaction_traces: vec![TransactionTrace {
@@ -900,10 +1198,7 @@ pub fn v3_pool_created_block(
             from: vec![0x01; 20],
             to: address(factory),
             status: TransactionTraceStatus::Succeeded as i32,
-            receipt: Some(TransactionReceipt {
-                logs: vec![log],
-                ..Default::default()
-            }),
+            receipt: Some(TransactionReceipt { logs: vec![log], ..Default::default() }),
             r#type: TransactionType::TrxTypeLegacy as i32,
             ..Default::default()
         }],

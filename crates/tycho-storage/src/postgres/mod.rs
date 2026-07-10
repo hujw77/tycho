@@ -797,11 +797,40 @@ pub mod testing {
     //! # Reusable components to write tests against the DB.
     use std::future::Future;
 
-    use diesel::sql_query;
+    use diesel::{pg::PgConnection, sql_query, Connection};
     use diesel_async::{
         pooled_connection::{deadpool::Pool, AsyncDieselConnectionManager},
         AsyncPgConnection, RunQueryDsl,
     };
+
+    use crate::postgres::run_migrations;
+
+    fn serial_db_tests_require_available_database() -> bool {
+        std::env::var("CI").is_ok()
+            || matches!(
+                std::env::var("TYCHO_REQUIRE_TEST_DB").as_deref(),
+                Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+            )
+    }
+
+    fn try_prepare_serial_test_database() -> Result<String, String> {
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| "DATABASE_URL must be set for testing".to_string())?;
+
+        let strict = serial_db_tests_require_available_database();
+        match PgConnection::establish(&database_url) {
+            Ok(_) => {
+                run_migrations(&database_url);
+                Ok(database_url)
+            }
+            Err(err) if strict => Err(format!(
+                "serial DB tests require a reachable database at DATABASE_URL={database_url}: {err}"
+            )),
+            Err(err) => Err(format!(
+                "serial DB test skipped because database is unavailable at DATABASE_URL={database_url}: {err}"
+            )),
+        }
+    }
 
     async fn setup_pool() -> Pool<AsyncPgConnection> {
         let database_url =
@@ -880,6 +909,17 @@ pub mod testing {
         F: FnOnce(Pool<AsyncPgConnection>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send,
     {
+        match try_prepare_serial_test_database() {
+            Ok(_) => {}
+            Err(message) if serial_db_tests_require_available_database() => {
+                panic!("{message}");
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                return;
+            }
+        }
+
         let connection_pool = setup_pool().await;
         let inner_pool = connection_pool.clone();
         let res = tokio::spawn(async move {

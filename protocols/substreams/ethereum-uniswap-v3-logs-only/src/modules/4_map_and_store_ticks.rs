@@ -1,6 +1,9 @@
 use substreams::store::StoreAddBigInt;
 
-use crate::{core::build_tick_deltas, pb::uniswap::v3::{Events, TickDeltas}};
+use crate::{
+    core::build_tick_deltas,
+    pb::uniswap::v3::{Events, TickDeltas},
+};
 
 use substreams::{
     scalar::BigInt,

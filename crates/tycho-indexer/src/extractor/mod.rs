@@ -35,6 +35,7 @@ use crate::{
 pub mod chain_state;
 mod dynamic_contract_indexer;
 pub mod family_dispatch;
+pub mod family_lifecycle;
 pub mod family_registry;
 pub mod family_runtime;
 pub mod family_uniswap;
@@ -46,6 +47,7 @@ pub mod protocol_extractor;
 pub mod reorg_buffer;
 pub mod runner;
 pub mod shared_bootstrap;
+pub mod startup;
 pub mod token_analysis_cron;
 mod u256_num;
 pub mod uniswap_v2_bootstrap;
@@ -99,6 +101,9 @@ pub type ExtractorMsg = Arc<BlockAggregatedChanges>;
 pub trait Extractor: Send + Sync {
     /// Returns the unique identity of this extractor.
     fn get_id(&self) -> ExtractorIdentity;
+
+    /// Returns the stable protocol-system identity served by this extractor.
+    fn protocol_system(&self) -> String;
 
     /// Ensures all protocol types this extractor needs are registered in
     /// storage. Safe to call multiple times.

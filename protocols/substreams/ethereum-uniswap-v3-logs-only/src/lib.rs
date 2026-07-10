@@ -2,9 +2,9 @@
 
 mod abi;
 pub mod core;
-pub mod pb;
 #[cfg(feature = "standalone-handlers")]
 mod modules;
+pub mod pb;
 
 #[cfg(feature = "standalone-handlers")]
 pub use modules::*;

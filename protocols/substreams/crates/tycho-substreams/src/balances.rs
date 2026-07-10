@@ -230,7 +230,9 @@ fn pop_matching_store_delta(
     indexed_store_deltas
         .get_mut(&(key.to_string(), ordinal))
         .and_then(|queue| queue.pop_front())
-        .unwrap_or_else(|| panic!("Missing matching store delta for key `{}` at ordinal {}", key, ordinal))
+        .unwrap_or_else(|| {
+            panic!("Missing matching store delta for key `{}` at ordinal {}", key, ordinal)
+        })
 }
 
 fn assert_all_store_deltas_consumed(
@@ -238,7 +240,11 @@ fn assert_all_store_deltas_consumed(
 ) {
     let leftovers = indexed_store_deltas
         .into_iter()
-        .filter_map(|((key, ordinal), mut queue)| queue.pop_front().map(|_| (key, ordinal)))
+        .filter_map(|((key, ordinal), mut queue)| {
+            queue
+                .pop_front()
+                .map(|_| (key, ordinal))
+        })
         .collect::<Vec<_>>();
 
     if !leftovers.is_empty() {

@@ -581,7 +581,9 @@ impl PostgresGateway {
         if !to_archive.is_empty() {
             ensure_daily_partitions_for_valid_tos(
                 "contract_storage",
-                to_archive.iter().map(|row| row.valid_to),
+                to_archive
+                    .iter()
+                    .map(|row| row.valid_to),
                 conn,
             )
             .await?;

@@ -72,10 +72,7 @@ impl FamilyBranchSpec {
             .map(|(contract, protocol_system)| (contract.to_vec(), protocol_system))
             .collect();
 
-        FamilyDispatcherSeed {
-            component_systems,
-            contract_systems,
-        }
+        FamilyDispatcherSeed { component_systems, contract_systems }
     }
 }
 
@@ -259,11 +256,7 @@ impl FamilyBlockChangesDispatcher {
 
         let mut dispatched = HashMap::new();
         let mut all_systems = self.branch_protocol_systems.clone();
-        all_systems.extend(
-            txs_by_system
-                .keys()
-                .cloned(),
-        );
+        all_systems.extend(txs_by_system.keys().cloned());
         all_systems.extend(storage_by_system.keys().cloned());
 
         for protocol_system in all_systems {
@@ -439,7 +432,11 @@ impl FamilyBlockChangesDispatcher {
                 tx_changes
                     .contract_changes
                     .iter()
-                    .filter_map(|change| self.contract_to_system.get(&change.address).cloned())
+                    .filter_map(|change| {
+                        self.contract_to_system
+                            .get(&change.address)
+                            .cloned()
+                    })
                     .collect::<HashSet<_>>()
             } else {
                 touched_systems.clone()
@@ -494,7 +491,11 @@ impl FamilyBlockChangesDispatcher {
         Ok(storage_changes
             .storage_changes
             .iter()
-            .filter_map(|change| self.contract_to_system.get(&change.address).cloned())
+            .filter_map(|change| {
+                self.contract_to_system
+                    .get(&change.address)
+                    .cloned()
+            })
             .collect())
     }
 }
@@ -515,9 +516,9 @@ fn empty_transaction_changes(tx: &substreams::Transaction) -> substreams::Transa
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use tycho_common::models::{Chain, FinancialType, ImplementationType};
     use chrono::Duration;
     use prost::Message;
+    use tycho_common::models::{Chain, FinancialType, ImplementationType};
     use tycho_substreams::pb::tycho::evm::v1 as substreams;
 
     use crate::extractor::{
@@ -610,10 +611,7 @@ mod tests {
         assert_eq!(branch.protocol_system, "uniswap_v2");
         assert_eq!(
             branch.protocol_type_names,
-            HashSet::from([
-                "uniswap_v2_pool".to_string(),
-                "uniswap_v2_pair".to_string(),
-            ])
+            HashSet::from(["uniswap_v2_pool".to_string(), "uniswap_v2_pair".to_string(),])
         );
     }
 
@@ -824,29 +822,27 @@ mod tests {
     #[test]
     fn builds_dispatcher_with_preloaded_seed_state() {
         let dispatcher = FamilyBlockChangesDispatcher::new_with_seed(
-            [
-                branch("uniswap_v2", "uniswap_v2_pool"),
-                branch("uniswap_v3", "uniswap_v3_pool"),
-            ],
+            [branch("uniswap_v2", "uniswap_v2_pool"), branch("uniswap_v3", "uniswap_v3_pool")],
             FamilyDispatcherSeed {
                 component_systems: HashMap::from([(
                     "seeded-v2-pool".to_string(),
                     "uniswap_v2".to_string(),
                 )]),
-                contract_systems: HashMap::from([(
-                    vec![0x77; 20],
-                    "uniswap_v3".to_string(),
-                )]),
+                contract_systems: HashMap::from([(vec![0x77; 20], "uniswap_v3".to_string())]),
             },
         )
         .expect("dispatcher builds with preloaded seed");
 
         assert_eq!(
-            dispatcher.component_to_system.get("seeded-v2-pool"),
+            dispatcher
+                .component_to_system
+                .get("seeded-v2-pool"),
             Some(&"uniswap_v2".to_string())
         );
         assert_eq!(
-            dispatcher.contract_to_system.get(&vec![0x77; 20]),
+            dispatcher
+                .contract_to_system
+                .get(&vec![0x77; 20]),
             Some(&"uniswap_v3".to_string())
         );
     }
@@ -915,10 +911,8 @@ mod tests {
             branch("uniswap_v3", "uniswap_v3_pool"),
         ])
         .expect("dispatcher builds");
-        dispatcher.register_contract_systems(HashMap::from([(
-            vec![0x44; 20],
-            "uniswap_v2".to_string(),
-        )]));
+        dispatcher
+            .register_contract_systems(HashMap::from([(vec![0x44; 20], "uniswap_v2".to_string())]));
 
         let dispatched = dispatcher
             .dispatch_block_changes(substreams::BlockChanges {
@@ -937,11 +931,13 @@ mod tests {
             .expect("dispatch succeeds");
 
         assert!(dispatched.contains_key("uniswap_v2"));
-        assert_eq!(dispatched["uniswap_v2"].changes[0].contract_changes.len(), 1);
         assert_eq!(
-            dispatched["uniswap_v2"].changes[0].contract_changes[0].address,
-            vec![0x44; 20]
+            dispatched["uniswap_v2"].changes[0]
+                .contract_changes
+                .len(),
+            1
         );
+        assert_eq!(dispatched["uniswap_v2"].changes[0].contract_changes[0].address, vec![0x44; 20]);
     }
 
     #[test]
@@ -951,10 +947,8 @@ mod tests {
             branch("uniswap_v3", "uniswap_v3_pool"),
         ])
         .expect("dispatcher builds");
-        dispatcher.register_contract_systems(HashMap::from([(
-            vec![0x55; 20],
-            "uniswap_v3".to_string(),
-        )]));
+        dispatcher
+            .register_contract_systems(HashMap::from([(vec![0x55; 20], "uniswap_v3".to_string())]));
 
         let dispatched = dispatcher
             .dispatch_block_changes(substreams::BlockChanges {
@@ -968,7 +962,12 @@ mod tests {
             .expect("dispatch succeeds");
 
         assert!(dispatched.contains_key("uniswap_v3"));
-        assert_eq!(dispatched["uniswap_v3"].storage_changes.len(), 1);
+        assert_eq!(
+            dispatched["uniswap_v3"]
+                .storage_changes
+                .len(),
+            1
+        );
         assert_eq!(
             dispatched["uniswap_v3"].storage_changes[0].storage_changes[0].address,
             vec![0x55; 20]
@@ -1035,6 +1034,83 @@ mod tests {
             })
             .expect("storage-only follow-up dispatch succeeds");
         assert!(storage_dispatched.contains_key("uniswap_v2"));
+    }
+
+    #[test]
+    fn routes_same_block_dynamic_admission_and_follow_up_updates() {
+        let mut dispatcher = FamilyBlockChangesDispatcher::new([
+            branch("uniswap_v2", "uniswap_v2_pool"),
+            branch("uniswap_v3", "uniswap_v3_pool"),
+        ])
+        .expect("dispatcher builds");
+
+        let tx = test_tx();
+        let dispatched = dispatcher
+            .dispatch_block_changes(substreams::BlockChanges {
+                block: Some(test_block()),
+                changes: vec![substreams::TransactionChanges {
+                    tx: Some(tx.clone()),
+                    contract_changes: vec![test_contract_change(vec![0x67; 20])],
+                    entity_changes: vec![substreams::EntityChanges {
+                        component_id: "new-v2-pool".to_string(),
+                        attributes: vec![],
+                    }],
+                    component_changes: vec![substreams::ProtocolComponent {
+                        id: "new-v2-pool".to_string(),
+                        protocol_type: Some(substreams::ProtocolType {
+                            name: "uniswap_v2_pool".to_string(),
+                            ..Default::default()
+                        }),
+                        contracts: vec![vec![0x67; 20]],
+                        ..Default::default()
+                    }],
+                    balance_changes: vec![substreams::BalanceChange {
+                        component_id: b"new-v2-pool".to_vec(),
+                        token: vec![0xa0; 20],
+                        balance: vec![0x01],
+                    }],
+                    entrypoints: vec![],
+                    entrypoint_params: vec![],
+                }],
+                storage_changes: vec![substreams::TransactionStorageChanges {
+                    tx: Some(tx),
+                    storage_changes: vec![test_storage_change(vec![0x67; 20])],
+                }],
+            })
+            .expect("same-block dynamic admission dispatch succeeds");
+
+        assert_eq!(dispatched.len(), 2);
+        assert_eq!(dispatched["uniswap_v2"].changes.len(), 1);
+        assert_eq!(
+            dispatched["uniswap_v2"]
+                .storage_changes
+                .len(),
+            1
+        );
+        assert_eq!(dispatched["uniswap_v2"].changes[0].component_changes[0].id, "new-v2-pool");
+        assert_eq!(
+            dispatched["uniswap_v2"].changes[0].entity_changes[0].component_id,
+            "new-v2-pool"
+        );
+        assert_eq!(
+            String::from_utf8(
+                dispatched["uniswap_v2"].changes[0].balance_changes[0]
+                    .component_id
+                    .clone()
+            )
+            .expect("balance change component id should be utf8"),
+            "new-v2-pool"
+        );
+        assert_eq!(
+            dispatched["uniswap_v2"].storage_changes[0].storage_changes[0].address,
+            vec![0x67; 20]
+        );
+        assert!(
+            dispatched["uniswap_v3"]
+                .changes
+                .is_empty(),
+            "untouched sibling branch should still receive an empty block"
+        );
     }
 
     #[test]
@@ -1169,7 +1245,9 @@ mod tests {
         assert_eq!(dispatched.len(), 2);
         assert_eq!(dispatched["uniswap_v2"].changes.len(), 1);
         assert!(
-            dispatched["uniswap_v3"].changes.is_empty(),
+            dispatched["uniswap_v3"]
+                .changes
+                .is_empty(),
             "untouched branch should still receive an empty progress block"
         );
         assert_eq!(
@@ -1189,55 +1267,58 @@ mod tests {
             Duration::seconds(60),
             std::sync::Arc::new(MockGateway::new()),
         );
-        cache.add_components(vec![
-            tycho_common::models::protocol::ProtocolComponent::new(
-                "seeded-v2-pool",
-                "uniswap_v2",
-                "uniswap_v2_pool",
-                Chain::Ethereum,
-                Vec::new(),
-                vec![tycho_common::Bytes::from(vec![0x81; 20])],
-                HashMap::new(),
-                tycho_common::models::ChangeType::Creation,
-                tycho_common::Bytes::default(),
-                chrono::NaiveDateTime::default(),
-            ),
-            tycho_common::models::protocol::ProtocolComponent::new(
-                "seeded-v3-pool",
-                "uniswap_v3",
-                "uniswap_v3_pool",
-                Chain::Ethereum,
-                Vec::new(),
-                vec![tycho_common::Bytes::from(vec![0x82; 20])],
-                HashMap::new(),
-                tycho_common::models::ChangeType::Creation,
-                tycho_common::Bytes::default(),
-                chrono::NaiveDateTime::default(),
-            ),
-        ])
-        .await
-        .expect("add cached components");
+        cache
+            .add_components(vec![
+                tycho_common::models::protocol::ProtocolComponent::new(
+                    "seeded-v2-pool",
+                    "uniswap_v2",
+                    "uniswap_v2_pool",
+                    Chain::Ethereum,
+                    Vec::new(),
+                    vec![tycho_common::Bytes::from(vec![0x81; 20])],
+                    HashMap::new(),
+                    tycho_common::models::ChangeType::Creation,
+                    tycho_common::Bytes::default(),
+                    chrono::NaiveDateTime::default(),
+                ),
+                tycho_common::models::protocol::ProtocolComponent::new(
+                    "seeded-v3-pool",
+                    "uniswap_v3",
+                    "uniswap_v3_pool",
+                    Chain::Ethereum,
+                    Vec::new(),
+                    vec![tycho_common::Bytes::from(vec![0x82; 20])],
+                    HashMap::new(),
+                    tycho_common::models::ChangeType::Creation,
+                    tycho_common::Bytes::default(),
+                    chrono::NaiveDateTime::default(),
+                ),
+            ])
+            .await
+            .expect("add cached components");
 
-        let branches = vec![
-            branch("uniswap_v2", "uniswap_v2_pool"),
-            branch("uniswap_v3", "uniswap_v3_pool"),
-        ];
+        let branches =
+            vec![branch("uniswap_v2", "uniswap_v2_pool"), branch("uniswap_v3", "uniswap_v3_pool")];
         let seed = FamilyBranchSpec::dispatcher_seed_from_protocol_cache(&branches, &cache).await;
 
         assert_eq!(
-            seed.component_systems.get("seeded-v2-pool"),
+            seed.component_systems
+                .get("seeded-v2-pool"),
             Some(&"uniswap_v2".to_string())
         );
         assert_eq!(
-            seed.component_systems.get("seeded-v3-pool"),
+            seed.component_systems
+                .get("seeded-v3-pool"),
             Some(&"uniswap_v3".to_string())
         );
         assert_eq!(
-            seed.contract_systems.get(&vec![0x81; 20]),
+            seed.contract_systems
+                .get(&vec![0x81; 20]),
             Some(&"uniswap_v2".to_string())
         );
         assert_eq!(
-            seed.contract_systems.get(&vec![0x82; 20]),
+            seed.contract_systems
+                .get(&vec![0x82; 20]),
             Some(&"uniswap_v3".to_string())
         );
     }

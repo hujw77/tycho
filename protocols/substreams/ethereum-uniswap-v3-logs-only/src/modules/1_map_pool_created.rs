@@ -1,5 +1,5 @@
-use substreams_ethereum::pb::eth::v2::{self as eth};
 use crate::core::build_pool_created_block_entity_changes;
+use substreams_ethereum::pb::eth::v2::{self as eth};
 use tycho_substreams::prelude::*;
 
 #[substreams::handlers::map]

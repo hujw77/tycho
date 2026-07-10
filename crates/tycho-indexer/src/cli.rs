@@ -36,6 +36,8 @@ pub enum Command {
     Index(IndexArgs),
     /// Runs a single substream, intended for testing.
     Run(RunSpkgArgs),
+    /// Records raw Substreams responses into the mock fixture format used by combined-family tests.
+    RecordSubstreams(RecordSubstreamsArgs),
     /// Starts a job to analyze stored tokens for tax and gas cost.
     AnalyzeTokens(AnalyzeTokenArgs),
     /// Starts Tycho RPC only. No extractors.
@@ -256,6 +258,95 @@ impl RunSpkgArgs {
     }
 }
 
+#[derive(Args, Debug, Clone, PartialEq)]
+pub struct RecordSubstreamsArgs {
+    #[clap(flatten)]
+    pub substreams_args: SubstreamsArgs,
+
+    /// Substreams Package file.
+    ///
+    /// Required in manual mode unless `--extractors-config` is used to derive the request.
+    #[clap(long)]
+    pub spkg: Option<String>,
+
+    /// Substreams Module name.
+    ///
+    /// Required in manual mode unless `--extractors-config` is used to derive the request.
+    #[clap(long)]
+    pub module: Option<String>,
+
+    /// Substreams start block.
+    ///
+    /// Optional when deriving the request from `--extractors-config`; if omitted, the resolved
+    /// runtime start block is used.
+    #[clap(long)]
+    pub start_block: Option<i64>,
+
+    /// Substreams stop block
+    ///
+    /// Optional. If not provided, the recorder will run until the stream ends or max_responses is
+    /// hit. If prefixed with a `+` the value is interpreted as an increment to the effective
+    /// request start block.
+    #[clap(long)]
+    stop_block: Option<String>,
+
+    /// Write the recorded responses to this fixture path.
+    #[clap(long)]
+    pub output: String,
+
+    /// Substreams params encoded as `key=value` pairs, separated by commas.
+    ///
+    /// In derived mode these params are merged on top of the runtime-derived params.
+    #[clap(long, value_delimiter = ',')]
+    pub params: Vec<String>,
+
+    /// Load the request shape from an extractor config instead of specifying `--spkg`,
+    /// `--module`, and `--start-block` manually.
+    #[clap(long)]
+    pub extractors_config: Option<String>,
+
+    /// Select a family runtime from `--extractors-config` and record its shared Substreams
+    /// request.
+    #[clap(long)]
+    pub family: Option<String>,
+
+    /// Select a standalone protocol system from `--extractors-config` and record its Substreams
+    /// request.
+    #[clap(long)]
+    pub protocol_system: Option<String>,
+
+    /// Stop after recording at most this many responses.
+    #[clap(long)]
+    pub max_responses: Option<usize>,
+
+    /// Request only final blocks from Substreams.
+    #[clap(long, default_value = "true", action = clap::ArgAction::Set)]
+    pub final_blocks_only: bool,
+
+    /// Resolve and print the effective Substreams request as JSON without recording anything.
+    #[clap(long)]
+    pub print_request: bool,
+}
+
+impl RecordSubstreamsArgs {
+    pub fn stop_block(&self, effective_start_block: i64) -> Option<i64> {
+        if let Some(s) = &self.stop_block {
+            if s.starts_with('+') {
+                let increment: i64 = s
+                    .strip_prefix('+')
+                    .expect("stripped stop block value")
+                    .parse()
+                    .expect("stop block value");
+                Some(effective_start_block + increment)
+            } else {
+                Some(s.parse().expect("stop block value"))
+            }
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzeTokenArgs {
     /// Blockchain to execute analysis for.
@@ -345,6 +436,81 @@ mod cli_tests {
                 settlement_contract: "0xc9f2e6ea1637E499406986ac50ddC92401ce1f58"
                     .parse()
                     .unwrap(),
+            }),
+        };
+
+        assert_eq!(cli, expected_args);
+    }
+
+    #[tokio::test]
+    async fn test_arg_parsing_record_substreams_cmd() {
+        let uniswap_output_module = crate::testing::family_output_module_for_tests("uniswap");
+        let cli = Cli::try_parse_from(vec![
+            "tycho-indexer",
+            "--endpoint",
+            "http://example.com",
+            "--database-url",
+            "my_db",
+            "--rpc-url",
+            "http://example.com",
+            "record-substreams",
+            "--api_token",
+            "your_api_token",
+            "--spkg",
+            "combined.spkg",
+            "--module",
+            &uniswap_output_module,
+            "--start-block",
+            "25384601",
+            "--stop-block",
+            "+4",
+            "--output",
+            "fixture.json",
+            "--params",
+            "factory=0xf1,pool=0x45",
+            "--max-responses",
+            "8",
+            "--enable-partial-blocks",
+            "--final-blocks-only",
+            "false",
+        ])
+        .expect("parse errored");
+
+        let expected_args = Cli {
+            global_args: GlobalArgs {
+                endpoint_url: "http://example.com".to_string(),
+                database_url: "my_db".to_string(),
+                database_insert_batch_size: 0,
+                s3_bucket: Some("repo.propellerheads-propellerheads".to_string()),
+                server_ip: "0.0.0.0".to_string(),
+                server_port: 4242,
+                server_version_prefix: "v1".to_string(),
+                rpc: RPCArgs {
+                    url: "http://example.com".to_string(),
+                    max_retries: 5,
+                    initial_backoff_ms: 150,
+                    max_backoff_ms: 5000,
+                    max_batch_size: None,
+                    storage_slot_max_batch_size: None,
+                },
+            },
+            command: Command::RecordSubstreams(RecordSubstreamsArgs {
+                substreams_args: SubstreamsArgs {
+                    substreams_api_token: "your_api_token".to_string(),
+                    enable_partial_blocks: true,
+                },
+                spkg: Some("combined.spkg".to_string()),
+                module: Some(uniswap_output_module.to_string()),
+                start_block: Some(25384601),
+                stop_block: Some("+4".to_string()),
+                output: "fixture.json".to_string(),
+                params: vec!["factory=0xf1".to_string(), "pool=0x45".to_string()],
+                extractors_config: None,
+                family: None,
+                protocol_system: None,
+                max_responses: Some(8),
+                final_blocks_only: false,
+                print_request: false,
             }),
         };
 

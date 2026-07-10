@@ -134,3 +134,49 @@ python scripts/compare-uniswap-v3-the-graph.py \
     0x1385fc1fe0418ea0b4fcf7adc61fc7535ab7f80d \
     0x6b6c7beadce465f8f2ada88903bdbbb170fa1f10
 ```
+
+## Combined Uniswap fixture capture
+
+Use `scripts/combined-family-history-slice-fixture.sh` to drive the checked-in combined
+Uniswap V2/V3 history-slice fixture workflow.
+
+Check whether the local environment is ready for the real capture workflow:
+
+```bash
+scripts/combined-family-history-slice-fixture.sh doctor
+```
+
+Fail fast when the required external inputs are missing:
+
+```bash
+scripts/combined-family-history-slice-fixture.sh doctor --strict
+```
+
+Preflight the resolved shared-family request without opening a Substreams session:
+
+```bash
+scripts/combined-family-history-slice-fixture.sh preflight
+```
+
+Print the exact live capture command before running it:
+
+```bash
+scripts/combined-family-history-slice-fixture.sh command
+```
+
+Capture the real fixture into
+`crates/tycho-indexer/tests/fixtures/combined_family_real_history_slice.json`:
+
+```bash
+TYCHO_RECORD_ENDPOINT=https://mainnet.eth.streamingfast.io \
+TYCHO_RECORD_RPC_URL=https://rpc.mevblocker.io \
+SUBSTREAMS_API_TOKEN=... \
+scripts/combined-family-history-slice-fixture.sh record
+```
+
+Optional overrides:
+
+- `TYCHO_COMBINED_FIXTURE_START_BLOCK`
+- `TYCHO_COMBINED_FIXTURE_STOP_BLOCK`
+- `TYCHO_COMBINED_FIXTURE_OUTPUT`
+- `TYCHO_COMBINED_FIXTURE_CONFIG`

@@ -86,13 +86,7 @@ pub fn build_pool_event_block_changes(
         .collect::<HashSet<_>>();
     let mut tx_changes: HashMap<Vec<u8>, PartialChanges> = HashMap::new();
 
-    handle_sync(
-        block,
-        &mut tx_changes,
-        pools_store,
-        &bootstrap_pool_tokens,
-        &bootstrap_pools,
-    );
+    handle_sync(block, &mut tx_changes, pools_store, &bootstrap_pool_tokens, &bootstrap_pools);
     merge_block(&mut tx_changes, &mut block_entity_changes);
 
     block_entity_changes
@@ -182,12 +176,15 @@ fn collect_new_pools(
 mod tests {
     use std::collections::HashMap;
 
-    use ethabi::{ethereum_types::{Address, U256}, Token};
-    use substreams::store::StoreGet;
+    use ethabi::{
+        ethereum_types::{Address, U256},
+        Token,
+    };
     use prost_types::Timestamp;
+    use substreams::store::StoreGet;
     use substreams_ethereum::pb::eth::v2::{
-        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
-        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+        block::DetailLevel, transaction_trace::Type as TransactionType, Block, BlockHeader, Log,
+        TransactionReceipt, TransactionTrace, TransactionTraceStatus,
     };
 
     use super::{
@@ -256,8 +253,8 @@ mod tests {
             address: address(factory),
             topics: vec![
                 vec![
-                    13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217,
-                    211, 21, 240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
+                    13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217, 211,
+                    21, 240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
                 ],
                 topic_address(token0),
                 topic_address(token1),
@@ -276,10 +273,7 @@ mod tests {
             size: 0,
             header: Some(BlockHeader {
                 parent_hash: vec![0xbb; 32],
-                timestamp: Some(Timestamp {
-                    seconds: 1_718_000_000,
-                    nanos: 0,
-                }),
+                timestamp: Some(Timestamp { seconds: 1_718_000_000, nanos: 0 }),
                 ..Default::default()
             }),
             transaction_traces: vec![TransactionTrace {
@@ -304,8 +298,8 @@ mod tests {
         Log {
             address: address(pool),
             topics: vec![vec![
-                28, 65, 30, 154, 150, 224, 113, 36, 28, 47, 33, 247, 114, 107, 23, 174, 137,
-                227, 202, 180, 199, 139, 229, 14, 6, 43, 3, 169, 255, 251, 186, 209,
+                28, 65, 30, 154, 150, 224, 113, 36, 28, 47, 33, 247, 114, 107, 23, 174, 137, 227,
+                202, 180, 199, 139, 229, 14, 6, 43, 3, 169, 255, 251, 186, 209,
             ]],
             data: ethabi::encode(&[
                 Token::Uint(U256::from(reserve0)),
@@ -324,10 +318,7 @@ mod tests {
             size: 0,
             header: Some(BlockHeader {
                 parent_hash: vec![0xaa; 32],
-                timestamp: Some(Timestamp {
-                    seconds: 1_718_000_043,
-                    nanos: 0,
-                }),
+                timestamp: Some(Timestamp { seconds: 1_718_000_043, nanos: 0 }),
                 ..Default::default()
             }),
             transaction_traces: vec![TransactionTrace {
@@ -359,7 +350,12 @@ mod tests {
 
         assert_eq!(created.id, "0x4545454545454545454545454545454545454545");
         assert_eq!(created.contracts, vec![vec![0x45; 20]]);
-        assert_eq!(changes.changes[0].contract_changes.len(), 1);
+        assert_eq!(
+            changes.changes[0]
+                .contract_changes
+                .len(),
+            1
+        );
         assert_eq!(changes.changes[0].contract_changes[0].address, vec![0x45; 20]);
     }
 
@@ -371,10 +367,8 @@ mod tests {
         let created_changes = build_pool_created_block_changes(&created_block, &params);
         let created_pool = created_changes.changes[0].component_changes[0].clone();
         let pool_id = created_pool.id.clone();
-        let pool_store = MockPoolStore::new(0).with_pool(
-            StoreKey::Pool.get_unique_pool_key(&pool_id),
-            created_pool,
-        );
+        let pool_store = MockPoolStore::new(0)
+            .with_pool(StoreKey::Pool.get_unique_pool_key(&pool_id), created_pool);
         let follow_up_block = sync_block(0x45, 2_000, 3_000);
 
         let follow_up = build_pool_event_block_changes(
@@ -389,8 +383,18 @@ mod tests {
         );
 
         assert_eq!(follow_up.changes.len(), 1);
-        assert_eq!(follow_up.changes[0].balance_changes.len(), 2);
-        assert_eq!(follow_up.changes[0].entity_changes.len(), 1);
+        assert_eq!(
+            follow_up.changes[0]
+                .balance_changes
+                .len(),
+            2
+        );
+        assert_eq!(
+            follow_up.changes[0]
+                .entity_changes
+                .len(),
+            1
+        );
         assert_eq!(follow_up.changes[0].entity_changes[0].component_id, pool_id);
     }
 }
@@ -421,7 +425,9 @@ fn handle_sync(
                 ComponentKey::new(pool_address_hex.clone(), attribute_name.clone()),
                 Attribute {
                     name: attribute_name,
-                    value: reserve_bytes.clone().to_signed_bytes_be(),
+                    value: reserve_bytes
+                        .clone()
+                        .to_signed_bytes_be(),
                     change: ChangeType::Update.into(),
                 },
             );
@@ -441,7 +447,9 @@ fn handle_sync(
                     ComponentKey::new(pool_address_hex.clone(), token.clone()),
                     BalanceChange {
                         token: token.clone(),
-                        balance: reserves_bytes[index].clone().to_signed_bytes_be(),
+                        balance: reserves_bytes[index]
+                            .clone()
+                            .to_signed_bytes_be(),
                         component_id: pool_address_hex.as_bytes().to_vec(),
                     },
                 );
@@ -458,12 +466,18 @@ fn handle_sync(
 fn parse_bootstrap_pool_tokens(params: &str) -> HashMap<String, PoolMetadata> {
     let mut pool_tokens = HashMap::new();
 
-    for pair in params.split('&').filter(|part| !part.is_empty()) {
+    for pair in params
+        .split('&')
+        .filter(|part| !part.is_empty())
+    {
         let Some(value) = pair.strip_prefix("pool_tokens=") else {
             continue;
         };
 
-        for entry in value.split(',').filter(|entry| !entry.is_empty()) {
+        for entry in value
+            .split(',')
+            .filter(|entry| !entry.is_empty())
+        {
             let mut parts = entry.split(':');
             let (Some(pool), Some(token0), Some(token1), None) =
                 (parts.next(), parts.next(), parts.next(), parts.next())
@@ -499,18 +513,30 @@ fn merge_block(
         tx_entity_changes_map
             .entry(transaction.hash.clone())
             .and_modify(|existing: &mut TransactionChanges| {
-                existing.component_changes.extend(change.component_changes.clone());
-                existing.entity_changes.extend(change.entity_changes.clone());
+                existing
+                    .component_changes
+                    .extend(change.component_changes.clone());
+                existing
+                    .entity_changes
+                    .extend(change.entity_changes.clone());
             })
             .or_insert(change);
     }
 
     for change in tx_entity_changes_map.values_mut() {
-        let tx = change.clone().tx.expect("Transaction not found");
+        let tx = change
+            .clone()
+            .tx
+            .expect("Transaction not found");
 
         if let Some(partial_changes) = tx_changes.remove(&tx.hash) {
-            change.entity_changes = partial_changes.clone().consolidate_entity_changes();
-            change.balance_changes = partial_changes.balance_changes.into_values().collect();
+            change.entity_changes = partial_changes
+                .clone()
+                .consolidate_entity_changes();
+            change.balance_changes = partial_changes
+                .balance_changes
+                .into_values()
+                .collect();
         }
     }
 
@@ -520,7 +546,9 @@ fn merge_block(
             TransactionChanges {
                 tx: Some(partial_changes.transaction.clone()),
                 contract_changes: vec![],
-                entity_changes: partial_changes.clone().consolidate_entity_changes(),
+                entity_changes: partial_changes
+                    .clone()
+                    .consolidate_entity_changes(),
                 balance_changes: partial_changes
                     .balance_changes
                     .clone()
@@ -533,5 +561,7 @@ fn merge_block(
         );
     }
 
-    block_entity_changes.changes = tx_entity_changes_map.into_values().collect();
+    block_entity_changes.changes = tx_entity_changes_map
+        .into_values()
+        .collect();
 }

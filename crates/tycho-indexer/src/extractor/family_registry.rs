@@ -26,11 +26,7 @@ pub const fn shared_bootstrap_member_runtime(
     params_parser: SharedBootstrapParamsParser,
     materialize_branch: crate::extractor::family_runtime::MaterializeBootstrapBranchFn,
 ) -> SharedBootstrapMemberRuntime {
-    SharedBootstrapMemberRuntime {
-        strategy,
-        params_parser,
-        materialize_branch,
-    }
+    SharedBootstrapMemberRuntime { strategy, params_parser, materialize_branch }
 }
 
 pub const fn shared_family_member_spec(
@@ -38,11 +34,14 @@ pub const fn shared_family_member_spec(
     shared_route_protocols: &'static [&'static str],
     shared_bootstrap: Option<SharedBootstrapMemberRuntime>,
 ) -> FamilyMemberSpec {
-    FamilyMemberSpec {
-        protocol_system,
-        shared_route_protocols,
-        shared_bootstrap,
-    }
+    FamilyMemberSpec { protocol_system, shared_route_protocols, shared_bootstrap }
+}
+
+pub const fn canonical_shared_family_member_spec(
+    protocol_system: &'static str,
+    shared_bootstrap: Option<SharedBootstrapMemberRuntime>,
+) -> FamilyMemberSpec {
+    shared_family_member_spec(protocol_system, &[], shared_bootstrap)
 }
 
 pub const fn shared_family_bootstrap_runtime(
@@ -55,28 +54,30 @@ pub const fn shared_family_runtime_spec(
     family_name: &'static str,
     members: &'static [FamilyMemberSpec],
     output_module: &'static str,
+    shared_stream_name: &'static str,
+    durability_scope: &'static str,
     shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
 ) -> FamilyRuntimeSpec {
     FamilyRuntimeSpec {
         family_name,
         members,
         output_module,
+        shared_stream_name,
+        durability_scope,
         shared_bootstrap_runtime,
     }
 }
 
-const UNISWAP_V2_MEMBER: FamilyMemberSpec = shared_family_member_spec(
+const UNISWAP_V2_MEMBER: FamilyMemberSpec = canonical_shared_family_member_spec(
     "uniswap_v2",
-    &["uniswapv2"],
     Some(pool_list_bootstrap_member_runtime(
         BootstrapStrategy::UniswapV2Rpc,
         materialize_uniswap_v2_branch,
     )),
 );
 
-const UNISWAP_V3_MEMBER: FamilyMemberSpec = shared_family_member_spec(
+const UNISWAP_V3_MEMBER: FamilyMemberSpec = canonical_shared_family_member_spec(
     "uniswap_v3",
-    &["uniswapv3"],
     Some(pool_list_bootstrap_member_runtime(
         BootstrapStrategy::UniswapV3Rpc,
         materialize_uniswap_v3_branch,
@@ -89,9 +90,9 @@ const UNISWAP_V2_V3_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
     "uniswap",
     UNISWAP_V2_V3_MEMBERS,
     "map_uniswap_family_protocol_changes",
-    Some(shared_family_bootstrap_runtime(
-        materialize_uniswap_family_plan,
-    )),
+    "uniswap_family",
+    "family::uniswap",
+    Some(shared_family_bootstrap_runtime(materialize_uniswap_family_plan)),
 );
 
 const DEFAULT_FAMILY_RUNTIME_SPECS: &[FamilyRuntimeSpec] = &[UNISWAP_V2_V3_FAMILY];

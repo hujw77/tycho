@@ -1,4 +1,7 @@
-use crate::{core::build_protocol_changes, pb::uniswap::v3::{Events, LiquidityChanges, TickDeltas}};
+use crate::{
+    core::build_protocol_changes,
+    pb::uniswap::v3::{Events, LiquidityChanges, TickDeltas},
+};
 use substreams::pb::substreams::StoreDeltas;
 use substreams_ethereum::pb::eth::v2::{self as eth};
 use tycho_substreams::{models::BlockBalanceDeltas, prelude::*};

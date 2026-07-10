@@ -1766,10 +1766,12 @@ mod test_serial_db {
         };
 
         assert_eq!(saved_states.len(), 2);
-        assert!(saved_states.iter().any(|state| state.name == "vm:test:v2"));
-        assert!(saved_states.iter().any(|state| {
-            state.name == "vm:test" && state.cursor == v1_updated.cursor
-        }));
+        assert!(saved_states
+            .iter()
+            .any(|state| state.name == "vm:test:v2"));
+        assert!(saved_states
+            .iter()
+            .any(|state| { state.name == "vm:test" && state.cursor == v1_updated.cursor }));
     }
 
     #[tokio::test]
@@ -1806,7 +1808,8 @@ mod test_serial_db {
             )
             .await;
             let executor_handle = write_executor.run();
-            let cached_gateway = CachedGateway::new(tx.clone(), connection_pool.clone(), state_gateway);
+            let cached_gateway =
+                CachedGateway::new(tx.clone(), connection_pool.clone(), state_gateway);
             let block = get_sample_block(1);
 
             let state_a = ExtractionState::new(

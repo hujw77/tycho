@@ -17,9 +17,7 @@ use substreams_ethereum::{
 };
 use substreams_helper::{event_handler::EventHandler, hex::Hexable};
 use tycho_substreams::{
-    balances::aggregate_balances_changes,
-    models::BlockBalanceDeltas,
-    prelude::*,
+    balances::aggregate_balances_changes, models::BlockBalanceDeltas, prelude::*,
 };
 
 use crate::{
@@ -225,8 +223,8 @@ pub fn build_protocol_changes(
             let new_value_bigint =
                 BigInt::from_str(&String::from_utf8(store_delta.new_value).unwrap()).unwrap();
 
-            let is_creation = store_delta.old_value.is_empty() ||
-                BigInt::from_str(&String::from_utf8(store_delta.old_value).unwrap())
+            let is_creation = store_delta.old_value.is_empty()
+                || BigInt::from_str(&String::from_utf8(store_delta.old_value).unwrap())
                     .unwrap()
                     .is_zero();
             let attribute = Attribute {
@@ -387,7 +385,12 @@ fn collect_new_pools(
                 BalanceChange {
                     token: event.token0,
                     balance: BigInt::from(0).to_signed_bytes_be(),
-                    component_id: event.pool.clone().to_hex().as_bytes().to_vec(),
+                    component_id: event
+                        .pool
+                        .clone()
+                        .to_hex()
+                        .as_bytes()
+                        .to_vec(),
                 },
                 BalanceChange {
                     token: event.token1,
@@ -418,10 +421,7 @@ fn log_to_event(
             let pool_address = created.pool.to_hex().to_lowercase();
             discovered_pools.insert(
                 pool_address.clone(),
-                PoolMetadata {
-                    token0: created.token0.to_hex(),
-                    token1: created.token1.to_hex(),
-                },
+                PoolMetadata { token0: created.token0.to_hex(), token1: created.token1.to_hex() },
             );
 
             return Some(PoolEvent {
@@ -444,7 +444,11 @@ fn log_to_event(
             token0: Hex(pool.token0).to_string(),
             token1: Hex(pool.token1).to_string(),
         })
-        .or_else(|| discovered_pools.get(&log_address).cloned());
+        .or_else(|| {
+            discovered_pools
+                .get(&log_address)
+                .cloned()
+        });
 
     if !filter.allows_pool_log(&log_address, metadata.is_some()) {
         return None;
@@ -581,7 +585,10 @@ fn log_to_event(
     }
 }
 
-fn event_to_balance_deltas(event: PoolEvent, pools_store: &StoreGetProto<Pool>) -> Vec<BalanceDelta> {
+fn event_to_balance_deltas(
+    event: PoolEvent,
+    pools_store: &StoreGetProto<Pool>,
+) -> Vec<BalanceDelta> {
     let address = event.pool_address.as_bytes().to_vec();
     let pool = match pools_store.get_last(format!("Pool:{}", event.pool_address)) {
         Some(pool) => pool,
@@ -809,7 +816,11 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
     match event.r#type.as_ref().unwrap() {
         pool_event::Type::Initialize(initialize) => vec![
             (
-                event.transaction.as_ref().unwrap().into(),
+                event
+                    .transaction
+                    .as_ref()
+                    .unwrap()
+                    .into(),
                 decode_prefixed_hex(&event.pool_address),
                 Attribute {
                     name: "sqrt_price_x96".to_string(),
@@ -831,7 +842,11 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
         ],
         pool_event::Type::Swap(swap) => vec![
             (
-                event.transaction.as_ref().unwrap().into(),
+                event
+                    .transaction
+                    .as_ref()
+                    .unwrap()
+                    .into(),
                 decode_prefixed_hex(&event.pool_address),
                 Attribute {
                     name: "sqrt_price_x96".to_string(),
@@ -853,7 +868,11 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
         ],
         pool_event::Type::SetFeeProtocol(set_fee_protocol) => vec![
             (
-                event.transaction.as_ref().unwrap().into(),
+                event
+                    .transaction
+                    .as_ref()
+                    .unwrap()
+                    .into(),
                 decode_prefixed_hex(&event.pool_address),
                 Attribute {
                     name: "protocol_fees/token0".to_string(),
@@ -879,7 +898,10 @@ fn parse_event_filter(params: &str) -> EventFilter {
     let mut factory_address = None;
     let mut allowed_pools = HashSet::new();
 
-    for part in params.split('&').filter(|part| !part.is_empty()) {
+    for part in params
+        .split('&')
+        .filter(|part| !part.is_empty())
+    {
         if let Some(address) = part.strip_prefix("factory=") {
             factory_address = Some(address.to_lowercase());
             continue;
@@ -891,7 +913,10 @@ fn parse_event_filter(params: &str) -> EventFilter {
         }
 
         if let Some(pools) = part.strip_prefix("pools=") {
-            for pool in pools.split(',').filter(|pool| !pool.is_empty()) {
+            for pool in pools
+                .split(',')
+                .filter(|pool| !pool.is_empty())
+            {
                 allowed_pools.insert(pool.to_lowercase());
             }
         }
@@ -928,7 +953,9 @@ fn pop_matching_store_delta(
     indexed_store_deltas
         .get_mut(&(key.to_string(), ordinal))
         .and_then(|queue| queue.pop_front())
-        .unwrap_or_else(|| panic!("Missing matching store delta for key `{}` at ordinal {}", key, ordinal))
+        .unwrap_or_else(|| {
+            panic!("Missing matching store delta for key `{}` at ordinal {}", key, ordinal)
+        })
 }
 
 fn assert_all_store_deltas_consumed(
@@ -936,7 +963,11 @@ fn assert_all_store_deltas_consumed(
 ) {
     let leftovers = indexed_store_deltas
         .into_iter()
-        .filter_map(|((key, ordinal), mut queue)| queue.pop_front().map(|_| (key, ordinal)))
+        .filter_map(|((key, ordinal), mut queue)| {
+            queue
+                .pop_front()
+                .map(|_| (key, ordinal))
+        })
         .collect::<Vec<_>>();
 
     if !leftovers.is_empty() {
@@ -946,7 +977,10 @@ fn assert_all_store_deltas_consumed(
 
 impl EventFilter {
     fn allows_pool(&self, pool_address: &str) -> bool {
-        self.allowed_pools.is_empty() || self.allowed_pools.contains(&pool_address.to_lowercase())
+        self.allowed_pools.is_empty()
+            || self
+                .allowed_pools
+                .contains(&pool_address.to_lowercase())
     }
 
     fn allows_pool_log(&self, pool_address: &str, is_known_pool: bool) -> bool {
@@ -965,18 +999,19 @@ impl PoolEvent {
 
 #[cfg(test)]
 mod tests {
-    use ethabi::{ethereum_types::{Address, U256}, Token};
+    use ethabi::{
+        ethereum_types::{Address, U256},
+        Token,
+    };
     use prost_types::Timestamp;
     use substreams::pb::substreams::StoreDeltas;
     use substreams_ethereum::pb::eth::v2::{
-        block::DetailLevel, Block, BlockHeader, Log, TransactionReceipt, TransactionTrace,
-        transaction_trace::Type as TransactionType, TransactionTraceStatus,
+        block::DetailLevel, transaction_trace::Type as TransactionType, Block, BlockHeader, Log,
+        TransactionReceipt, TransactionTrace, TransactionTraceStatus,
     };
     use tycho_substreams::models::BlockBalanceDeltas;
 
-    use crate::{
-        pb::uniswap::v3::{Events, LiquidityChanges, TickDeltas},
-    };
+    use crate::pb::uniswap::v3::{Events, LiquidityChanges, TickDeltas};
 
     use super::{
         build_pool_created_block_entity_changes, build_protocol_changes, parse_event_filter,
@@ -997,9 +1032,15 @@ mod tests {
         );
 
         assert_eq!(filter.factory_address, "0x1f98431c8ad98523631ae4a59f267346ea31f984");
-        assert!(filter.allowed_pools.contains("0xe0554a476a092703abdb3ef35c80e0d76d32939f"));
-        assert!(filter.allowed_pools.contains("0x1111111111111111111111111111111111111111"));
-        assert!(filter.allowed_pools.contains("0x2222222222222222222222222222222222222222"));
+        assert!(filter
+            .allowed_pools
+            .contains("0xe0554a476a092703abdb3ef35c80e0d76d32939f"));
+        assert!(filter
+            .allowed_pools
+            .contains("0x1111111111111111111111111111111111111111"));
+        assert!(filter
+            .allowed_pools
+            .contains("0x2222222222222222222222222222222222222222"));
         assert!(!filter.allows_pool("0x3333333333333333333333333333333333333333"));
     }
 
@@ -1010,14 +1051,8 @@ mod tests {
         );
 
         assert!(!filter.allows_pool("0x2222222222222222222222222222222222222222"));
-        assert!(filter.allows_pool_log(
-            "0x2222222222222222222222222222222222222222",
-            true
-        ));
-        assert!(!filter.allows_pool_log(
-            "0x2222222222222222222222222222222222222222",
-            false
-        ));
+        assert!(filter.allows_pool_log("0x2222222222222222222222222222222222222222", true));
+        assert!(!filter.allows_pool_log("0x2222222222222222222222222222222222222222", false));
     }
 
     fn address(byte: u8) -> Vec<u8> {
@@ -1032,7 +1067,14 @@ mod tests {
         ethabi::encode(&[Token::Uint(U256::from(value))])
     }
 
-    fn pool_created_log(factory: u8, token0: u8, token1: u8, fee: u32, tick_spacing: i32, pool: u8) -> Log {
+    fn pool_created_log(
+        factory: u8,
+        token0: u8,
+        token1: u8,
+        fee: u32,
+        tick_spacing: i32,
+        pool: u8,
+    ) -> Log {
         let data = ethabi::encode(&[
             Token::Int(tick_spacing.into()),
             Token::Address(Address::from_slice(&address(pool))),
@@ -1070,10 +1112,7 @@ mod tests {
             size: 0,
             header: Some(BlockHeader {
                 parent_hash: vec![0xbb; 32],
-                timestamp: Some(Timestamp {
-                    seconds: 1_718_000_000,
-                    nanos: 0,
-                }),
+                timestamp: Some(Timestamp { seconds: 1_718_000_000, nanos: 0 }),
                 ..Default::default()
             }),
             transaction_traces: vec![TransactionTrace {
@@ -1083,14 +1122,7 @@ mod tests {
                 to: address(factory),
                 status: TransactionTraceStatus::Succeeded as i32,
                 receipt: Some(TransactionReceipt {
-                    logs: vec![pool_created_log(
-                        factory,
-                        token0,
-                        token1,
-                        fee,
-                        tick_spacing,
-                        pool,
-                    )],
+                    logs: vec![pool_created_log(factory, token0, token1, fee, tick_spacing, pool)],
                     ..Default::default()
                 }),
                 r#type: TransactionType::TrxTypeLegacy as i32,
@@ -1124,13 +1156,8 @@ mod tests {
         let protocol_changes = build_protocol_changes(
             block,
             created_pools,
-            Events {
-                block: None,
-                pool_events: vec![],
-            },
-            BlockBalanceDeltas {
-                balance_deltas: vec![],
-            },
+            Events { block: None, pool_events: vec![] },
+            BlockBalanceDeltas { balance_deltas: vec![] },
             StoreDeltas { deltas: vec![] },
             TickDeltas { deltas: vec![] },
             StoreDeltas { deltas: vec![] },
@@ -1139,10 +1166,12 @@ mod tests {
         );
 
         assert_eq!(protocol_changes.changes.len(), 1);
-        assert_eq!(protocol_changes.changes[0].contract_changes.len(), 1);
         assert_eq!(
-            protocol_changes.changes[0].contract_changes[0].address,
-            vec![0x45; 20]
+            protocol_changes.changes[0]
+                .contract_changes
+                .len(),
+            1
         );
+        assert_eq!(protocol_changes.changes[0].contract_changes[0].address, vec![0x45; 20]);
     }
 }

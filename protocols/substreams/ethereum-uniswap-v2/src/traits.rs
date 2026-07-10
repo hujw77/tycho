@@ -1,6 +1,6 @@
 use ethabi::ethereum_types::Address;
-use substreams::store::StoreGet;
 use std::collections::HashSet;
+use substreams::store::StoreGet;
 
 use substreams_helper::{common::HasAddresser, hex::Hexable};
 

@@ -1,13 +1,19 @@
 use std::collections::{HashMap, HashSet};
 
 use tycho_common::{
-    models::{blockchain::{TracedEntryPoint, TxWithChanges}, Chain},
+    models::{
+        blockchain::{TracedEntryPoint, TxWithChanges},
+        Chain,
+    },
     Bytes,
 };
 use tycho_ethereum::rpc::EthereumRpcClient;
 
 use crate::extractor::{
-    family_runtime::{default_family_runtime_registry, FamilyRuntimeRegistry},
+    family_runtime::{
+        default_family_runtime_registry, FamilyRuntimeRegistry,
+        ResolvedSharedBootstrapBranchRuntime,
+    },
     models::{BlockChanges, TxWithContractChanges},
     runner::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
     ExtractionError,
@@ -25,7 +31,10 @@ pub fn parse_pool_list_bootstrap_params(
     let mut bootstrap_block = None;
     let mut pools = Vec::new();
 
-    for pair in params.split('&').filter(|part| !part.is_empty()) {
+    for pair in params
+        .split('&')
+        .filter(|part| !part.is_empty())
+    {
         let Some((key, value)) = pair.split_once('=') else {
             return Err(ExtractionError::Setup(format!("invalid bootstrap param `{pair}`")));
         };
@@ -38,7 +47,10 @@ pub fn parse_pool_list_bootstrap_params(
             }
             "pool" => pools.push(Bytes::from(value)),
             "pools" => {
-                for pool in value.split(',').filter(|pool| !pool.is_empty()) {
+                for pool in value
+                    .split(',')
+                    .filter(|pool| !pool.is_empty())
+                {
                     pools.push(Bytes::from(pool));
                 }
             }
@@ -153,7 +165,9 @@ pub async fn materialize_branch_block_with_registry(
     branch: &BootstrapBranchDescriptor,
     registry: FamilyRuntimeRegistry<'_>,
 ) -> Result<BlockChanges, ExtractionError> {
-    registry.materialize_shared_bootstrap_branch(rpc, branch)?.await
+    registry
+        .materialize_shared_bootstrap_branch(rpc, branch)?
+        .await
 }
 
 pub async fn materialize_plan_block(
@@ -189,30 +203,24 @@ pub async fn materialize_plan_block_with_registry(
     })
 }
 
-pub(crate) async fn materialize_plan_by_registered_branches(
+pub(crate) async fn materialize_plan_by_branch_runtimes(
     rpc: &EthereumRpcClient,
     plan: &SharedBootstrapPlan,
-    registry: FamilyRuntimeRegistry<'_>,
+    branch_runtimes: &[ResolvedSharedBootstrapBranchRuntime],
 ) -> Result<BlockChanges, ExtractionError> {
-    let family_name = plan.family_name.as_deref().ok_or_else(|| {
-        ExtractionError::Setup(
-            "shared family bootstrap plan is missing family identity during materialization"
-                .to_string(),
-        )
-    })?;
     let mut merged = None;
 
     for branch in &plan.branches {
-        let member = registry.require_shared_bootstrap_member_for_family(
-            family_name,
-            &branch.protocol_system,
-            "shared bootstrap plan for family",
-        )?;
-        let materialize = member
-            .shared_bootstrap
-            .expect("validated shared bootstrap member must have runtime")
-            .materialize_branch;
-        let branch_changes = materialize(rpc, branch).await?;
+        let runtime = branch_runtimes
+            .iter()
+            .find(|runtime| runtime.protocol_system == branch.protocol_system)
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
+                    "shared bootstrap plan is missing materializer for protocol system `{}`",
+                    branch.protocol_system
+                ))
+            })?;
+        let branch_changes = (runtime.materialize_branch)(rpc, branch).await?;
         merged = Some(match merged {
             Some(existing) => merge_family_block_changes(existing, branch_changes)?,
             None => branch_changes,
@@ -239,7 +247,8 @@ pub fn split_plan_block_by_protocol_system(
         collect_block_protocol_ownership(&block_changes.txs_with_update)?;
 
     let mut txs_by_system: HashMap<String, Vec<TxWithChanges>> = HashMap::new();
-    let mut contract_changes_by_system: HashMap<String, Vec<TxWithContractChanges>> = HashMap::new();
+    let mut contract_changes_by_system: HashMap<String, Vec<TxWithContractChanges>> =
+        HashMap::new();
     let mut trace_results_by_system: HashMap<String, Vec<TracedEntryPoint>> = HashMap::new();
     let mut tokens_by_system: HashMap<String, HashSet<Bytes>> = HashMap::new();
 
@@ -296,7 +305,9 @@ pub fn split_plan_block_by_protocol_system(
 
     let mut split_blocks = HashMap::new();
     for protocol_system in protocol_systems {
-        let mut txs_with_update = txs_by_system.remove(&protocol_system).unwrap_or_default();
+        let mut txs_with_update = txs_by_system
+            .remove(&protocol_system)
+            .unwrap_or_default();
         txs_with_update.sort_by_key(|tx| tx.tx.index);
         let mut block_contract_changes = contract_changes_by_system
             .remove(&protocol_system)
@@ -332,11 +343,7 @@ pub fn split_plan_block_by_protocol_system(
 fn collect_block_protocol_ownership(
     txs_with_update: &[TxWithChanges],
 ) -> Result<
-    (
-        HashMap<String, String>,
-        HashMap<Bytes, String>,
-        HashMap<String, String>,
-    ),
+    (HashMap<String, String>, HashMap<Bytes, String>, HashMap<String, String>),
     ExtractionError,
 > {
     let mut component_to_system = HashMap::new();
@@ -422,7 +429,10 @@ fn resolve_trace_result_protocol_system(
     account_to_system: &HashMap<Bytes, String>,
     entrypoint_to_system: &HashMap<String, String>,
 ) -> Result<String, ExtractionError> {
-    let target_account = &traced_entrypoint.entry_point_with_params.entry_point.target;
+    let target_account = &traced_entrypoint
+        .entry_point_with_params
+        .entry_point
+        .target;
     if let Some(protocol_system) = account_to_system.get(target_account) {
         return Ok(protocol_system.clone());
     }
@@ -503,11 +513,14 @@ fn split_tx_with_changes_by_protocol_system(
     }
 
     for (account, delta) in tx_with_changes.account_deltas {
-        let protocol_system = account_to_system.get(&account).cloned().ok_or_else(|| {
-            ExtractionError::Setup(format!(
+        let protocol_system = account_to_system
+            .get(&account)
+            .cloned()
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
                 "shared bootstrap splitter could not resolve account delta account `{account:#x}`"
             ))
-        })?;
+            })?;
         split
             .entry(protocol_system)
             .or_insert_with(|| TxWithChanges {
@@ -519,11 +532,14 @@ fn split_tx_with_changes_by_protocol_system(
     }
 
     for (account, balances) in tx_with_changes.account_balance_changes {
-        let protocol_system = account_to_system.get(&account).cloned().ok_or_else(|| {
-            ExtractionError::Setup(format!(
+        let protocol_system = account_to_system
+            .get(&account)
+            .cloned()
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
                 "shared bootstrap splitter could not resolve account balance account `{account:#x}`"
             ))
-        })?;
+            })?;
         split
             .entry(protocol_system)
             .or_insert_with(|| TxWithChanges {
@@ -679,8 +695,8 @@ mod tests {
     use tycho_common::{
         models::{
             blockchain::{
-                Block, EntryPoint, EntryPointWithTracingParams, RPCTracerParams,
-                TracedEntryPoint, TracingParams, TracingResult, Transaction, TxWithChanges,
+                Block, EntryPoint, EntryPointWithTracingParams, RPCTracerParams, TracedEntryPoint,
+                TracingParams, TracingResult, Transaction, TxWithChanges,
             },
             contract::{AccountBalance, AccountDelta, ContractChanges},
             protocol::{ComponentBalance, ProtocolComponent, ProtocolComponentStateDelta},
@@ -693,8 +709,7 @@ mod tests {
 
     use crate::extractor::{
         family_registry::{
-            shared_bootstrap_member_runtime, shared_family_member_spec,
-            shared_family_runtime_spec,
+            shared_bootstrap_member_runtime, shared_family_member_spec, shared_family_runtime_spec,
         },
         family_runtime::{
             default_family_runtime_registry, FamilyMemberSpec, FamilyRuntimeRegistry,
@@ -706,8 +721,8 @@ mod tests {
     };
 
     use super::{
-        merge_family_block_changes, split_plan_block_by_protocol_system,
-        BootstrapBranchDescriptor, SharedBootstrapPlan, SharedBootstrapParams,
+        merge_family_block_changes, split_plan_block_by_protocol_system, BootstrapBranchDescriptor,
+        SharedBootstrapParams, SharedBootstrapPlan,
     };
 
     fn test_extractor_config() -> ExtractorConfig {
@@ -903,9 +918,9 @@ mod tests {
         )
         .with_protocol_system("uniswap_v2")
         .with_family_runtime(Some(crate::extractor::runner::FamilyRuntimeConfig {
-                family: "uniswap".to_string(),
-                ..Default::default()
-            }));
+            family: "uniswap".to_string(),
+            ..Default::default()
+        }));
         let future_config = ExtractorConfig::new(
             "future_v1".to_owned(),
             Chain::Ethereum,
@@ -925,9 +940,9 @@ mod tests {
         )
         .with_protocol_system("future_v1")
         .with_family_runtime(Some(crate::extractor::runner::FamilyRuntimeConfig {
-                family: "future_swap".to_string(),
-                ..Default::default()
-            }));
+            family: "future_swap".to_string(),
+            ..Default::default()
+        }));
         let v2_bootstrap = BootstrapConfig {
             strategy: BootstrapStrategy::UniswapV2Rpc,
             start_block: 42,
@@ -1071,6 +1086,8 @@ mod tests {
                 )),
             )],
             "map_future_swap_family_protocol_changes",
+            "future_swap_family",
+            "family::future_swap",
             None,
         );
         let registry = test_registry_with_future_family(FUTURE_FAMILY);
@@ -1126,6 +1143,8 @@ mod tests {
                 shared_bootstrap: None,
             }],
             output_module: "map_future_swap_family_protocol_changes",
+            shared_stream_name: "future_swap_family",
+            durability_scope: "family::future_swap",
             shared_bootstrap_runtime: None,
         };
         let registry = FamilyRuntimeRegistry::new(&[INVALID_FUTURE_FAMILY]);
@@ -1169,10 +1188,7 @@ mod tests {
             .split("pool=")
             .nth(1)
             .ok_or_else(|| ExtractionError::Setup("missing pool".to_string()))?;
-        Ok(SharedBootstrapParams {
-            bootstrap_block: 99,
-            pools: vec![Bytes::from(pool)],
-        })
+        Ok(SharedBootstrapParams { bootstrap_block: 99, pools: vec![Bytes::from(pool)] })
     }
 
     fn materialize_future_branch<'a>(
@@ -1191,7 +1207,9 @@ mod tests {
     fn test_registry_with_future_family(
         future_family: FamilyRuntimeSpec,
     ) -> FamilyRuntimeRegistry<'static> {
-        let mut specs = default_family_runtime_registry().specs().to_vec();
+        let mut specs = default_family_runtime_registry()
+            .specs()
+            .to_vec();
         specs.push(future_family);
         FamilyRuntimeRegistry::new(Box::leak(specs.into_boxed_slice()))
     }
@@ -1221,6 +1239,8 @@ mod tests {
                 ),
             ],
             "map_future_swap_family_protocol_changes",
+            "future_swap_family",
+            "family::future_swap",
             None,
         );
         let registry = test_registry_with_future_family(FUTURE_FAMILY);
@@ -1634,8 +1654,18 @@ mod tests {
         );
         assert_eq!(split["uniswap_v2"].new_tokens.len(), 1);
         assert_eq!(split["uniswap_v3"].new_tokens.len(), 1);
-        assert_eq!(split["uniswap_v2"].block_contract_changes.len(), 1);
-        assert_eq!(split["uniswap_v3"].block_contract_changes.len(), 1);
+        assert_eq!(
+            split["uniswap_v2"]
+                .block_contract_changes
+                .len(),
+            1
+        );
+        assert_eq!(
+            split["uniswap_v3"]
+                .block_contract_changes
+                .len(),
+            1
+        );
         assert_eq!(
             split["uniswap_v2"].block_contract_changes[0]
                 .contract_changes
@@ -1644,11 +1674,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![v2_contract.clone()]
         );
+        assert_eq!(split["uniswap_v3"].trace_results[0].entry_point_id(), v3_entrypoint_id);
         assert_eq!(
-            split["uniswap_v3"].trace_results[0].entry_point_id(),
-            v3_entrypoint_id
+            split["uniswap_v2"].txs_with_update[0]
+                .account_deltas
+                .len(),
+            1
         );
-        assert_eq!(split["uniswap_v2"].txs_with_update[0].account_deltas.len(), 1);
         assert_eq!(
             split["uniswap_v2"].txs_with_update[0]
                 .account_deltas
@@ -1665,9 +1697,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![v3_contract.clone()]
         );
-        assert_eq!(
-            split["uniswap_v2"].trace_results[0].entry_point_id(),
-            v2_entrypoint_id
-        );
+        assert_eq!(split["uniswap_v2"].trace_results[0].entry_point_id(), v2_entrypoint_id);
     }
 }

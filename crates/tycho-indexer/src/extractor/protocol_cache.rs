@@ -632,13 +632,7 @@ mod tests {
             .await;
 
         assert_eq!(contract_systems.len(), 2);
-        assert_eq!(
-            contract_systems.get(&Bytes::from(vec![0x11; 20])),
-            Some(&"sys1".to_string())
-        );
-        assert_eq!(
-            contract_systems.get(&Bytes::from(vec![0x22; 20])),
-            Some(&"sys2".to_string())
-        );
+        assert_eq!(contract_systems.get(&Bytes::from(vec![0x11; 20])), Some(&"sys1".to_string()));
+        assert_eq!(contract_systems.get(&Bytes::from(vec![0x22; 20])), Some(&"sys2".to_string()));
     }
 }

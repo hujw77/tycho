@@ -11,10 +11,5 @@ pub fn map_pool_events(
     block_entity_changes: BlockChanges,
     pools_store: StoreGetProto<ProtocolComponent>,
 ) -> Result<BlockChanges, substreams::errors::Error> {
-    Ok(build_pool_event_block_changes(
-        &params,
-        &block,
-        block_entity_changes,
-        &pools_store,
-    ))
+    Ok(build_pool_event_block_changes(&params, &block, block_entity_changes, &pools_store))
 }

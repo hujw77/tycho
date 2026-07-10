@@ -85,8 +85,8 @@ impl<'a> EventHandler<'a> {
         // Here we don't need to filter out failed transactions because logs only exist for
         // successful ones.
         for log in self.block.logs() {
-            if self.addresses.is_some() &&
-                !&self
+            if self.addresses.is_some()
+                && !&self
                     .addresses
                     .as_ref()
                     .unwrap()

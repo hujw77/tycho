@@ -43,7 +43,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-retry = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
-tonic = { version = "0.9", features = ["tls-roots", "gzip"] }
+tonic = { version = "0.9", features = ["tls-webpki-roots", "gzip"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.17", default-features = false, features = [
     "env-filter",

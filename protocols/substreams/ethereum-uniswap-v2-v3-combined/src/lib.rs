@@ -10,14 +10,17 @@ use ethereum_uniswap_v2::core::{
 use ethereum_uniswap_v3_logs_only::{
     core::{
         build_balance_deltas as build_v3_balance_deltas,
-        build_pool_created_block_entity_changes as build_v3_pool_created_block_entity_changes,
         build_liquidity_changes as build_v3_liquidity_changes,
+        build_pool_created_block_entity_changes as build_v3_pool_created_block_entity_changes,
         build_pool_events as build_v3_pool_events,
         build_protocol_changes as build_v3_protocol_changes,
         build_tick_deltas as build_v3_tick_deltas,
         collect_current_tick_updates as collect_v3_current_tick_updates,
     },
-    pb::uniswap::v3::{Events as V3Events, LiquidityChanges as V3LiquidityChanges, Pool as V3Pool, TickDeltas as V3TickDeltas},
+    pb::uniswap::v3::{
+        Events as V3Events, LiquidityChanges as V3LiquidityChanges, Pool as V3Pool,
+        TickDeltas as V3TickDeltas,
+    },
 };
 use substreams::store::{
     StoreAdd, StoreAddBigInt, StoreGet, StoreGetInt64, StoreGetProto, StoreNew, StoreSet,
@@ -94,12 +97,7 @@ pub fn run_v2_map_pool_events<S>(
 where
     S: StoreGet<ProtocolComponent>,
 {
-    Ok(build_v2_pool_event_block_changes(
-        &params,
-        &block,
-        block_entity_changes,
-        pools_store,
-    ))
+    Ok(build_v2_pool_event_block_changes(&params, &block, block_entity_changes, pools_store))
 }
 
 #[substreams::handlers::map]
@@ -111,10 +109,7 @@ pub fn v3_map_pools_created(
 }
 
 #[substreams::handlers::store]
-pub fn v3_store_pools(
-    pools_created: BlockEntityChanges,
-    store: StoreSetIfNotExistsProto<V3Pool>,
-) {
+pub fn v3_store_pools(pools_created: BlockEntityChanges, store: StoreSetIfNotExistsProto<V3Pool>) {
     for change in pools_created.changes {
         for component_change in &change.component_changes {
             let pool_address = &component_change.id;
@@ -257,14 +252,9 @@ pub fn build_uniswap_family_protocol_changes(
     merge_block_changes([v2_changes, v3_changes])
 }
 
-pub fn build_uniswap_family_protocol_changes_from_v2(
-    v2_changes: BlockChanges,
-) -> BlockChanges {
-    let empty_v3 = BlockChanges {
-        block: v2_changes.block.clone(),
-        changes: vec![],
-        storage_changes: vec![],
-    };
+pub fn build_uniswap_family_protocol_changes_from_v2(v2_changes: BlockChanges) -> BlockChanges {
+    let empty_v3 =
+        BlockChanges { block: v2_changes.block.clone(), changes: vec![], storage_changes: vec![] };
     build_uniswap_family_protocol_changes(v2_changes, empty_v3)
 }
 
@@ -273,17 +263,12 @@ pub fn build_uniswap_family_protocol_changes_from_v3_created_pools(
     block: eth::Block,
 ) -> BlockChanges {
     let created_pools = build_v3_pool_created_block_entity_changes(params, &block);
-    let events = V3Events {
-        block: None,
-        pool_events: vec![],
-    };
+    let events = V3Events { block: None, pool_events: vec![] };
     let protocol_changes = build_v3_protocol_changes(
         block,
         created_pools,
         events,
-        BlockBalanceDeltas {
-            balance_deltas: vec![],
-        },
+        BlockBalanceDeltas { balance_deltas: vec![] },
         substreams::pb::substreams::StoreDeltas { deltas: vec![] },
         V3TickDeltas { deltas: vec![] },
         substreams::pb::substreams::StoreDeltas { deltas: vec![] },
@@ -303,11 +288,8 @@ pub fn build_uniswap_family_protocol_changes_from_v3_created_pools(
 pub fn build_uniswap_family_protocol_changes_from_v3_protocol_changes(
     v3_changes: BlockChanges,
 ) -> BlockChanges {
-    let empty_v2 = BlockChanges {
-        block: v3_changes.block.clone(),
-        changes: vec![],
-        storage_changes: vec![],
-    };
+    let empty_v2 =
+        BlockChanges { block: v3_changes.block.clone(), changes: vec![], storage_changes: vec![] };
     build_uniswap_family_protocol_changes(empty_v2, v3_changes)
 }
 
@@ -354,11 +336,7 @@ fn merge_block_changes(block_changes: impl IntoIterator<Item = BlockChanges>) ->
             .unwrap_or(u64::MAX)
     });
 
-    BlockChanges {
-        block: merged_block,
-        changes,
-        storage_changes: merged_storage_changes,
-    }
+    BlockChanges { block: merged_block, changes, storage_changes: merged_storage_changes }
 }
 
 fn merge_transaction_changes(existing: &mut TransactionChanges, incoming: &TransactionChanges) {
@@ -386,13 +364,16 @@ fn merge_transaction_changes(existing: &mut TransactionChanges, incoming: &Trans
 mod tests {
     use std::collections::HashMap;
 
-    use ethabi::{ethereum_types::{Address, U256}, Token as AbiToken};
+    use ethabi::{
+        ethereum_types::{Address, U256},
+        Token as AbiToken,
+    };
     use prost_types::Timestamp;
     use substreams::store::StoreGet;
     use substreams_ethereum::pb::eth::v2::{
-        block::DetailLevel, Block as EthBlock, BlockHeader as EthBlockHeader, Log as EthLog,
-        TransactionReceipt as EthTransactionReceipt, TransactionTrace as EthTransactionTrace,
-        transaction_trace::Type as EthTransactionType, TransactionTraceStatus,
+        block::DetailLevel, transaction_trace::Type as EthTransactionType, Block as EthBlock,
+        BlockHeader as EthBlockHeader, Log as EthLog, TransactionReceipt as EthTransactionReceipt,
+        TransactionTrace as EthTransactionTrace, TransactionTraceStatus,
     };
 
     use super::*;
@@ -440,21 +421,11 @@ mod tests {
     }
 
     fn test_block() -> Block {
-        Block {
-            number: 42,
-            hash: vec![0x01; 32],
-            parent_hash: vec![0x02; 32],
-            ts: 1_718_000_000,
-        }
+        Block { number: 42, hash: vec![0x01; 32], parent_hash: vec![0x02; 32], ts: 1_718_000_000 }
     }
 
     fn test_tx(hash: &[u8], index: u64) -> Transaction {
-        Transaction {
-            hash: hash.to_vec(),
-            from: vec![0x11; 20],
-            to: vec![0x22; 20],
-            index,
-        }
+        Transaction { hash: hash.to_vec(), from: vec![0x11; 20], to: vec![0x22; 20], index }
     }
 
     fn test_component(id: &str, protocol_type_name: &str, contract: Vec<u8>) -> ProtocolComponent {
@@ -489,8 +460,8 @@ mod tests {
             address: address(factory),
             topics: vec![
                 vec![
-                    13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217,
-                    211, 21, 240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
+                    13, 54, 72, 189, 15, 107, 168, 1, 52, 163, 59, 169, 39, 90, 197, 133, 217, 211,
+                    21, 240, 173, 131, 85, 205, 222, 253, 227, 26, 250, 40, 208, 233,
                 ],
                 topic_address(token0),
                 topic_address(token1),
@@ -507,10 +478,7 @@ mod tests {
             size: 0,
             header: Some(EthBlockHeader {
                 parent_hash: vec![0xbb; 32],
-                timestamp: Some(Timestamp {
-                    seconds: 1_718_000_043,
-                    nanos: 0,
-                }),
+                timestamp: Some(Timestamp { seconds: 1_718_000_043, nanos: 0 }),
                 ..Default::default()
             }),
             transaction_traces: vec![EthTransactionTrace {
@@ -519,10 +487,7 @@ mod tests {
                 from: vec![0x11; 20],
                 to: address(factory),
                 status: TransactionTraceStatus::Succeeded as i32,
-                receipt: Some(EthTransactionReceipt {
-                    logs: vec![log],
-                    ..Default::default()
-                }),
+                receipt: Some(EthTransactionReceipt { logs: vec![log], ..Default::default() }),
                 r#type: EthTransactionType::TrxTypeLegacy as i32,
                 ..Default::default()
             }],
@@ -535,8 +500,8 @@ mod tests {
         let log = EthLog {
             address: address(pool),
             topics: vec![vec![
-                28, 65, 30, 154, 150, 224, 113, 36, 28, 47, 33, 247, 114, 107, 23, 174, 137,
-                227, 202, 180, 199, 139, 229, 14, 6, 43, 3, 169, 255, 251, 186, 209,
+                28, 65, 30, 154, 150, 224, 113, 36, 28, 47, 33, 247, 114, 107, 23, 174, 137, 227,
+                202, 180, 199, 139, 229, 14, 6, 43, 3, 169, 255, 251, 186, 209,
             ]],
             data: ethabi::encode(&[
                 AbiToken::Uint(U256::from(reserve0)),
@@ -553,10 +518,7 @@ mod tests {
             size: 0,
             header: Some(EthBlockHeader {
                 parent_hash: vec![0xaa; 32],
-                timestamp: Some(Timestamp {
-                    seconds: 1_718_000_044,
-                    nanos: 0,
-                }),
+                timestamp: Some(Timestamp { seconds: 1_718_000_044, nanos: 0 }),
                 ..Default::default()
             }),
             transaction_traces: vec![EthTransactionTrace {
@@ -565,10 +527,7 @@ mod tests {
                 from: vec![0x22; 20],
                 to: address(pool),
                 status: TransactionTraceStatus::Succeeded as i32,
-                receipt: Some(EthTransactionReceipt {
-                    logs: vec![log],
-                    ..Default::default()
-                }),
+                receipt: Some(EthTransactionReceipt { logs: vec![log], ..Default::default() }),
                 r#type: EthTransactionType::TrxTypeLegacy as i32,
                 ..Default::default()
             }],
@@ -611,8 +570,19 @@ mod tests {
         let merged = merge_block_changes([v2_changes, v3_changes]);
 
         assert_eq!(merged.changes.len(), 1);
-        assert_eq!(merged.block.as_ref().map(|block| block.number), Some(42));
-        assert_eq!(merged.changes[0].component_changes.len(), 2);
+        assert_eq!(
+            merged
+                .block
+                .as_ref()
+                .map(|block| block.number),
+            Some(42)
+        );
+        assert_eq!(
+            merged.changes[0]
+                .component_changes
+                .len(),
+            2
+        );
         assert_eq!(
             merged.changes[0].component_changes[0]
                 .protocol_type
@@ -754,7 +724,10 @@ mod tests {
         };
 
         let merged = merge_block_changes([v2_changes, v3_changes]);
-        let tx_changes = merged.changes.first().expect("one merged tx");
+        let tx_changes = merged
+            .changes
+            .first()
+            .expect("one merged tx");
 
         assert_eq!(merged.changes.len(), 1);
         assert_eq!(tx_changes.component_changes.len(), 2);
@@ -777,10 +750,7 @@ mod tests {
         );
         let created_pool = created_changes.changes[0].component_changes[0].clone();
         let pool_id = created_pool.id.clone();
-        let pool_store = MockPoolStore::new(0).with_pool(
-            format!("Pool:{pool_id}"),
-            created_pool,
-        );
+        let pool_store = MockPoolStore::new(0).with_pool(format!("Pool:{pool_id}"), created_pool);
 
         let follow_up_block = v2_sync_block(0x45, 2_000, 3_000);
         let follow_up_changes = build_family_v2_pool_event_block_changes(
@@ -796,8 +766,18 @@ mod tests {
         let family_follow_up = build_uniswap_family_protocol_changes_from_v2(follow_up_changes);
 
         assert_eq!(family_follow_up.changes.len(), 1);
-        assert_eq!(family_follow_up.changes[0].entity_changes.len(), 1);
-        assert_eq!(family_follow_up.changes[0].balance_changes.len(), 2);
+        assert_eq!(
+            family_follow_up.changes[0]
+                .entity_changes
+                .len(),
+            1
+        );
+        assert_eq!(
+            family_follow_up.changes[0]
+                .balance_changes
+                .len(),
+            2
+        );
         assert_eq!(family_follow_up.changes[0].entity_changes[0].component_id, pool_id);
     }
 }

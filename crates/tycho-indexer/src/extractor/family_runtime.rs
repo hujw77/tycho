@@ -1,17 +1,23 @@
-use std::{collections::{HashMap, HashSet}, future::Future, pin::Pin};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+};
 
-use tycho_common::models::Chain;
+use serde::Serialize;
+use tycho_common::models::{Address, Chain, ExtractorIdentity};
 use tycho_ethereum::rpc::EthereumRpcClient;
 
 use crate::extractor::{
+    family_dispatch::FamilyBranchSpec,
     models::BlockChanges,
     runner::{
         configured_stream_start_block, merged_family_substreams_params, BootstrapConfig,
         BootstrapStrategy, ExtractorConfig, FamilyRuntimeConfig,
     },
     shared_bootstrap::{
-        parse_pool_list_bootstrap_params, BootstrapBranchDescriptor, SharedBootstrapParams,
-        SharedBootstrapPlan,
+        materialize_plan_by_branch_runtimes, parse_pool_list_bootstrap_params,
+        BootstrapBranchDescriptor, SharedBootstrapParams, SharedBootstrapPlan,
     },
     ExtractionError,
 };
@@ -20,12 +26,34 @@ pub type ParseBootstrapParamsFn = fn(&str) -> Result<SharedBootstrapParams, Extr
 pub type MaterializeBootstrapBranchFn = for<'a> fn(
     &'a EthereumRpcClient,
     &'a BootstrapBranchDescriptor,
-) -> Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>>;
+) -> Pin<
+    Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>,
+>;
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedSharedBootstrapBranchRuntime {
+    pub protocol_system: &'static str,
+    pub materialize_branch: MaterializeBootstrapBranchFn,
+}
+
 pub type MaterializeBootstrapPlanFn = for<'a> fn(
     &'a EthereumRpcClient,
     &'a SharedBootstrapPlan,
-    FamilyRuntimeRegistry<'a>,
-) -> Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>>;
+    &'a [ResolvedSharedBootstrapBranchRuntime],
+) -> Pin<
+    Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>,
+>;
+
+fn generic_shared_bootstrap_plan_materializer<'a>(
+    rpc: &'a EthereumRpcClient,
+    plan: &'a SharedBootstrapPlan,
+    branch_runtimes: &'a [ResolvedSharedBootstrapBranchRuntime],
+) -> Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>> {
+    Box::pin(async move { materialize_plan_by_branch_runtimes(rpc, plan, branch_runtimes).await })
+}
+
+pub(crate) fn default_shared_bootstrap_plan_materializer() -> MaterializeBootstrapPlanFn {
+    generic_shared_bootstrap_plan_materializer
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum SharedBootstrapParamsParser {
@@ -57,6 +85,8 @@ pub struct FamilyRuntimeSpec {
     pub family_name: &'static str,
     pub members: &'static [FamilyMemberSpec],
     pub output_module: &'static str,
+    pub shared_stream_name: &'static str,
+    pub durability_scope: &'static str,
     pub shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
 }
 
@@ -72,6 +102,23 @@ pub struct DetectedFamilyRuntime {
     pub member_protocol_systems: Vec<String>,
     pub shared_spkg: String,
     pub output_module: String,
+    pub shared_stream_name: String,
+    pub durability_scope: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResolvedSharedFamilyStream {
+    pub spkg: String,
+    pub module: String,
+    pub extractor_id: String,
+    pub durability_scope: String,
+}
+
+pub struct FamilySharedStreamIdentity<'a> {
+    pub output_module: &'a str,
+    pub shared_stream_name: &'a str,
+    pub extractor_id: String,
+    pub durability_scope: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,12 +131,25 @@ pub struct FamilyRuntimeBuildPlan {
 pub struct ResolvedFamilyRuntime<'a> {
     pub family: DetectedFamilyRuntime,
     pub extractor_configs: Vec<&'a ExtractorConfig>,
+    pub execution: ResolvedFamilyExecutionConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedFamilyExecutionConfig {
+    pub branch_specs: Vec<FamilyBranchSpec>,
+    pub shared_stream: ResolvedSharedFamilyStream,
+    pub shared_bootstrap_plan_materializer: MaterializeBootstrapPlanFn,
+    pub shared_bootstrap_branches: Vec<ResolvedSharedBootstrapBranchRuntime>,
+    pub merged_substreams_params: HashMap<String, String>,
+    pub stop_block: u64,
+    pub configured_start_block: i64,
+    pub bootstrap_plan: Option<SharedBootstrapPlan>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ResolvedFamilyRuntimePlan<'a> {
     pub families: Vec<ResolvedFamilyRuntime<'a>>,
-    pub standalone_extractors: Vec<(&'a str, &'a ExtractorConfig)>,
+    pub standalone_extractors: Vec<ResolvedStandaloneRuntime<'a>>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,10 +158,33 @@ pub struct ResolvedStandaloneRuntime<'a> {
     pub extractor_config: &'a ExtractorConfig,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResolvedSubstreamsExecutionRequest {
+    pub spkg: String,
+    pub module: String,
+    pub start_block: i64,
+    pub stop_block: u64,
+    pub params: HashMap<String, String>,
+    pub extractor_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedInitializedAccountsRequest {
+    pub chain: Chain,
+    pub accounts: Vec<Address>,
+    pub block_id: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum ResolvedRuntimeTarget<'a> {
     Family(ResolvedFamilyRuntime<'a>),
     Standalone(ResolvedStandaloneRuntime<'a>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedRuntimeTargetSelector<'a> {
+    Family(&'a str),
+    StandaloneProtocolSystem(&'a str),
 }
 
 impl<'a> ResolvedRuntimeTarget<'a> {
@@ -129,11 +212,182 @@ impl<'a> ResolvedRuntimeTarget<'a> {
             Self::Standalone(standalone) => vec![standalone.protocol_system],
         }
     }
+
+    pub fn initialized_accounts_requests(&self) -> Vec<ResolvedInitializedAccountsRequest> {
+        let chain = self.chain();
+        let mut requests: Vec<ResolvedInitializedAccountsRequest> = Vec::new();
+
+        for config in self.extractor_configs() {
+            if config.initialized_accounts.is_empty() {
+                continue;
+            }
+
+            if let Some(existing) = requests.iter_mut().find(|request| {
+                request.chain == chain && request.block_id == config.initialized_accounts_block
+            }) {
+                for account in &config.initialized_accounts {
+                    if !existing.accounts.contains(account) {
+                        existing.accounts.push(account.clone());
+                    }
+                }
+                continue;
+            }
+
+            requests.push(ResolvedInitializedAccountsRequest {
+                chain,
+                accounts: config.initialized_accounts.clone(),
+                block_id: config.initialized_accounts_block,
+            });
+        }
+
+        requests
+    }
+
+    pub fn matches_selector(&self, selector: ResolvedRuntimeTargetSelector<'_>) -> bool {
+        match (selector, self) {
+            (ResolvedRuntimeTargetSelector::Family(family_name), Self::Family(family)) => {
+                family.family.family_name == family_name
+            }
+            (
+                ResolvedRuntimeTargetSelector::StandaloneProtocolSystem(protocol_system),
+                Self::Standalone(standalone),
+            ) => standalone.protocol_system == protocol_system,
+            _ => false,
+        }
+    }
+
+    pub fn substreams_execution_request(
+        &self,
+    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
+        let start_block = match self {
+            Self::Family(family) => family.execution.configured_start_block,
+            Self::Standalone(standalone) => {
+                configured_stream_start_block(standalone.extractor_config)?
+            }
+        };
+
+        self.substreams_execution_request_with_start_block(start_block)
+    }
+
+    pub fn substreams_execution_request_with_start_block(
+        &self,
+        start_block: i64,
+    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
+        match self {
+            Self::Family(family) => Ok(ResolvedSubstreamsExecutionRequest {
+                spkg: family
+                    .execution
+                    .shared_stream
+                    .spkg
+                    .clone(),
+                module: family
+                    .execution
+                    .shared_stream
+                    .module
+                    .clone(),
+                start_block,
+                stop_block: family.execution.stop_block,
+                params: family
+                    .execution
+                    .merged_substreams_params
+                    .clone(),
+                extractor_id: family
+                    .execution
+                    .shared_stream
+                    .extractor_id
+                    .clone(),
+            }),
+            Self::Standalone(standalone) => Ok(ResolvedSubstreamsExecutionRequest {
+                spkg: standalone
+                    .extractor_config
+                    .spkg()
+                    .to_string(),
+                module: standalone
+                    .extractor_config
+                    .module_name()
+                    .to_string(),
+                start_block,
+                stop_block: standalone
+                    .extractor_config
+                    .stop_block()
+                    .unwrap_or_default() as u64,
+                params: standalone
+                    .extractor_config
+                    .substreams_params
+                    .clone(),
+                extractor_id: ExtractorIdentity::new(
+                    standalone.extractor_config.chain(),
+                    standalone.extractor_config.name(),
+                )
+                .to_string(),
+            }),
+        }
+    }
+}
+
+impl<'a> ResolvedRuntimeTargetSelector<'a> {
+    pub fn not_found_error(&self, selector_context: &str) -> ExtractionError {
+        match self {
+            Self::Family(family_name) => ExtractionError::Setup(format!(
+                "No family runtime `{family_name}` found in `{selector_context}`"
+            )),
+            Self::StandaloneProtocolSystem(protocol_system) => ExtractionError::Setup(format!(
+                "No standalone protocol system `{protocol_system}` found in `{selector_context}`"
+            )),
+        }
+    }
+}
+
+pub fn select_resolved_runtime_target<'a>(
+    targets: Vec<ResolvedRuntimeTarget<'a>>,
+    selector: ResolvedRuntimeTargetSelector<'_>,
+) -> Option<ResolvedRuntimeTarget<'a>> {
+    targets
+        .into_iter()
+        .find(|target| target.matches_selector(selector))
+}
+
+pub fn coalesce_initialized_accounts_requests<'a>(
+    targets: impl IntoIterator<Item = &'a ResolvedRuntimeTarget<'a>>,
+) -> Vec<ResolvedInitializedAccountsRequest> {
+    let mut requests: Vec<ResolvedInitializedAccountsRequest> = Vec::new();
+
+    for target in targets {
+        for request in target.initialized_accounts_requests() {
+            if let Some(existing) = requests.iter_mut().find(|existing| {
+                existing.chain == request.chain && existing.block_id == request.block_id
+            }) {
+                for account in request.accounts {
+                    if !existing.accounts.contains(&account) {
+                        existing.accounts.push(account);
+                    }
+                }
+                continue;
+            }
+
+            requests.push(request);
+        }
+    }
+
+    requests
 }
 
 impl DetectedFamilyRuntime {
     pub fn stream_extractor_id(&self) -> String {
-        format!("{}:{}_family", self.chain, self.family_name)
+        format!("{}:{}", self.chain, self.shared_stream_name)
+    }
+
+    pub fn resolved_shared_stream(&self) -> ResolvedSharedFamilyStream {
+        ResolvedSharedFamilyStream {
+            spkg: self.shared_spkg.clone(),
+            module: self.output_module.clone(),
+            extractor_id: self.stream_extractor_id(),
+            durability_scope: self.durability_scope(),
+        }
+    }
+
+    pub fn durability_scope(&self) -> String {
+        self.durability_scope.clone()
     }
 }
 
@@ -152,16 +406,83 @@ impl<'a> FamilyRuntimeRegistry<'a> {
             .find(|spec| spec.family_name == family_name)
     }
 
+    pub fn output_module_for_family(&self, family_name: &str) -> Option<&'a str> {
+        self.family_spec_by_name(family_name)
+            .map(|spec| spec.output_module)
+    }
+
+    pub fn shared_stream_name_for_family(&self, family_name: &str) -> Option<&'a str> {
+        self.family_spec_by_name(family_name)
+            .map(|spec| spec.shared_stream_name)
+    }
+
+    pub fn member_protocol_systems_for_family(&self, family_name: &str) -> Option<Vec<&'a str>> {
+        self.family_spec_by_name(family_name)
+            .map(|spec| {
+                spec.members
+                    .iter()
+                    .map(|member| member.protocol_system)
+                    .collect()
+            })
+    }
+
+    pub fn durability_scope_for_family(&self, family_name: &str) -> Option<&'a str> {
+        self.family_spec_by_name(family_name)
+            .map(|spec| spec.durability_scope)
+    }
+
+    pub fn shared_stream_identity_for_family(
+        &self,
+        chain: Chain,
+        family_name: &str,
+    ) -> Option<FamilySharedStreamIdentity<'a>> {
+        let spec = self.family_spec_by_name(family_name)?;
+        Some(FamilySharedStreamIdentity {
+            output_module: spec.output_module,
+            shared_stream_name: spec.shared_stream_name,
+            extractor_id: format!("{chain}:{}", spec.shared_stream_name),
+            durability_scope: spec.durability_scope,
+        })
+    }
+
+    pub fn detected_family_runtime(
+        &self,
+        family_name: &str,
+        chain: Chain,
+        shared_spkg: impl Into<String>,
+    ) -> Result<DetectedFamilyRuntime, ExtractionError> {
+        let spec = self.require_family_spec(family_name, "family runtime")?;
+        Ok(DetectedFamilyRuntime {
+            family_name: spec.family_name.to_string(),
+            chain,
+            member_protocol_systems: spec
+                .members
+                .iter()
+                .map(|member| member.protocol_system.to_string())
+                .collect(),
+            shared_spkg: shared_spkg.into(),
+            output_module: spec.output_module.to_string(),
+            shared_stream_name: spec.shared_stream_name.to_string(),
+            durability_scope: spec.durability_scope.to_string(),
+        })
+    }
+
+    pub fn output_module_for_protocol_system(&self, protocol_system: &str) -> Option<&'a str> {
+        self.family_name_for_protocol_system(protocol_system)
+            .and_then(|family_name| self.output_module_for_family(family_name))
+    }
+
     pub fn require_family_spec(
         &self,
         family_name: &str,
         context: &str,
     ) -> Result<&'a FamilyRuntimeSpec, ExtractionError> {
-        self.family_spec_by_name(family_name).ok_or_else(|| {
-            ExtractionError::Setup(format!(
-                "{context} `{family_name}` does not match any registered family runtime"
-            ))
-        })
+        self.family_spec_by_name(family_name)
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
+                    "{context} `{family_name}` does not match any registered family runtime"
+                ))
+            })
     }
 
     pub fn member_spec_by_protocol_system(
@@ -223,13 +544,8 @@ impl<'a> FamilyRuntimeRegistry<'a> {
         &self,
         protocol_system: &str,
     ) -> Option<HashSet<String>> {
-        self.shared_route_protocols_for_protocol_system(protocol_system)
-            .map(|protocols| {
-                protocols
-                    .iter()
-                    .map(|protocol| canonicalize_shared_route_protocol(protocol))
-                    .collect()
-            })
+        self.member_spec_by_protocol_system(protocol_system)
+            .map(|member| normalized_shared_route_protocols_for_member(member))
     }
 
     pub fn validate_family_runtime_config(
@@ -250,19 +566,29 @@ impl<'a> FamilyRuntimeRegistry<'a> {
         mut family_runtime: FamilyRuntimeConfig,
         shared_spkg: Option<String>,
         shared_module: Option<String>,
+        durability_scope: Option<String>,
     ) -> Result<FamilyRuntimeConfig, ExtractionError> {
         self.validate_family_runtime_config(protocol_system, &family_runtime)?;
+        let family_spec = self.require_family_spec(&family_runtime.family, "family_runtime")?;
 
         if family_runtime.shared_spkg.is_none() {
             family_runtime.shared_spkg = shared_spkg;
         }
         if family_runtime.shared_module.is_none() {
-            family_runtime.shared_module = shared_module;
+            family_runtime.shared_module =
+                shared_module.or_else(|| Some(family_spec.output_module.to_string()));
+        }
+        if family_runtime
+            .durability_scope
+            .is_none()
+        {
+            family_runtime.durability_scope =
+                durability_scope.or_else(|| Some(family_spec.durability_scope.to_string()));
         }
 
-        if family_runtime.shared_spkg.is_none() || family_runtime.shared_module.is_none() {
+        if family_runtime.shared_spkg.is_none() {
             return Err(ExtractionError::Setup(format!(
-                "family_runtime `{}` must resolve both `shared_spkg` and `shared_module` either inline or via top-level family_runtimes",
+                "family_runtime `{}` must resolve `shared_spkg` either inline or via top-level family_runtimes",
                 family_runtime.family
             )));
         }
@@ -312,12 +638,24 @@ impl<'a> FamilyRuntimeRegistry<'a> {
         ExtractionError,
     > {
         let spec = self.require_family_spec(family_name, "shared bootstrap plan for")?;
-        let runtime = spec.shared_bootstrap_runtime.ok_or_else(|| {
-            ExtractionError::Setup(format!(
-                "family `{family_name}` does not declare shared bootstrap runtime materialization"
-            ))
-        })?;
-        Ok((runtime.materialize_plan)(rpc, plan, *self))
+        let branch_runtimes = self.resolve_shared_bootstrap_branch_runtimes(family_name)?;
+        let materialize_plan = spec
+            .shared_bootstrap_runtime
+            .map(|runtime| runtime.materialize_plan)
+            .unwrap_or_else(default_shared_bootstrap_plan_materializer);
+        Ok(Box::pin(async move { materialize_plan(rpc, plan, &branch_runtimes).await }))
+    }
+
+    pub fn resolve_shared_bootstrap_plan_materializer(
+        &self,
+        family_name: &str,
+    ) -> Result<MaterializeBootstrapPlanFn, ExtractionError> {
+        let spec =
+            self.require_family_spec(family_name, "shared bootstrap plan materializer for")?;
+        Ok(spec
+            .shared_bootstrap_runtime
+            .map(|runtime| runtime.materialize_plan)
+            .unwrap_or_else(default_shared_bootstrap_plan_materializer))
     }
 
     pub fn resolve_shared_bootstrap_plan_family_name(
@@ -425,7 +763,8 @@ impl<'a> FamilyRuntimeRegistry<'a> {
         strategy: BootstrapStrategy,
         params: &str,
     ) -> Result<SharedBootstrapParams, ExtractionError> {
-        let member = self.require_bootstrap_member_for_protocol_system(protocol_system, strategy)?;
+        let member =
+            self.require_bootstrap_member_for_protocol_system(protocol_system, strategy)?;
         let parser = member
             .shared_bootstrap
             .expect("validated shared bootstrap member must have runtime")
@@ -455,6 +794,26 @@ impl<'a> FamilyRuntimeRegistry<'a> {
         Ok(materialize(rpc, branch))
     }
 
+    pub fn resolve_shared_bootstrap_branch_runtimes(
+        &self,
+        family_name: &str,
+    ) -> Result<Vec<ResolvedSharedBootstrapBranchRuntime>, ExtractionError> {
+        let spec = self.require_family_spec(family_name, "shared bootstrap branch runtime for")?;
+        let runtimes = spec
+            .members
+            .iter()
+            .filter_map(|member| {
+                member
+                    .shared_bootstrap
+                    .map(|bootstrap| ResolvedSharedBootstrapBranchRuntime {
+                        protocol_system: member.protocol_system,
+                        materialize_branch: bootstrap.materialize_branch,
+                    })
+            })
+            .collect::<Vec<_>>();
+        Ok(runtimes)
+    }
+
     pub fn validate(&self) -> Result<(), ExtractionError> {
         let mut seen_protocol_systems = HashMap::new();
         let mut seen_route_protocols = HashMap::new();
@@ -470,15 +829,7 @@ impl<'a> FamilyRuntimeRegistry<'a> {
                     )));
                 }
 
-                if member.shared_bootstrap.is_some() && member.shared_route_protocols.is_empty() {
-                    return Err(ExtractionError::Setup(format!(
-                        "family `{}` member `{}` declares shared bootstrap handlers but no shared route protocol aliases",
-                        spec.family_name, member.protocol_system
-                    )));
-                }
-
-                for route_protocol in member.shared_route_protocols {
-                    let normalized = canonicalize_shared_route_protocol(route_protocol);
+                for normalized in normalized_shared_route_protocols_for_member(member) {
                     if normalized.is_empty() {
                         return Err(ExtractionError::Setup(format!(
                             "family `{}` member `{}` declares an empty shared route protocol alias",
@@ -486,8 +837,8 @@ impl<'a> FamilyRuntimeRegistry<'a> {
                         )));
                     }
 
-                    if let Some(existing_protocol_system) = seen_route_protocols
-                        .insert(normalized.clone(), member.protocol_system)
+                    if let Some(existing_protocol_system) =
+                        seen_route_protocols.insert(normalized.clone(), member.protocol_system)
                     {
                         return Err(ExtractionError::Setup(format!(
                             "shared route protocol alias `{normalized}` is assigned to both `{existing_protocol_system}` and `{}`",
@@ -514,7 +865,10 @@ impl<'a> FamilyRuntimeRegistry<'a> {
                 ))
             })?;
 
-        match member.shared_bootstrap.map(|bootstrap| bootstrap.strategy) {
+        match member
+            .shared_bootstrap
+            .map(|bootstrap| bootstrap.strategy)
+        {
             Some(member_strategy) if member_strategy == strategy => Ok(member),
             Some(member_strategy) => Err(ExtractionError::Setup(format!(
                 "protocol system `{protocol_system}` expects bootstrap strategy `{:?}`, got `{:?}`",
@@ -529,6 +883,18 @@ impl<'a> FamilyRuntimeRegistry<'a> {
 
 pub const fn default_family_runtime_registry() -> FamilyRuntimeRegistry<'static> {
     FamilyRuntimeRegistry::new(crate::extractor::family_registry::default_family_runtime_specs())
+}
+
+fn normalized_shared_route_protocols_for_member(member: &FamilyMemberSpec) -> HashSet<String> {
+    if member.shared_route_protocols.is_empty() {
+        HashSet::from([canonicalize_shared_route_protocol(member.protocol_system)])
+    } else {
+        member
+            .shared_route_protocols
+            .iter()
+            .map(|protocol| canonicalize_shared_route_protocol(protocol))
+            .collect()
+    }
 }
 
 pub fn canonicalize_shared_route_protocol(protocol: &str) -> String {
@@ -571,17 +937,10 @@ pub fn detect_family_runtimes_with_registry(
             }
         }
 
-        detected.push(DetectedFamilyRuntime {
-            family_name: spec.family_name.to_string(),
-            chain,
-            member_protocol_systems: spec
-                .members
-                .iter()
-                .map(|member| member.protocol_system.to_string())
-                .collect(),
-            shared_spkg,
-            output_module,
-        });
+        let detected_family =
+            registry.detected_family_runtime(spec.family_name, chain, shared_spkg)?;
+        debug_assert_eq!(detected_family.output_module, output_module);
+        detected.push(detected_family);
     }
 
     Ok(detected)
@@ -703,17 +1062,11 @@ fn detect_explicit_shared_runtime(
     let mut output_module = None;
 
     for (protocol_system, config) in family_members {
-        let runtime = config
-            .family_runtime()
-            .expect("explicitly enabled members must carry family runtime config");
-        let candidate_spkg = runtime
-            .shared_spkg
-            .as_deref()
-            .unwrap_or_else(|| config.spkg());
-        let candidate_module = runtime
-            .shared_module
-            .as_deref()
-            .unwrap_or(spec.output_module);
+        let target = config
+            .require_family_shared_stream_target()?
+            .expect("explicitly enabled members must resolve one shared stream target");
+        let candidate_spkg = target.spkg;
+        let candidate_module = target.module;
 
         if let Some(existing) = &shared_spkg {
             if existing != candidate_spkg {
@@ -815,13 +1168,12 @@ pub fn family_extractor_configs<'a>(
         .member_protocol_systems
         .iter()
         .map(|name| {
-            extractor_config_by_protocol_system(extractors, name)?
-                .ok_or_else(|| {
-                    ExtractionError::Setup(format!(
-                        "family `{}` is missing extractor config for `{name}`",
-                        family.family_name
-                    ))
-                })
+            extractor_config_by_protocol_system(extractors, name)?.ok_or_else(|| {
+                ExtractionError::Setup(format!(
+                    "family `{}` is missing extractor config for `{name}`",
+                    family.family_name
+                ))
+            })
         })
         .collect::<Result<Vec<_>, ExtractionError>>()?;
 
@@ -886,7 +1238,7 @@ pub(crate) fn validate_family_runtime_membership(
     Ok(())
 }
 
-fn validate_resolved_family_stream_config(
+pub(crate) fn validate_resolved_family_stream_config(
     family: &DetectedFamilyRuntime,
     extractor_configs: &[&ExtractorConfig],
 ) -> Result<(), ExtractionError> {
@@ -895,6 +1247,151 @@ fn validate_resolved_family_stream_config(
     validate_family_shared_stop_block(family, extractor_configs)?;
     validate_family_shared_substreams_params(family, extractor_configs)?;
     Ok(())
+}
+
+pub(crate) fn resolve_resolved_family_execution_config(
+    family: &DetectedFamilyRuntime,
+    extractor_configs: &[&ExtractorConfig],
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Result<ResolvedFamilyExecutionConfig, ExtractionError> {
+    validate_resolved_family_stream_config(family, extractor_configs)?;
+
+    let branch_specs = FamilyBranchSpec::from_extractor_configs(extractor_configs)?;
+    let merged_substreams_params =
+        merged_family_substreams_params(extractor_configs).map_err(|err| match err {
+            ExtractionError::Setup(message) => ExtractionError::Setup(format!(
+                "family `{}` has incompatible shared substreams params: {message}",
+                family.family_name
+            )),
+            other => other,
+        })?;
+
+    let first_config = extractor_configs
+        .first()
+        .ok_or_else(|| {
+            ExtractionError::Setup(format!(
+                "family `{}` has no extractor configs to resolve execution settings",
+                family.family_name
+            ))
+        })?;
+
+    let stop_block = u64::try_from(first_config.stop_block().unwrap_or(0)).map_err(|_| {
+        ExtractionError::Setup(format!(
+            "family `{}` resolved stop_block exceeds u64",
+            family.family_name
+        ))
+    })?;
+    let configured_start_block = configured_stream_start_block(first_config)?;
+    let bootstrap_plan = resolve_family_bootstrap_plan(extractor_configs, registry)?;
+    let shared_bootstrap_branches =
+        registry.resolve_shared_bootstrap_branch_runtimes(&family.family_name)?;
+    let shared_bootstrap_plan_materializer =
+        registry.resolve_shared_bootstrap_plan_materializer(&family.family_name)?;
+
+    Ok(ResolvedFamilyExecutionConfig {
+        branch_specs,
+        shared_stream: family.resolved_shared_stream(),
+        shared_bootstrap_plan_materializer,
+        shared_bootstrap_branches,
+        merged_substreams_params,
+        stop_block,
+        configured_start_block,
+        bootstrap_plan,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn empty_resolved_family_execution_config_for_tests() -> ResolvedFamilyExecutionConfig {
+    ResolvedFamilyExecutionConfig {
+        branch_specs: Vec::new(),
+        shared_stream: ResolvedSharedFamilyStream {
+            spkg: String::new(),
+            module: String::new(),
+            extractor_id: String::new(),
+            durability_scope: String::new(),
+        },
+        shared_bootstrap_plan_materializer: default_shared_bootstrap_plan_materializer(),
+        shared_bootstrap_branches: Vec::new(),
+        merged_substreams_params: HashMap::new(),
+        stop_block: 0,
+        configured_start_block: 0,
+        bootstrap_plan: None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn resolved_family_execution_config_from_extractor_configs_for_tests(
+    extractor_configs: &[&ExtractorConfig],
+) -> Result<ResolvedFamilyExecutionConfig, ExtractionError> {
+    let branch_specs = FamilyBranchSpec::from_extractor_configs(extractor_configs)?;
+    let merged_substreams_params = merged_family_substreams_params(extractor_configs)?;
+    let stop_block = resolve_family_stop_block_for_tests(extractor_configs)?;
+    let configured_start_block =
+        resolve_family_configured_start_block_for_tests(extractor_configs)?;
+    let registry = default_family_runtime_registry();
+    let family_name = infer_single_test_family_name(extractor_configs, registry)?;
+    let chain = extractor_configs
+        .first()
+        .map(|config| config.chain())
+        .ok_or_else(|| {
+            ExtractionError::Setup(
+                "family execution test helper requires at least one extractor config".to_string(),
+            )
+        })?;
+    let bootstrap_plan = resolve_family_bootstrap_plan(extractor_configs, registry)?;
+    let shared_bootstrap_branches =
+        registry.resolve_shared_bootstrap_branch_runtimes(&family_name)?;
+    let shared_bootstrap_plan_materializer =
+        registry.resolve_shared_bootstrap_plan_materializer(&family_name)?;
+    let shared_stream = registry
+        .detected_family_runtime(&family_name, chain, String::new())?
+        .resolved_shared_stream();
+
+    Ok(ResolvedFamilyExecutionConfig {
+        branch_specs,
+        shared_stream,
+        shared_bootstrap_plan_materializer,
+        shared_bootstrap_branches,
+        merged_substreams_params,
+        stop_block,
+        configured_start_block,
+        bootstrap_plan,
+    })
+}
+
+#[cfg(test)]
+fn infer_single_test_family_name(
+    extractor_configs: &[&ExtractorConfig],
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Result<String, ExtractionError> {
+    let mut family_name = None;
+
+    for config in extractor_configs {
+        let candidate = registry
+            .family_name_for_protocol_system(config.protocol_system())
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
+                    "family execution test helper could not resolve a registered family for protocol system `{}`",
+                    config.protocol_system()
+                ))
+            })?;
+
+        if let Some(existing) = family_name.as_deref() {
+            if existing != candidate {
+                return Err(ExtractionError::Setup(format!(
+                    "family execution test helper requires one registered family, found `{existing}` and `{candidate}`"
+                )));
+            }
+        } else {
+            family_name = Some(candidate.to_string());
+        }
+    }
+
+    family_name.ok_or_else(|| {
+        ExtractionError::Setup(
+            "family execution test helper requires at least one extractor config".to_string(),
+        )
+    })
 }
 
 fn validate_family_shared_bootstrap_config(
@@ -929,10 +1426,7 @@ fn validate_family_shared_start_block(
     let mut starts = Vec::new();
 
     for config in extractor_configs {
-        starts.push((
-            config.protocol_system().to_string(),
-            configured_stream_start_block(config)?,
-        ));
+        starts.push((config.protocol_system().to_string(), configured_stream_start_block(config)?));
     }
 
     if let Some((_, first_start)) = starts.first() {
@@ -990,6 +1484,78 @@ fn validate_family_shared_substreams_params(
     Ok(())
 }
 
+fn resolve_family_bootstrap_plan(
+    extractor_configs: &[&ExtractorConfig],
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Result<Option<SharedBootstrapPlan>, ExtractionError> {
+    let plan_inputs = extractor_configs
+        .iter()
+        .filter_map(|config| {
+            config
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| (*config, bootstrap))
+        })
+        .collect::<Vec<_>>();
+
+    if plan_inputs.is_empty() {
+        Ok(None)
+    } else {
+        SharedBootstrapPlan::for_extractor_configs_with_registry(plan_inputs, registry).map(Some)
+    }
+}
+
+#[cfg(test)]
+fn resolve_family_stop_block_for_tests(
+    extractor_configs: &[&ExtractorConfig],
+) -> Result<u64, ExtractionError> {
+    let mut resolved = None;
+
+    for config in extractor_configs {
+        let candidate = config.stop_block();
+        if let Some(existing) = resolved {
+            if existing != candidate {
+                return Err(ExtractionError::Setup(format!(
+                    "family runner requires one shared stop_block, found {:?} on `{}` and {:?} on another family member",
+                    candidate,
+                    config.name(),
+                    existing
+                )));
+            }
+        } else {
+            resolved = Some(candidate);
+        }
+    }
+
+    Ok(resolved.flatten().unwrap_or(0) as u64)
+}
+
+#[cfg(test)]
+fn resolve_family_configured_start_block_for_tests(
+    extractor_configs: &[&ExtractorConfig],
+) -> Result<i64, ExtractionError> {
+    let mut configured_starts = Vec::new();
+    for cfg in extractor_configs {
+        let configured_stream_start = configured_stream_start_block(cfg)?;
+        configured_starts.push((cfg.protocol_system().to_string(), configured_stream_start));
+    }
+
+    let (_, first_start) = configured_starts
+        .first()
+        .ok_or_else(|| ExtractionError::Setup("family runner has no branch configs".to_string()))?;
+    if configured_starts
+        .iter()
+        .any(|(_, start_block)| start_block != first_start)
+    {
+        return Err(ExtractionError::Setup(format!(
+            "family runner requires aligned branch start blocks, found {:?}",
+            configured_starts
+        )));
+    }
+
+    Ok(*first_start)
+}
+
 pub fn build_resolved_family_runtime_plan<'a>(
     extractors: &'a HashMap<String, ExtractorConfig>,
 ) -> Result<ResolvedFamilyRuntimePlan<'a>, ExtractionError> {
@@ -1012,18 +1578,23 @@ pub fn build_resolved_family_runtime_plan_with_registry<'a>(
         .into_iter()
         .map(|family| {
             let extractor_configs = family_extractor_configs(&family, extractors)?;
-            Ok(ResolvedFamilyRuntime { family, extractor_configs })
+            let execution =
+                resolve_resolved_family_execution_config(&family, &extractor_configs, registry)?;
+            Ok(ResolvedFamilyRuntime { family, extractor_configs, execution })
         })
         .collect::<Result<Vec<_>, ExtractionError>>()?;
     let standalone_extractors = runtime_plan
         .standalone_protocol_systems
         .into_iter()
-        .map(|name| {
-            extractor_config_by_protocol_system(extractors, &name)?
-                .map(|cfg| (cfg.protocol_system(), cfg))
+        .map(|protocol_system| {
+            extractor_config_by_protocol_system(extractors, &protocol_system)?
+                .map(|extractor_config| ResolvedStandaloneRuntime {
+                    protocol_system: extractor_config.protocol_system(),
+                    extractor_config,
+                })
                 .ok_or_else(|| {
                     ExtractionError::Setup(format!(
-                        "standalone extractor config `{name}` disappeared during resolution"
+                        "standalone extractor config `{protocol_system}` disappeared during resolution"
                     ))
                 })
         })
@@ -1046,12 +1617,7 @@ pub fn build_resolved_runtime_targets_with_registry<'a>(
         resolved
             .standalone_extractors
             .into_iter()
-            .map(|(protocol_system, extractor_config)| {
-                ResolvedRuntimeTarget::Standalone(ResolvedStandaloneRuntime {
-                    protocol_system,
-                    extractor_config,
-                })
-            }),
+            .map(ResolvedRuntimeTarget::Standalone),
     );
     Ok(targets)
 }
@@ -1060,8 +1626,9 @@ pub fn build_resolved_runtime_targets_with_registry<'a>(
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use tycho_common::Bytes;
     use tycho_common::models::{Chain, FinancialType, ImplementationType};
+    use tycho_common::Bytes;
+    use tycho_ethereum::rpc::EthereumRpcClient;
 
     use crate::extractor::runner::{
         BootstrapConfig, BootstrapStrategy, ExtractorConfig, FamilyRuntimeConfig,
@@ -1069,10 +1636,10 @@ mod tests {
     };
     use crate::extractor::{
         family_registry::{
-            shared_bootstrap_member_runtime, shared_family_member_spec,
-            shared_family_runtime_spec,
+            shared_bootstrap_member_runtime, shared_family_member_spec, shared_family_runtime_spec,
         },
-        family_uniswap::materialize_uniswap_v2_branch, shared_bootstrap::SharedBootstrapParams,
+        family_uniswap::materialize_uniswap_v2_branch,
+        shared_bootstrap::{BootstrapBranchDescriptor, SharedBootstrapParams, SharedBootstrapPlan},
         ExtractionError,
     };
 
@@ -1080,11 +1647,13 @@ mod tests {
         build_family_runtime_plan, build_family_runtime_plan_with_registry,
         build_resolved_family_runtime_plan, build_resolved_family_runtime_plan_with_registry,
         build_resolved_runtime_targets, build_resolved_runtime_targets_with_registry,
-        canonicalize_shared_route_protocol, default_family_runtime_registry, detect_family_runtimes,
-        detect_family_runtimes_with_registry, family_extractor_configs, standalone_protocol_systems,
-        DetectedFamilyRuntime,
-        FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec, ResolvedRuntimeTarget,
-        ResolvedStandaloneRuntime, SharedBootstrapMemberRuntime, SharedBootstrapParamsParser,
+        canonicalize_shared_route_protocol, coalesce_initialized_accounts_requests,
+        default_family_runtime_registry, detect_family_runtimes,
+        detect_family_runtimes_with_registry, family_extractor_configs,
+        select_resolved_runtime_target, standalone_protocol_systems, FamilyMemberSpec,
+        FamilyRuntimeRegistry, FamilyRuntimeSpec, ResolvedInitializedAccountsRequest,
+        ResolvedRuntimeTarget, ResolvedRuntimeTargetSelector, ResolvedStandaloneRuntime,
+        SharedBootstrapMemberRuntime, SharedBootstrapParamsParser,
     };
 
     fn make_config(name: &str, spkg: &str) -> ExtractorConfig {
@@ -1112,6 +1681,7 @@ mod tests {
             family: "uniswap".to_string(),
             shared_spkg: Some(shared_spkg.to_string()),
             shared_module: Some("map_uniswap_family_protocol_changes".to_string()),
+            durability_scope: None,
         }))
     }
 
@@ -1120,15 +1690,21 @@ mod tests {
         let extractors = HashMap::from([
             (
                 "uniswap_v2".to_string(),
-                make_config(
-                    "uniswap_v2",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
             (
                 "uniswap_v3".to_string(),
-                make_config(
-                    "uniswap_v3",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
@@ -1207,6 +1783,7 @@ mod tests {
                     family: "uniswap".to_string(),
                     shared_spkg: Some("/tmp/a.spkg".to_string()),
                     shared_module: Some("map_uniswap_family_protocol_changes".to_string()),
+                    durability_scope: None,
                 })),
             ),
         ]);
@@ -1223,15 +1800,21 @@ mod tests {
         let extractors = HashMap::from([
             (
                 "uniswap_v2".to_string(),
-                make_config(
-                    "uniswap_v2",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
             (
                 "uniswap_v3".to_string(),
-                make_config(
-                    "uniswap_v3",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
@@ -1249,15 +1832,21 @@ mod tests {
         let extractors = HashMap::from([
             (
                 "uniswap_v2".to_string(),
-                make_config(
-                    "uniswap_v2",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
             (
                 "uniswap_v3".to_string(),
-                make_config(
-                    "uniswap_v3",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
@@ -1305,15 +1894,21 @@ mod tests {
         let extractors = HashMap::from([
             (
                 "uniswap_v2".to_string(),
-                make_config(
-                    "uniswap_v2",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
             (
                 "uniswap_v3".to_string(),
-                make_config(
-                    "uniswap_v3",
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
                     "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
                 ),
             ),
@@ -1332,10 +1927,10 @@ mod tests {
             2
         );
         assert_eq!(resolved.standalone_extractors.len(), 1);
-        assert_eq!(resolved.standalone_extractors[0].0, "curve");
+        assert_eq!(resolved.standalone_extractors[0].protocol_system, "curve");
         assert_eq!(
             resolved.standalone_extractors[0]
-                .1
+                .extractor_config
                 .name(),
             "curve"
         );
@@ -1395,6 +1990,708 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["curve"]
         );
+    }
+
+    #[test]
+    fn resolved_runtime_target_derives_family_substreams_execution_request() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v2".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        Some(120),
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v2_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        HashMap::from([(
+                            "map_pool_events".to_string(),
+                            "factory=0x01".to_string(),
+                        )]),
+                        Some(BootstrapConfig {
+                            strategy: BootstrapStrategy::UniswapV2Rpc,
+                            start_block: 42,
+                            params: "bootstrap_block=42&pools=0x01".to_string(),
+                        }),
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v3".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        Some(120),
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v3_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
+                        Some(BootstrapConfig {
+                            strategy: BootstrapStrategy::UniswapV3Rpc,
+                            start_block: 42,
+                            params: "bootstrap_block=42&pools=0x02".to_string(),
+                        }),
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let family_target = targets
+            .into_iter()
+            .find(|target| matches!(target, ResolvedRuntimeTarget::Family(_)))
+            .expect("family target present");
+
+        let execution = family_target
+            .substreams_execution_request()
+            .expect("family execution request derives");
+
+        assert_eq!(
+            execution.spkg,
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+        );
+        assert_eq!(execution.module, "map_uniswap_family_protocol_changes");
+        assert_eq!(execution.start_block, 43);
+        assert_eq!(execution.stop_block, 120);
+        assert_eq!(execution.extractor_id, "ethereum:uniswap_family");
+        assert_eq!(
+            execution.params,
+            HashMap::from([
+                ("map_pool_events".to_string(), "factory=0x01".to_string()),
+                ("map_events".to_string(), "factory=0x02".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn resolved_runtime_target_derives_standalone_substreams_execution_request() {
+        let curve = ExtractorConfig::new(
+            "curve".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            100,
+            Some(150),
+            vec![ProtocolTypeConfig::new("curve_pool".to_string(), FinancialType::Swap)],
+            "protocols/substreams/curve/curve.spkg".to_string(),
+            "map_curve".to_string(),
+            vec![],
+            0,
+            None,
+            None,
+            HashMap::from([("curve_events".to_string(), "factory=0x03".to_string())]),
+            Some(BootstrapConfig {
+                strategy: BootstrapStrategy::UniswapV2Rpc,
+                start_block: 100,
+                params: "bootstrap_block=100&pools=0x03".to_string(),
+            }),
+        );
+        let target = ResolvedRuntimeTarget::Standalone(ResolvedStandaloneRuntime {
+            protocol_system: "curve",
+            extractor_config: &curve,
+        });
+
+        let execution = target
+            .substreams_execution_request()
+            .expect("standalone execution request derives");
+
+        assert_eq!(execution.spkg, "protocols/substreams/curve/curve.spkg");
+        assert_eq!(execution.module, "map_curve");
+        assert_eq!(execution.start_block, 101);
+        assert_eq!(execution.stop_block, 150);
+        assert_eq!(execution.extractor_id, "ethereum:curve");
+        assert_eq!(
+            execution.params,
+            HashMap::from([("curve_events".to_string(), "factory=0x03".to_string())])
+        );
+    }
+
+    #[test]
+    fn resolved_runtime_target_derives_family_substreams_execution_request_with_start_block() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v2".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        Some(120),
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v2_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        HashMap::from([(
+                            "map_pool_events".to_string(),
+                            "factory=0x01".to_string(),
+                        )]),
+                        Some(BootstrapConfig {
+                            strategy: BootstrapStrategy::UniswapV2Rpc,
+                            start_block: 42,
+                            params: "bootstrap_block=42&pools=0x01".to_string(),
+                        }),
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v3".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        Some(120),
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v3_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
+                        Some(BootstrapConfig {
+                            strategy: BootstrapStrategy::UniswapV3Rpc,
+                            start_block: 42,
+                            params: "bootstrap_block=42&pools=0x02".to_string(),
+                        }),
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let family_target = targets
+            .into_iter()
+            .find(|target| matches!(target, ResolvedRuntimeTarget::Family(_)))
+            .expect("family target present");
+
+        let execution = family_target
+            .substreams_execution_request_with_start_block(88)
+            .expect("family execution request derives with explicit start block");
+
+        assert_eq!(
+            execution.spkg,
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+        );
+        assert_eq!(execution.module, "map_uniswap_family_protocol_changes");
+        assert_eq!(execution.start_block, 88);
+        assert_eq!(execution.stop_block, 120);
+        assert_eq!(execution.extractor_id, "ethereum:uniswap_family");
+        assert_eq!(
+            execution.params,
+            HashMap::from([
+                ("map_pool_events".to_string(), "factory=0x01".to_string()),
+                ("map_events".to_string(), "factory=0x02".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn select_resolved_runtime_target_selects_family_target_by_family_name() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let selected = select_resolved_runtime_target(
+            targets,
+            ResolvedRuntimeTargetSelector::Family("uniswap"),
+        )
+        .expect("family target selected");
+
+        match selected {
+            ResolvedRuntimeTarget::Family(family) => {
+                assert_eq!(family.family.family_name, "uniswap");
+                assert_eq!(family.extractor_configs.len(), 2);
+            }
+            ResolvedRuntimeTarget::Standalone(_) => panic!("expected family target"),
+        }
+    }
+
+    #[test]
+    fn select_resolved_runtime_target_selects_standalone_target_by_protocol_system() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_uniswap_family(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let selected = select_resolved_runtime_target(
+            targets,
+            ResolvedRuntimeTargetSelector::StandaloneProtocolSystem("curve"),
+        )
+        .expect("standalone target selected");
+
+        match selected {
+            ResolvedRuntimeTarget::Standalone(standalone) => {
+                assert_eq!(standalone.protocol_system, "curve");
+                assert_eq!(standalone.extractor_config.name(), "curve");
+            }
+            ResolvedRuntimeTarget::Family(_) => panic!("expected standalone target"),
+        }
+    }
+
+    #[test]
+    fn resolved_runtime_target_derives_initialized_accounts_requests_for_family_members() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v2".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        None,
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v2_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![Bytes::from([0x11; 20])],
+                        101,
+                        None,
+                        None,
+                        HashMap::new(),
+                        None,
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v3".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        None,
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v3_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![Bytes::from([0x22; 20]), Bytes::from([0x33; 20])],
+                        202,
+                        None,
+                        None,
+                        HashMap::new(),
+                        None,
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let family_target = targets
+            .into_iter()
+            .find(|target| matches!(target, ResolvedRuntimeTarget::Family(_)))
+            .expect("family target present");
+
+        let requests = family_target.initialized_accounts_requests();
+
+        assert_eq!(
+            requests,
+            vec![
+                ResolvedInitializedAccountsRequest {
+                    chain: Chain::Ethereum,
+                    accounts: vec![Bytes::from([0x11; 20])],
+                    block_id: 101,
+                },
+                ResolvedInitializedAccountsRequest {
+                    chain: Chain::Ethereum,
+                    accounts: vec![Bytes::from([0x22; 20]), Bytes::from([0x33; 20])],
+                    block_id: 202,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_runtime_target_coalesces_initialized_accounts_requests_by_block() {
+        let shared_account = Bytes::from([0xaa; 20]);
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v2".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        None,
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v2_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![shared_account.clone(), Bytes::from([0x11; 20])],
+                        101,
+                        None,
+                        None,
+                        HashMap::new(),
+                        None,
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_uniswap_family(
+                    ExtractorConfig::new(
+                        "uniswap_v3".to_string(),
+                        Chain::Ethereum,
+                        ImplementationType::Custom,
+                        1000,
+                        42,
+                        None,
+                        vec![ProtocolTypeConfig::new(
+                            "uniswap_v3_pool".to_string(),
+                            FinancialType::Swap,
+                        )],
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+                            .to_string(),
+                        "map_protocol_changes".to_string(),
+                        vec![shared_account, Bytes::from([0x22; 20])],
+                        101,
+                        None,
+                        None,
+                        HashMap::new(),
+                        None,
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let family_target = targets
+            .into_iter()
+            .find(|target| matches!(target, ResolvedRuntimeTarget::Family(_)))
+            .expect("family target present");
+
+        let requests = family_target.initialized_accounts_requests();
+
+        assert_eq!(
+            requests,
+            vec![ResolvedInitializedAccountsRequest {
+                chain: Chain::Ethereum,
+                accounts: vec![
+                    Bytes::from([0xaa; 20]),
+                    Bytes::from([0x11; 20]),
+                    Bytes::from([0x22; 20]),
+                ],
+                block_id: 101,
+            }]
+        );
+    }
+
+    #[test]
+    fn coalesced_initialized_accounts_requests_merge_across_runtime_targets() {
+        let shared_account = Bytes::from([0xaa; 20]);
+        let standalone_account = Bytes::from([0xbb; 20]);
+        let later_block_account = Bytes::from([0xcc; 20]);
+
+        let family_v2 = with_uniswap_family(
+            ExtractorConfig::new(
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                ImplementationType::Custom,
+                1000,
+                42,
+                None,
+                vec![ProtocolTypeConfig::new("uniswap_v2_pool".to_string(), FinancialType::Swap)],
+                "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+                "map_protocol_changes".to_string(),
+                vec![shared_account.clone(), Bytes::from([0x11; 20])],
+                101,
+                None,
+                None,
+                HashMap::new(),
+                None,
+            ),
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+        );
+        let family_v3 = with_uniswap_family(
+            ExtractorConfig::new(
+                "uniswap_v3".to_string(),
+                Chain::Ethereum,
+                ImplementationType::Custom,
+                1000,
+                42,
+                None,
+                vec![ProtocolTypeConfig::new("uniswap_v3_pool".to_string(), FinancialType::Swap)],
+                "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+                "map_protocol_changes".to_string(),
+                vec![shared_account.clone(), Bytes::from([0x22; 20])],
+                101,
+                None,
+                None,
+                HashMap::new(),
+                None,
+            ),
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+        );
+        let standalone_curve = ExtractorConfig::new(
+            "curve".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            42,
+            None,
+            vec![ProtocolTypeConfig::new("curve_pool".to_string(), FinancialType::Swap)],
+            "/tmp/curve.spkg".to_string(),
+            "map_protocol_changes".to_string(),
+            vec![shared_account, standalone_account],
+            101,
+            None,
+            None,
+            HashMap::new(),
+            None,
+        );
+        let standalone_balancer = ExtractorConfig::new(
+            "balancer".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            42,
+            None,
+            vec![ProtocolTypeConfig::new("balancer_pool".to_string(), FinancialType::Swap)],
+            "/tmp/balancer.spkg".to_string(),
+            "map_protocol_changes".to_string(),
+            vec![later_block_account],
+            202,
+            None,
+            None,
+            HashMap::new(),
+            None,
+        );
+
+        let extractors = HashMap::from([
+            ("uniswap_v2".to_string(), family_v2),
+            ("uniswap_v3".to_string(), family_v3),
+            ("curve".to_string(), standalone_curve),
+            ("balancer".to_string(), standalone_balancer),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let requests = coalesce_initialized_accounts_requests(targets.iter());
+
+        assert_eq!(
+            requests,
+            vec![
+                ResolvedInitializedAccountsRequest {
+                    chain: Chain::Ethereum,
+                    accounts: vec![
+                        Bytes::from([0xaa; 20]),
+                        Bytes::from([0x11; 20]),
+                        Bytes::from([0x22; 20]),
+                        Bytes::from([0xbb; 20]),
+                    ],
+                    block_id: 101,
+                },
+                ResolvedInitializedAccountsRequest {
+                    chain: Chain::Ethereum,
+                    accounts: vec![Bytes::from([0xcc; 20])],
+                    block_id: 202,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_runtime_plan_precomputes_family_execution_settings() {
+        let v2 = with_uniswap_family(
+            ExtractorConfig::new(
+                "uniswap_v2".to_string(),
+                Chain::Ethereum,
+                ImplementationType::Custom,
+                1000,
+                42,
+                Some(120),
+                vec![ProtocolTypeConfig::new("uniswap_v2_pool".to_string(), FinancialType::Swap)],
+                "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+                "map_protocol_changes".to_string(),
+                vec![],
+                0,
+                None,
+                None,
+                HashMap::from([("map_pool_events".to_string(), "factory=0x01".to_string())]),
+                Some(crate::extractor::runner::BootstrapConfig {
+                    strategy: BootstrapStrategy::UniswapV2Rpc,
+                    start_block: 42,
+                    params: "bootstrap_block=42&pools=0x01".to_string(),
+                }),
+            ),
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+        );
+
+        let v3 = with_uniswap_family(
+            ExtractorConfig::new(
+                "uniswap_v3".to_string(),
+                Chain::Ethereum,
+                ImplementationType::Custom,
+                1000,
+                42,
+                Some(120),
+                vec![ProtocolTypeConfig::new("uniswap_v3_pool".to_string(), FinancialType::Swap)],
+                "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+                "map_protocol_changes".to_string(),
+                vec![],
+                0,
+                None,
+                None,
+                HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
+                Some(crate::extractor::runner::BootstrapConfig {
+                    strategy: BootstrapStrategy::UniswapV3Rpc,
+                    start_block: 42,
+                    params: "bootstrap_block=42&pools=0x02".to_string(),
+                }),
+            ),
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+        );
+
+        let extractors =
+            HashMap::from([("uniswap_v2".to_string(), v2), ("uniswap_v3".to_string(), v3)]);
+
+        let resolved = build_resolved_family_runtime_plan(&extractors)
+            .expect("resolved family runtime plan should build");
+
+        let family = resolved
+            .families
+            .first()
+            .expect("one uniswap family should be resolved");
+
+        assert_eq!(
+            family.execution.shared_stream.spkg,
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+        );
+        assert_eq!(family.execution.shared_stream.module, "map_uniswap_family_protocol_changes");
+        assert_eq!(
+            family
+                .execution
+                .shared_stream
+                .extractor_id,
+            "ethereum:uniswap_family"
+        );
+        assert_eq!(
+            family
+                .execution
+                .shared_bootstrap_branches
+                .len(),
+            2
+        );
+        assert_eq!(family.execution.stop_block, 120);
+        assert_eq!(family.execution.configured_start_block, 43);
+        assert_eq!(
+            family
+                .execution
+                .merged_substreams_params,
+            HashMap::from([
+                ("map_pool_events".to_string(), "factory=0x01".to_string()),
+                ("map_events".to_string(), "factory=0x02".to_string()),
+            ])
+        );
+        let bootstrap_plan = family
+            .execution
+            .bootstrap_plan
+            .as_ref()
+            .expect("family execution should precompute shared bootstrap plan");
+        assert_eq!(bootstrap_plan.bootstrap_block, 42);
+        assert_eq!(bootstrap_plan.branches.len(), 2);
     }
 
     #[test]
@@ -1458,9 +2755,9 @@ mod tests {
         let err = build_resolved_family_runtime_plan(&extractors)
             .expect_err("partial shared bootstrap config should fail during planning");
 
-        assert!(err
-            .to_string()
-            .contains("family `uniswap` requires shared bootstrap configuration consistency across members"));
+        assert!(err.to_string().contains(
+            "family `uniswap` requires shared bootstrap configuration consistency across members"
+        ));
     }
 
     #[test]
@@ -1526,10 +2823,8 @@ mod tests {
             ),
             "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
         );
-        v2.substreams_params = HashMap::from([(
-            "map_pool_events".to_string(),
-            "factory=0x01".to_string(),
-        )]);
+        v2.substreams_params =
+            HashMap::from([("map_pool_events".to_string(), "factory=0x01".to_string())]);
 
         let mut v3 = with_uniswap_family(
             make_config(
@@ -1538,10 +2833,8 @@ mod tests {
             ),
             "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
         );
-        v3.substreams_params = HashMap::from([(
-            "map_pool_events".to_string(),
-            "factory=0x02".to_string(),
-        )]);
+        v3.substreams_params =
+            HashMap::from([("map_pool_events".to_string(), "factory=0x02".to_string())]);
 
         let extractors =
             HashMap::from([("uniswap_v2".to_string(), v2), ("uniswap_v3".to_string(), v3)]);
@@ -1597,15 +2890,28 @@ mod tests {
 
     #[test]
     fn stream_extractor_id_uses_detected_chain() {
-        let family = DetectedFamilyRuntime {
-            family_name: "uniswap".to_string(),
-            chain: Chain::Base,
-            member_protocol_systems: vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()],
-            shared_spkg: "protocols/substreams/base-uniswap-v2-v3-combined/test.spkg".to_string(),
-            output_module: "map_uniswap_family_protocol_changes".to_string(),
-        };
+        let family = default_family_runtime_registry()
+            .detected_family_runtime(
+                "uniswap",
+                Chain::Base,
+                "protocols/substreams/base-uniswap-v2-v3-combined/test.spkg",
+            )
+            .expect("registered uniswap family runtime");
 
         assert_eq!(family.stream_extractor_id(), "base:uniswap_family");
+    }
+
+    #[test]
+    fn durability_scope_uses_detected_family_name() {
+        let family = default_family_runtime_registry()
+            .detected_family_runtime(
+                "uniswap",
+                Chain::Base,
+                "protocols/substreams/base-uniswap-v2-v3-combined/test.spkg",
+            )
+            .expect("registered uniswap family runtime");
+
+        assert_eq!(family.durability_scope(), "family::uniswap");
     }
 
     #[test]
@@ -1616,16 +2922,21 @@ mod tests {
         let v2_bootstrap = BootstrapConfig {
             strategy: BootstrapStrategy::UniswapV2Rpc,
             start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678".to_string(),
+            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
+                .to_string(),
         };
         let v3_bootstrap = BootstrapConfig {
             strategy: BootstrapStrategy::UniswapV3Rpc,
             start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_string(),
+            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
+                .to_string(),
         };
 
         let family_name = registry
-            .resolve_shared_bootstrap_plan_family_name(&[(&v2, &v2_bootstrap), (&v3, &v3_bootstrap)])
+            .resolve_shared_bootstrap_plan_family_name(&[
+                (&v2, &v2_bootstrap),
+                (&v3, &v3_bootstrap),
+            ])
             .expect("family name should resolve");
 
         assert_eq!(family_name, Some("uniswap".to_string()));
@@ -1698,10 +3009,7 @@ mod tests {
             .expect("v3 params parse");
 
         assert_eq!(params.bootstrap_block, 42);
-        assert_eq!(
-            params.pools,
-            vec![Bytes::from("0x0000000000000000000000000000000000000003")]
-        );
+        assert_eq!(params.pools, vec![Bytes::from("0x0000000000000000000000000000000000000003")]);
     }
 
     #[test]
@@ -1721,6 +3029,8 @@ mod tests {
                 },
             ],
             output_module: "map_future_swap_family_protocol_changes",
+            shared_stream_name: "future_swap_family",
+            durability_scope: "family::future_swap_runtime",
             shared_bootstrap_runtime: None,
         };
         const SPECS: &[FamilyRuntimeSpec] = &[FUTURE_FAMILY];
@@ -1734,9 +3044,8 @@ mod tests {
                         shared_spkg: Some(
                             "protocols/substreams/future-swap-combined/test.spkg".to_string(),
                         ),
-                        shared_module: Some(
-                            "map_future_swap_family_protocol_changes".to_string(),
-                        ),
+                        shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
+                        durability_scope: None,
                     },
                 )),
             ),
@@ -1748,9 +3057,8 @@ mod tests {
                         shared_spkg: Some(
                             "protocols/substreams/future-swap-combined/test.spkg".to_string(),
                         ),
-                        shared_module: Some(
-                            "map_future_swap_family_protocol_changes".to_string(),
-                        ),
+                        shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
+                        durability_scope: None,
                     },
                 )),
             ),
@@ -1771,6 +3079,8 @@ mod tests {
             vec!["future_v1".to_string(), "future_v2".to_string()]
         );
         assert_eq!(detected[0].output_module, "map_future_swap_family_protocol_changes");
+        assert_eq!(detected[0].shared_stream_name, "future_swap_family");
+        assert_eq!(detected[0].durability_scope, "family::future_swap_runtime");
         assert_eq!(plan.standalone_protocol_systems, vec!["curve".to_string()]);
         assert_eq!(resolved.families.len(), 1);
         assert_eq!(
@@ -1779,7 +3089,7 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(resolved.standalone_extractors[0].0, "curve");
+        assert_eq!(resolved.standalone_extractors[0].protocol_system, "curve");
 
         let targets = build_resolved_runtime_targets_with_registry(&extractors, registry)
             .expect("custom resolved targets build");
@@ -1805,6 +3115,8 @@ mod tests {
                 shared_bootstrap: None,
             }],
             output_module: "map_family_a",
+            shared_stream_name: "family_a_stream",
+            durability_scope: "family::family_a",
             shared_bootstrap_runtime: None,
         };
         const FAMILY_B: FamilyRuntimeSpec = FamilyRuntimeSpec {
@@ -1815,6 +3127,8 @@ mod tests {
                 shared_bootstrap: None,
             }],
             output_module: "map_family_b",
+            shared_stream_name: "family_b_stream",
+            durability_scope: "family::family_b",
             shared_bootstrap_runtime: None,
         };
         const SPECS: &[FamilyRuntimeSpec] = &[FAMILY_A, FAMILY_B];
@@ -1824,9 +3138,9 @@ mod tests {
             .validate()
             .expect_err("duplicate protocol system across families should fail");
 
-        assert!(err
-            .to_string()
-            .contains("assigns protocol system `shared_protocol` to both `family_a` and `family_b`"));
+        assert!(err.to_string().contains(
+            "assigns protocol system `shared_protocol` to both `family_a` and `family_b`"
+        ));
     }
 
     fn parse_future_params(params: &str) -> Result<SharedBootstrapParams, ExtractionError> {
@@ -1834,9 +3148,22 @@ mod tests {
             .split("pool=")
             .nth(1)
             .ok_or_else(|| ExtractionError::Setup("missing pool param".to_string()))?;
-        Ok(SharedBootstrapParams {
-            bootstrap_block: 99,
-            pools: vec![Bytes::from(pool)],
+        Ok(SharedBootstrapParams { bootstrap_block: 99, pools: vec![Bytes::from(pool)] })
+    }
+
+    fn materialize_future_branch_fallback<'a>(
+        _rpc: &'a EthereumRpcClient,
+        _branch: &'a BootstrapBranchDescriptor,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::extractor::models::BlockChanges, ExtractionError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(ExtractionError::Setup("future branch fallback materializer reached".to_string()))
         })
     }
 
@@ -1852,14 +3179,14 @@ mod tests {
                     SharedBootstrapParamsParser::Custom(parse_future_params),
                     |_rpc, _branch| {
                         Box::pin(async {
-                            Err(ExtractionError::Setup(
-                                "not used in this test".to_string(),
-                            ))
+                            Err(ExtractionError::Setup("not used in this test".to_string()))
                         })
                     },
                 )),
             )],
             "map_future_swap_family_protocol_changes",
+            "future_swap_family",
+            "family::future_swap",
             None,
         );
         let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
@@ -1873,10 +3200,53 @@ mod tests {
             .expect("custom registry params parse");
 
         assert_eq!(params.bootstrap_block, 99);
-        assert_eq!(
-            params.pools,
-            vec![Bytes::from("0x0000000000000000000000000000000000000099")]
+        assert_eq!(params.pools, vec![Bytes::from("0x0000000000000000000000000000000000000099")]);
+    }
+
+    #[tokio::test]
+    async fn custom_registry_defaults_shared_bootstrap_plan_materializer_from_branch_runtimes() {
+        const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
+            "future_swap",
+            &[shared_family_member_spec(
+                "future_v1",
+                &["futurev1"],
+                Some(shared_bootstrap_member_runtime(
+                    BootstrapStrategy::UniswapV2Rpc,
+                    SharedBootstrapParamsParser::Custom(parse_future_params),
+                    materialize_future_branch_fallback,
+                )),
+            )],
+            "map_future_swap_family_protocol_changes",
+            "future_swap_family",
+            "family::future_swap",
+            None,
         );
+        let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
+        let rpc = EthereumRpcClient::new("http://localhost:0000").expect("stub rpc client builds");
+        let plan = SharedBootstrapPlan {
+            family_name: Some("future_swap".to_string()),
+            bootstrap_block: 99,
+            branches: vec![BootstrapBranchDescriptor {
+                extractor_name: "future_v1".to_string(),
+                protocol_system: "future_v1".to_string(),
+                chain: Chain::Ethereum,
+                strategy: BootstrapStrategy::UniswapV2Rpc,
+                params: SharedBootstrapParams {
+                    bootstrap_block: 99,
+                    pools: vec![Bytes::from("0x0000000000000000000000000000000000000099")],
+                },
+            }],
+        };
+
+        let err = registry
+            .materialize_shared_bootstrap_plan("future_swap", &rpc, &plan)
+            .expect("registry should resolve default plan materializer")
+            .await
+            .expect_err("default branch-level materializer should run");
+
+        assert!(err
+            .to_string()
+            .contains("future branch fallback materializer reached"));
     }
 
     #[test]
@@ -1902,11 +3272,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_bootstrap_member_without_route_aliases() {
+    fn registry_defaults_bootstrap_member_route_aliases_from_protocol_system() {
         const BROKEN_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
             "broken_family",
             &[shared_family_member_spec(
-                "broken_protocol",
+                "broken_protocol_v2",
                 &[],
                 Some(shared_bootstrap_member_runtime(
                     BootstrapStrategy::UniswapV2Rpc,
@@ -1915,17 +3285,20 @@ mod tests {
                 )),
             )],
             "map_broken_family",
+            "broken_family_stream",
+            "family::broken_family",
             None,
         );
         let registry = FamilyRuntimeRegistry::new(&[BROKEN_FAMILY]);
 
-        let err = registry
+        registry
             .validate()
-            .expect_err("bootstrap-capable member without route aliases should fail");
-
-        assert!(err
-            .to_string()
-            .contains("declares shared bootstrap handlers but no shared route protocol aliases"));
+            .expect("bootstrap-capable member without explicit route aliases should default from protocol system");
+        assert_eq!(
+            registry
+                .normalized_shared_route_protocol_filter_for_protocol_system("broken_protocol_v2"),
+            Some(HashSet::from(["brokenprotocolv2".to_string()]))
+        );
     }
 
     #[test]
@@ -1945,6 +3318,8 @@ mod tests {
                 },
             ],
             output_module: "map_broken_family",
+            shared_stream_name: "broken_family_stream",
+            durability_scope: "family::broken_family",
             shared_bootstrap_runtime: None,
         };
         let registry = FamilyRuntimeRegistry::new(&[BROKEN_FAMILY]);
@@ -2064,11 +3439,8 @@ mod tests {
             ),
             (
                 "v3".to_string(),
-                make_config(
-                    "v3",
-                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-                )
-                .with_protocol_system("uniswap_v3"),
+                make_config("v3", "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg")
+                    .with_protocol_system("uniswap_v3"),
             ),
         ]);
 
@@ -2098,33 +3470,99 @@ mod tests {
     }
 
     #[test]
-    fn registry_exposes_shared_route_protocol_aliases() {
+    fn registry_exposes_normalized_shared_route_protocol_aliases() {
         let registry = default_family_runtime_registry();
 
         assert_eq!(
-            registry.shared_route_protocols_for_protocol_system("uniswap_v2"),
-            Some(&["uniswapv2"][..])
+            registry.normalized_shared_route_protocol_filter_for_protocol_system("uniswap_v2"),
+            Some(HashSet::from([String::from("uniswapv2")]))
         );
         assert_eq!(
-            registry.shared_route_protocols_for_protocol_system("uniswap_v3"),
-            Some(&["uniswapv3"][..])
+            registry.normalized_shared_route_protocol_filter_for_protocol_system("uniswap_v3"),
+            Some(HashSet::from([String::from("uniswapv3")]))
         );
-        assert_eq!(registry.shared_route_protocols_for_protocol_system("curve"), None);
+        assert_eq!(
+            registry.normalized_shared_route_protocol_filter_for_protocol_system("curve"),
+            None
+        );
     }
 
     #[test]
     fn registry_resolves_family_name_for_protocol_system() {
         let registry = default_family_runtime_registry();
 
-        assert_eq!(
-            registry.family_name_for_protocol_system("uniswap_v2"),
-            Some("uniswap")
-        );
-        assert_eq!(
-            registry.family_name_for_protocol_system("uniswap_v3"),
-            Some("uniswap")
-        );
+        assert_eq!(registry.family_name_for_protocol_system("uniswap_v2"), Some("uniswap"));
+        assert_eq!(registry.family_name_for_protocol_system("uniswap_v3"), Some("uniswap"));
         assert_eq!(registry.family_name_for_protocol_system("curve"), None);
+    }
+
+    #[test]
+    fn registry_exposes_output_module_for_family_and_protocol_system() {
+        let registry = default_family_runtime_registry();
+
+        assert_eq!(
+            registry.output_module_for_family("uniswap"),
+            Some("map_uniswap_family_protocol_changes")
+        );
+        assert_eq!(
+            registry.output_module_for_protocol_system("uniswap_v2"),
+            Some("map_uniswap_family_protocol_changes")
+        );
+        assert_eq!(
+            registry.output_module_for_protocol_system("uniswap_v3"),
+            Some("map_uniswap_family_protocol_changes")
+        );
+        assert_eq!(registry.output_module_for_family("curve"), None);
+        assert_eq!(registry.output_module_for_protocol_system("curve"), None);
+    }
+
+    #[test]
+    fn registry_exposes_member_protocol_systems_for_family() {
+        let registry = default_family_runtime_registry();
+
+        assert_eq!(
+            registry.member_protocol_systems_for_family("uniswap"),
+            Some(vec!["uniswap_v2", "uniswap_v3"])
+        );
+        assert_eq!(registry.member_protocol_systems_for_family("curve"), None);
+    }
+
+    #[test]
+    fn registry_builds_detected_family_runtime_from_registered_metadata() {
+        let family = default_family_runtime_registry()
+            .detected_family_runtime("uniswap", Chain::Ethereum, "/tmp/test.spkg")
+            .expect("registered uniswap family runtime");
+
+        assert_eq!(family.family_name, "uniswap");
+        assert_eq!(
+            family.member_protocol_systems,
+            vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()]
+        );
+        assert_eq!(family.shared_spkg, "/tmp/test.spkg");
+        assert_eq!(family.output_module, "map_uniswap_family_protocol_changes");
+        assert_eq!(family.shared_stream_name, "uniswap_family");
+        assert_eq!(family.durability_scope, "family::uniswap");
+    }
+
+    #[test]
+    fn registry_exposes_shared_stream_identity_for_family() {
+        let registry = default_family_runtime_registry();
+
+        assert_eq!(registry.shared_stream_name_for_family("uniswap"), Some("uniswap_family"));
+        assert_eq!(registry.durability_scope_for_family("uniswap"), Some("family::uniswap"));
+        assert_eq!(registry.shared_stream_name_for_family("curve"), None);
+        assert_eq!(registry.durability_scope_for_family("curve"), None);
+
+        let identity = registry
+            .shared_stream_identity_for_family(Chain::Ethereum, "uniswap")
+            .expect("uniswap family stream identity");
+        assert_eq!(identity.output_module, "map_uniswap_family_protocol_changes");
+        assert_eq!(identity.shared_stream_name, "uniswap_family");
+        assert_eq!(identity.extractor_id, "ethereum:uniswap_family");
+        assert_eq!(identity.durability_scope, "family::uniswap");
+        assert!(registry
+            .shared_stream_identity_for_family(Chain::Ethereum, "curve")
+            .is_none());
     }
 
     #[test]
@@ -2138,6 +3576,7 @@ mod tests {
                     family: "uniswap".to_string(),
                     shared_spkg: None,
                     shared_module: None,
+                    durability_scope: None,
                 },
             )
             .expect("uniswap v2 belongs to uniswap family");
@@ -2151,12 +3590,13 @@ mod tests {
                     family: "uniswap".to_string(),
                     shared_spkg: None,
                     shared_module: None,
+                    durability_scope: None,
                 },
             )
             .expect_err("curve should not belong to uniswap family");
-        assert!(err.to_string().contains(
-            "family_runtime `uniswap` cannot be applied to protocol system `curve`"
-        ));
+        assert!(err
+            .to_string()
+            .contains("family_runtime `uniswap` cannot be applied to protocol system `curve`"));
     }
 
     #[test]
@@ -2170,9 +3610,11 @@ mod tests {
                     family: "uniswap".to_string(),
                     shared_spkg: None,
                     shared_module: None,
+                    durability_scope: None,
                 },
                 Some("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string()),
                 Some("map_uniswap_family_protocol_changes".to_string()),
+                None,
             )
             .expect("family runtime defaults should resolve");
 
@@ -2181,10 +3623,73 @@ mod tests {
             resolved.shared_spkg.as_deref(),
             Some("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg")
         );
+        assert_eq!(resolved.shared_module.as_deref(), Some("map_uniswap_family_protocol_changes"));
+        assert_eq!(resolved.durability_scope.as_deref(), Some("family::uniswap"));
+    }
+
+    #[test]
+    fn registry_resolves_family_runtime_config_with_registry_output_module_default() {
+        let registry = default_family_runtime_registry();
+
+        let resolved = registry
+            .resolve_family_runtime_config(
+                "uniswap_v2",
+                FamilyRuntimeConfig {
+                    family: "uniswap".to_string(),
+                    shared_spkg: None,
+                    shared_module: None,
+                    durability_scope: None,
+                },
+                Some("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string()),
+                None,
+                None,
+            )
+            .expect("family runtime should inherit output module from registry");
+
+        assert_eq!(resolved.family, "uniswap");
         assert_eq!(
-            resolved.shared_module.as_deref(),
-            Some("map_uniswap_family_protocol_changes")
+            resolved.shared_spkg.as_deref(),
+            Some("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg")
         );
+        assert_eq!(resolved.shared_module.as_deref(), Some("map_uniswap_family_protocol_changes"));
+        assert_eq!(resolved.durability_scope.as_deref(), Some("family::uniswap"));
+    }
+
+    #[test]
+    fn registry_resolves_family_runtime_config_with_registry_durability_scope_default() {
+        const FUTURE_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec {
+            family_name: "future_swap",
+            members: &[FamilyMemberSpec {
+                protocol_system: "future_v1",
+                shared_route_protocols: &["futurev1"],
+                shared_bootstrap: None,
+            }],
+            output_module: "map_future_swap_family_protocol_changes",
+            shared_stream_name: "future_swap_family",
+            durability_scope: "family::future_swap_runtime",
+            shared_bootstrap_runtime: None,
+        };
+        const SPECS: &[FamilyRuntimeSpec] = &[FUTURE_FAMILY];
+        let registry = FamilyRuntimeRegistry::new(SPECS);
+
+        let resolved = registry
+            .resolve_family_runtime_config(
+                "future_v1",
+                FamilyRuntimeConfig {
+                    family: "future_swap".to_string(),
+                    shared_spkg: Some(
+                        "protocols/substreams/future-swap-combined/test.spkg".to_string(),
+                    ),
+                    shared_module: None,
+                    durability_scope: None,
+                },
+                None,
+                None,
+                None,
+            )
+            .expect("family runtime should inherit durability scope from registry");
+
+        assert_eq!(resolved.durability_scope.as_deref(), Some("family::future_swap_runtime"));
     }
 
     #[test]
@@ -2208,6 +3713,8 @@ mod tests {
                 },
             ],
             output_module: "map_partial_swap_family_protocol_changes",
+            shared_stream_name: "partial_swap_family",
+            durability_scope: "family::partial_swap",
             shared_bootstrap_runtime: None,
         };
         let registry = FamilyRuntimeRegistry::new(&[PARTIAL_FAMILY]);
@@ -2242,6 +3749,8 @@ mod tests {
                 },
             ],
             output_module: "map_partial_swap_family_protocol_changes",
+            shared_stream_name: "partial_swap_family",
+            durability_scope: "family::partial_swap",
             shared_bootstrap_runtime: None,
         };
         let registry = FamilyRuntimeRegistry::new(&[PARTIAL_FAMILY]);
@@ -2267,9 +3776,6 @@ mod tests {
             registry.normalized_shared_route_protocol_filter_for_protocol_system("uniswap_v2"),
             Some(HashSet::from(["uniswapv2".to_string()]))
         );
-        assert_eq!(
-            canonicalize_shared_route_protocol("Uniswap-V3"),
-            "uniswapv3".to_string()
-        );
+        assert_eq!(canonicalize_shared_route_protocol("Uniswap-V3"), "uniswapv3".to_string());
     }
 }

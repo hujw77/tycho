@@ -79,6 +79,36 @@ impl SubstreamsStream {
 static DEFAULT_BACKOFF: Lazy<ExponentialBackoff> =
     Lazy::new(|| ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(45)));
 
+#[allow(clippy::too_many_arguments)]
+pub fn build_substreams_request(
+    cursor: Option<String>,
+    package: Option<Package>,
+    output_module_name: String,
+    start_block_num: i64,
+    stop_block_num: u64,
+    final_blocks_only: bool,
+    partial_blocks: bool,
+    params: HashMap<String, String>,
+) -> Request {
+    Request {
+        start_block_num,
+        start_cursor: cursor.unwrap_or_default(),
+        stop_block_num,
+        final_blocks_only,
+        package,
+        params,
+        network: String::new(), // TODO: check if we need to set the network?
+        output_module: output_module_name,
+        production_mode: true,
+        debug_initial_store_snapshot_for_modules: vec![],
+        dev_output_modules: vec![],
+        limit_processed_blocks: u64::MAX,
+        progress_messages_interval_ms: 30 * 1000,
+        partial_blocks,
+        noop_mode: false,
+    }
+}
+
 async fn wait_for_next_retry(
     backoff: &mut ExponentialBackoff,
     retry_count: &mut u32,
@@ -126,27 +156,16 @@ fn stream_blocks(
                 warn!("Blockstreams disconnected, connecting again");
             }
 
-            let result = endpoint.clone().substreams(Request {
+            let result = endpoint.clone().substreams(build_substreams_request(
+                Some(latest_cursor.clone()),
+                package.clone(),
+                output_module_name.clone(),
                 start_block_num,
-                start_cursor: latest_cursor.clone(),
                 stop_block_num,
                 final_blocks_only,
-                package: package.clone(),
-                params: params.clone(),
-                network: String::new(), // TODO: check if we need to set the network?
-                output_module: output_module_name.clone(),
-                // There is usually no good reason for you to consume the stream development mode (so switching `true`
-                // to `false`). If you do switch it, be aware that more than one output module will be send back to you,
-                // and the current code in `process_block_scoped_data` (within your 'main.rs' file) expects a single
-                // module.
-                production_mode: true,
-                debug_initial_store_snapshot_for_modules: vec![],
-                dev_output_modules: vec![],
-                limit_processed_blocks: u64::MAX,
-                progress_messages_interval_ms: 30 * 1000,
                 partial_blocks,
-                noop_mode: false,
-            }).await;
+                params.clone(),
+            )).await;
 
             match result {
                 Ok(stream) => {
@@ -295,7 +314,7 @@ mod tests {
     use super::{stream_blocks, BlockResponse};
     use crate::{
         pb::sf::substreams::rpc::v2::{
-            response::Message, BlockScopedData, Response, SessionInit,
+            response::Message, BlockScopedData, BlockUndoSignal, Response, SessionInit,
         },
         substreams::{
             mock::{start_scripted_mock_substreams, MockSubstreamsScript},
@@ -341,6 +360,26 @@ mod tests {
         }
     }
 
+    fn undo_response(last_valid_block: u64, last_valid_cursor: &str) -> Response {
+        Response {
+            message: Some(Message::BlockUndoSignal(BlockUndoSignal {
+                last_valid_block: Some(crate::pb::sf::substreams::v1::BlockRef {
+                    id: last_valid_block.to_string(),
+                    number: last_valid_block,
+                }),
+                last_valid_cursor: last_valid_cursor.to_string(),
+            })),
+        }
+    }
+
+    fn family_stream_identity(family_name: &str) -> (String, String) {
+        let registry = crate::extractor::family_runtime::default_family_runtime_registry();
+        let identity = registry
+            .shared_stream_identity_for_family(tycho_common::models::Chain::Ethereum, family_name)
+            .unwrap_or_else(|| panic!("family `{family_name}` shared stream identity"));
+        (identity.output_module.to_string(), identity.extractor_id)
+    }
+
     #[tokio::test]
     async fn reconnects_with_latest_cursor_after_stream_error() {
         let (captured, addr) = start_scripted_mock_substreams(vec![
@@ -362,15 +401,16 @@ mod tests {
                 .await
                 .expect("endpoint builds"),
         );
+        let (module, extractor_id) = family_stream_identity("uniswap");
         let mut stream = Box::pin(stream_blocks(
             endpoint,
             None,
             None,
-            "map_uniswap_family_protocol_changes".to_string(),
+            module,
             42,
             0,
             false,
-            "ethereum:uniswap_family".to_string(),
+            extractor_id,
             false,
             HashMap::new(),
         ));
@@ -411,6 +451,102 @@ mod tests {
         assert_eq!(
             requests[1].start_cursor, "cursor@42",
             "hot reconnect should resume from latest cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnects_with_last_valid_cursor_after_undo_and_stream_error() {
+        let (captured, addr) = start_scripted_mock_substreams(vec![
+            MockSubstreamsScript {
+                responses: vec![
+                    session_response(),
+                    block_response(42, "cursor@42"),
+                    undo_response(41, "cursor@41"),
+                ],
+                grpc_status: "13",
+                grpc_message: Some("forced-reconnect"),
+            },
+            MockSubstreamsScript {
+                responses: vec![session_response(), block_response(42, "cursor@42b")],
+                grpc_status: "0",
+                grpc_message: None,
+            },
+        ])
+        .await;
+
+        let endpoint = Arc::new(
+            SubstreamsEndpoint::new(format!("http://{addr}"), None)
+                .await
+                .expect("endpoint builds"),
+        );
+        let (module, extractor_id) = family_stream_identity("uniswap");
+        let mut stream = Box::pin(stream_blocks(
+            endpoint,
+            None,
+            None,
+            module,
+            42,
+            0,
+            false,
+            extractor_id,
+            false,
+            HashMap::new(),
+        ));
+
+        let first = stream
+            .next()
+            .await
+            .expect("first response exists")
+            .expect("first response succeeds");
+        let undo = stream
+            .next()
+            .await
+            .expect("undo response exists")
+            .expect("undo response succeeds");
+        let second = stream
+            .next()
+            .await
+            .expect("second block response exists")
+            .expect("second block response succeeds");
+        let ended = stream
+            .next()
+            .await
+            .expect("ended response exists")
+            .expect("ended response succeeds");
+
+        match first {
+            BlockResponse::New(block) => assert_eq!(block.cursor, "cursor@42"),
+            _ => panic!("expected first response to be a new block"),
+        }
+        match undo {
+            BlockResponse::Undo(signal) => {
+                assert_eq!(signal.last_valid_cursor, "cursor@41");
+                assert_eq!(
+                    signal
+                        .last_valid_block
+                        .as_ref()
+                        .map(|block| block.number),
+                    Some(41)
+                );
+            }
+            _ => panic!("expected second response to be an undo signal"),
+        }
+        match second {
+            BlockResponse::New(block) => assert_eq!(block.cursor, "cursor@42b"),
+            _ => panic!("expected third response to be a new block"),
+        }
+        assert!(matches!(ended, BlockResponse::Ended));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "expected one initial request and one reconnect");
+        assert_eq!(requests[0].start_block_num, 42);
+        assert!(
+            requests[0].start_cursor.is_empty(),
+            "fresh shared stream should start without cursor"
+        );
+        assert_eq!(
+            requests[1].start_cursor, "cursor@41",
+            "hot reconnect after undo should resume from the last valid cursor"
         );
     }
 }

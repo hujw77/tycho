@@ -111,11 +111,11 @@ fn extract_contract_changes_generic<
             let filtered_calls = block_tx.calls.iter().filter(|call| {
                 let address_included = inclusion_predicate(&call.address);
                 let caller_included = inclusion_predicate(&call.caller);
-                let is_delegate_or_callcode = call.call_type() == CallType::Delegate ||
-                    call.call_type() == CallType::Callcode;
+                let is_delegate_or_callcode = call.call_type() == CallType::Delegate
+                    || call.call_type() == CallType::Callcode;
 
-                !call.state_reverted &&
-                    (address_included || (caller_included && is_delegate_or_callcode))
+                !call.state_reverted
+                    && (address_included || (caller_included && is_delegate_or_callcode))
             });
 
             filtered_calls.for_each(|call| {
@@ -178,9 +178,9 @@ fn extract_contract_changes_generic<
                     contract_change.set_code(&code_change.new_code);
                 });
 
-            if !storage_changes.is_empty() ||
-                !balance_changes.is_empty() ||
-                !code_changes.is_empty()
+            if !storage_changes.is_empty()
+                || !balance_changes.is_empty()
+                || !code_changes.is_empty()
             {
                 store_changes(block_tx, &changed_contracts)
             }

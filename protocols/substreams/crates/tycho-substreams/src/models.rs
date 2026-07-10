@@ -465,8 +465,8 @@ impl InterimEntityChanges {
         // Note: If it's already present in `self.attributes` it means this is not a real
         // creation (it can be a deletion -> creation sequence for example), in that case we don't
         // want to mark it as created.
-        if attr.change == i32::from(ChangeType::Creation) &&
-            !self.attributes.contains_key(&attr.name)
+        if attr.change == i32::from(ChangeType::Creation)
+            && !self.attributes.contains_key(&attr.name)
         {
             self.created_attributes
                 .insert(attr.name.clone());
@@ -474,8 +474,9 @@ impl InterimEntityChanges {
 
         // If a freshly created attribute is deleted, remove the creation and don't emit the
         // deletion.
-        if attr.change == i32::from(ChangeType::Deletion) &&
-            self.created_attributes
+        if attr.change == i32::from(ChangeType::Deletion)
+            && self
+                .created_attributes
                 .contains(&attr.name)
         {
             self.attributes.remove(&attr.name);
@@ -634,20 +635,20 @@ impl From<InterimContractChange> for Option<ContractChange> {
 
 impl ContractChange {
     fn is_empty(&self) -> bool {
-        self.balance.is_empty() &&
-            self.slots.is_empty() &&
-            self.code.is_empty() &&
-            self.token_balances.is_empty() &&
-            self.change == i32::from(ChangeType::Update)
+        self.balance.is_empty()
+            && self.slots.is_empty()
+            && self.code.is_empty()
+            && self.token_balances.is_empty()
+            && self.change == i32::from(ChangeType::Update)
     }
 }
 
 impl TransactionChanges {
     fn is_empty(&self) -> bool {
-        self.contract_changes.is_empty() &&
-            self.component_changes.is_empty() &&
-            self.balance_changes.is_empty() &&
-            self.entity_changes.is_empty()
+        self.contract_changes.is_empty()
+            && self.component_changes.is_empty()
+            && self.balance_changes.is_empty()
+            && self.entity_changes.is_empty()
     }
 }
 
