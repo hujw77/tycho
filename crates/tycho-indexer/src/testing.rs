@@ -1,10 +1,29 @@
 use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
-use crate::extractor::runner::FamilyRuntimeConfig;
+use crate::config::ExtractorConfigs;
+#[cfg(test)]
+use crate::extractor::family_registry::{
+    shared_bootstrap_member_runtime, shared_family_member_spec, shared_family_runtime_spec,
+};
+#[cfg(test)]
+use crate::extractor::family_runtime::{
+    default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec,
+    SharedBootstrapParamsParser,
+};
+#[cfg(test)]
+use crate::extractor::family_runtime::FamilyRuntimeConfig;
+#[cfg(test)]
+use crate::extractor::shared_bootstrap::BootstrapBranchDescriptor;
+#[cfg(test)]
+use crate::extractor::{models::BlockChanges, runner::BootstrapStrategy, ExtractionError};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use mockall::mock;
+#[cfg(test)]
+use serde::Deserialize;
+#[cfg(test)]
+use tycho_common::models::ImplementationType;
 use tycho_common::{
     models::{
         blockchain::{
@@ -27,6 +46,8 @@ use tycho_common::{
     },
     Bytes,
 };
+#[cfg(test)]
+use tycho_ethereum::rpc::EthereumRpcClient;
 
 mock! {
     pub Gateway {}
@@ -726,11 +747,33 @@ pub fn scripted_undo_response(
 #[cfg(test)]
 pub fn family_output_module_for_tests(family_name: &str) -> String {
     crate::extractor::family_runtime::default_family_runtime_registry()
-        .output_module_for_family(family_name)
-        .unwrap_or_else(|| {
-            panic!("family `{family_name}` must resolve an output module in the runtime registry")
-        })
-        .to_string()
+        .shared_runtime_metadata_for_family(family_name)
+        .map(|metadata| metadata.output_module.to_string())
+        .unwrap_or_else(|| format!("map_{family_name}_family_protocol_changes"))
+}
+
+#[cfg(test)]
+pub fn family_shared_stream_name_for_tests(family_name: &str) -> String {
+    crate::extractor::family_runtime::default_family_runtime_registry()
+        .shared_runtime_metadata_for_family(family_name)
+        .map(|metadata| metadata.shared_stream_name.to_string())
+        .unwrap_or_else(|| format!("{family_name}_family"))
+}
+
+#[cfg(test)]
+pub fn family_durability_scope_for_tests(family_name: &str) -> String {
+    crate::extractor::family_runtime::default_family_runtime_registry()
+        .shared_runtime_metadata_for_family(family_name)
+        .map(|metadata| metadata.durability_scope.to_string())
+        .unwrap_or_else(|| format!("family::{family_name}"))
+}
+
+#[cfg(test)]
+pub fn family_shared_extractor_id_for_tests(family_name: &str, chain: Chain) -> String {
+    crate::extractor::family_runtime::default_family_runtime_registry()
+        .shared_stream_identity_for_family(chain, family_name)
+        .map(|identity| identity.extractor_id)
+        .unwrap_or_else(|| format!("{chain}:{}", family_shared_stream_name_for_tests(family_name)))
 }
 
 #[cfg(test)]
@@ -759,6 +802,79 @@ pub fn family_detected_runtime_for_tests(
         .unwrap_or_else(|_| {
             panic!("family `{family_name}` must resolve a detected runtime in the registry")
         })
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn family_detected_runtime_from_configs_for_tests(
+    extractor_configs: &[&crate::extractor::runner::ExtractorConfig],
+    shared_spkg: impl Into<String>,
+) -> crate::extractor::family_runtime::DetectedFamilyRuntime {
+    let registry = crate::extractor::family_runtime::default_family_runtime_registry();
+    let shared_spkg = shared_spkg.into();
+    let extractors = extractor_configs
+        .iter()
+        .map(|config| (config.protocol_system().to_string(), (*config).clone()))
+        .collect::<HashMap<_, _>>();
+    let detected = crate::extractor::family_runtime::detect_family_runtimes_with_registry(
+        &extractors,
+        registry,
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "family test configs must resolve detected runtime through production detection: {err}"
+        )
+    });
+
+    let detected = if detected.is_empty() {
+        let family_name = extractor_configs
+            .iter()
+            .map(|config| {
+                registry
+                    .family_name_for_protocol_system(config.protocol_system())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "protocol system `{}` must belong to a registered family for test detection",
+                            config.protocol_system()
+                        )
+                    })
+            })
+            .reduce(|existing, candidate| {
+                assert_eq!(
+                    existing, candidate,
+                    "family test configs must all resolve to one registered family"
+                );
+                existing
+            })
+            .unwrap_or_else(|| panic!("family test configs must include at least one extractor"));
+
+        let enriched = extractor_configs
+            .iter()
+            .map(|config| {
+                let mut cloned = (*config).clone();
+                cloned.family_runtime =
+                    Some(family_runtime_config_for_tests(family_name, shared_spkg.clone()));
+                (cloned.protocol_system().to_string(), cloned)
+            })
+            .collect::<HashMap<_, _>>();
+        crate::extractor::family_runtime::detect_family_runtimes_with_registry(&enriched, registry)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "family test configs must resolve detected runtime after shared-family enrichment: {err}"
+                )
+            })
+    } else {
+        detected
+    };
+
+    match detected.as_slice() {
+        [family] => family.clone(),
+        [] => panic!("family test configs did not resolve any detected runtime"),
+        many => panic!(
+            "family test configs must resolve exactly one detected runtime, found {}",
+            many.len()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -838,6 +954,124 @@ pub fn write_uniswap_family_defaults_config(
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct FamilyDefaultsFixtureMemberSpec<'a> {
+    pub extractor_name: &'a str,
+    pub protocol_system: &'a str,
+    pub protocol_type_name: &'a str,
+    pub module_name: &'a str,
+    pub start_block: i64,
+    pub substreams_module_name: Option<&'a str>,
+    pub substreams_params: Option<&'a str>,
+}
+
+#[cfg(test)]
+fn render_family_defaults_fixture_extractors_yaml(
+    family_name: &str,
+    members: &[FamilyDefaultsFixtureMemberSpec<'_>],
+) -> String {
+    members
+        .iter()
+        .map(|member| {
+            format!(
+                r#"  {extractor_name}:
+    name: "{extractor_name}"
+    protocol_system: "{protocol_system}"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1
+    start_block: {start_block}
+    protocol_types:
+      - name: "{protocol_type_name}"
+        financial_type: "Swap"
+    module_name: "{module_name}"
+    family_runtime:
+      family: "{family_name}"
+"#,
+                extractor_name = member.extractor_name,
+                protocol_system = member.protocol_system,
+                start_block = member.start_block,
+                protocol_type_name = member.protocol_type_name,
+                module_name = member.module_name,
+                family_name = family_name,
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn render_family_defaults_fixture_member_defaults_yaml(
+    members: &[FamilyDefaultsFixtureMemberSpec<'_>],
+) -> String {
+    let body = members
+        .iter()
+        .filter_map(|member| match (member.substreams_module_name, member.substreams_params) {
+            (Some(module_name), Some(params)) => Some(format!(
+                r#"      {protocol_system}:
+        substreams_params:
+          {module_name}: "{params}"
+"#,
+                protocol_system = member.protocol_system,
+                module_name = module_name,
+                params = params,
+            )),
+            _ => None,
+        })
+        .collect::<String>();
+
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("    members:\n{body}")
+    }
+}
+
+#[cfg(test)]
+pub fn write_family_defaults_config_with_shared_bootstrap_for_tests(
+    file_prefix: &str,
+    unique: &str,
+    family_name: &str,
+    shared_spkg_path: &str,
+    bootstrap_path: Option<&str>,
+    stop_block: Option<i64>,
+    members: &[FamilyDefaultsFixtureMemberSpec<'_>],
+) -> std::path::PathBuf {
+    let stop_block_yaml = stop_block
+        .map(|value| format!("    stop_block: {value}\n"))
+        .unwrap_or_default();
+    let bootstrap_yaml = bootstrap_path
+        .map(|path| format!("    bootstrap:\n      params: \"@{path}\"\n"))
+        .unwrap_or_default();
+    let member_defaults_yaml = render_family_defaults_fixture_member_defaults_yaml(members);
+    let extractor_configs_yaml =
+        render_family_defaults_fixture_extractors_yaml(family_name, members);
+    let config_path = std::env::temp_dir().join(format!("{file_prefix}-{unique}.yaml"));
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+family_runtimes:
+  {family_name}:
+    shared_spkg: "{shared_spkg_path}"
+    shared_module: "{shared_module}"
+{stop_block_yaml}{bootstrap_yaml}{member_defaults_yaml}extractors:
+{extractor_configs_yaml}
+"#,
+            family_name = family_name,
+            shared_module = family_output_module_for_tests(family_name),
+            stop_block_yaml = stop_block_yaml,
+            bootstrap_yaml = bootstrap_yaml,
+            member_defaults_yaml = member_defaults_yaml,
+            extractor_configs_yaml = extractor_configs_yaml,
+        ),
+    )
+    .expect("write temp family-default config");
+
+    config_path
+}
+
+#[cfg(test)]
 pub fn write_uniswap_family_defaults_config_with_member_names(
     file_prefix: &str,
     unique: &str,
@@ -847,40 +1081,33 @@ pub fn write_uniswap_family_defaults_config_with_member_names(
     v2_name: &str,
     v3_name: &str,
 ) -> std::path::PathBuf {
-    write_family_defaults_config_for_tests(
+    write_family_defaults_config_with_shared_bootstrap_for_tests(
         file_prefix,
         unique,
         "uniswap",
         shared_spkg_path,
+        None,
         stop_block,
-        &format!(
-            r#"  {v2_name}:
-    name: "{v2_name}"
-    protocol_system: "uniswap_v2"
-    chain: "ethereum"
-    implementation_type: "Custom"
-    sync_batch_size: 1
-    start_block: {start_block}
-    protocol_types:
-      - name: "uniswap_v2_pool"
-        financial_type: "Swap"
-    module_name: "v2_map_pool_events"
-    family_runtime:
-      family: "uniswap"
-  {v3_name}:
-    name: "{v3_name}"
-    protocol_system: "uniswap_v3"
-    chain: "ethereum"
-    implementation_type: "Custom"
-    sync_batch_size: 1
-    start_block: {start_block}
-    protocol_types:
-      - name: "uniswap_v3_pool"
-        financial_type: "Swap"
-    module_name: "v3_map_protocol_changes"
-    family_runtime:
-      family: "uniswap""#
-        ),
+        &[
+            FamilyDefaultsFixtureMemberSpec {
+                extractor_name: v2_name,
+                protocol_system: "uniswap_v2",
+                protocol_type_name: "uniswap_v2_pool",
+                module_name: "v2_map_pool_events",
+                start_block,
+                substreams_module_name: None,
+                substreams_params: None,
+            },
+            FamilyDefaultsFixtureMemberSpec {
+                extractor_name: v3_name,
+                protocol_system: "uniswap_v3",
+                protocol_type_name: "uniswap_v3_pool",
+                module_name: "v3_map_protocol_changes",
+                start_block,
+                substreams_module_name: None,
+                substreams_params: None,
+            },
+        ],
     )
 }
 
@@ -895,76 +1122,34 @@ pub fn write_uniswap_family_defaults_config_with_shared_bootstrap(
     v2_substreams_params: Option<&str>,
     v3_substreams_params: Option<&str>,
 ) -> std::path::PathBuf {
-    let stop_block_yaml = stop_block
-        .map(|value| format!("    stop_block: {value}\n"))
-        .unwrap_or_default();
-    let v2_member_yaml = v2_substreams_params
-        .map(|params| {
-            format!(
-                r#"      uniswap_v2:
-        substreams_params:
-          v2_map_pool_events: "{params}"
-"#
-            )
-        })
-        .unwrap_or_default();
-    let v3_member_yaml = v3_substreams_params
-        .map(|params| {
-            format!(
-                r#"      uniswap_v3:
-        substreams_params:
-          v3_map_events: "{params}"
-"#
-            )
-        })
-        .unwrap_or_default();
-    let members_yaml = if v2_member_yaml.is_empty() && v3_member_yaml.is_empty() {
-        String::new()
-    } else {
-        format!("    members:\n{v2_member_yaml}{v3_member_yaml}")
-    };
-    let config_path = std::env::temp_dir().join(format!("{file_prefix}-{unique}.yaml"));
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"
-family_runtimes:
-  uniswap:
-    shared_spkg: "{shared_spkg_path}"
-    shared_module: "{shared_module}"
-{stop_block_yaml}    bootstrap:
-      params: "@{bootstrap_path}"
-{members_yaml}extractors:
-  uniswap_v2:
-    name: "uniswap_v2"
-    chain: "ethereum"
-    implementation_type: "Custom"
-    sync_batch_size: 1
-    start_block: {start_block}
-    protocol_types:
-      - name: "uniswap_v2_pool"
-        financial_type: "Swap"
-    module_name: "v2_map_pool_events"
-    family_runtime:
-      family: "uniswap"
-  uniswap_v3:
-    name: "uniswap_v3"
-    chain: "ethereum"
-    implementation_type: "Custom"
-    sync_batch_size: 1
-    start_block: {start_block}
-    protocol_types:
-      - name: "uniswap_v3_pool"
-        financial_type: "Swap"
-    module_name: "v3_map_protocol_changes"
-    family_runtime:
-      family: "uniswap"
-"#,
-            shared_module = family_output_module_for_tests("uniswap"),
-        ),
+    write_family_defaults_config_with_shared_bootstrap_for_tests(
+        file_prefix,
+        unique,
+        "uniswap",
+        shared_spkg_path,
+        Some(bootstrap_path),
+        stop_block,
+        &[
+            FamilyDefaultsFixtureMemberSpec {
+                extractor_name: "uniswap_v2",
+                protocol_system: "uniswap_v2",
+                protocol_type_name: "uniswap_v2_pool",
+                module_name: "v2_map_pool_events",
+                start_block,
+                substreams_module_name: Some("v2_map_pool_events"),
+                substreams_params: v2_substreams_params,
+            },
+            FamilyDefaultsFixtureMemberSpec {
+                extractor_name: "uniswap_v3",
+                protocol_system: "uniswap_v3",
+                protocol_type_name: "uniswap_v3_pool",
+                module_name: "v3_map_protocol_changes",
+                start_block,
+                substreams_module_name: Some("v3_map_events"),
+                substreams_params: v3_substreams_params,
+            },
+        ],
     )
-    .expect("write temp family-default bootstrap config");
-    config_path
 }
 
 #[cfg(test)]
@@ -981,8 +1166,826 @@ pub fn family_runtime_config_for_tests(
         family: family_name.to_string(),
         shared_spkg: Some(shared_spkg.into()),
         shared_module: Some(family_shared_module_for_tests(family_name)),
-        durability_scope: None,
+        durability_scope: Some(family_durability_scope_for_tests(family_name)),
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct RecordSubstreamsFixtureMemberSpec<'a> {
+    protocol_system: &'a str,
+    protocol_type_name: &'a str,
+    module_name: &'a str,
+    substreams_module_name: &'a str,
+    substreams_file_name: &'a str,
+    substreams_body: &'a str,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct RecordSubstreamsFixtureFamilySpec<'a> {
+    temp_prefix: &'a str,
+    extractors_file_name: &'a str,
+    family_name: &'a str,
+    shared_bootstrap_body: &'a str,
+    members: &'a [RecordSubstreamsFixtureMemberSpec<'a>],
+}
+
+#[cfg(test)]
+fn write_record_substreams_combined_family_fixture_inputs(
+    shared_spkg_path: &std::path::Path,
+    spec: RecordSubstreamsFixtureFamilySpec<'_>,
+    registry: FamilyRuntimeRegistry<'_>,
+) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "tycho-indexer-{}-{}-{}",
+        spec.temp_prefix,
+        std::process::id(),
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+    ));
+    let config_dir = root.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create record-substreams family config dir");
+
+    std::fs::write(config_dir.join("shared_bootstrap.yaml"), spec.shared_bootstrap_body)
+        .expect("write shared bootstrap file");
+    for member in spec.members {
+        std::fs::write(config_dir.join(member.substreams_file_name), member.substreams_body)
+            .expect("write member substreams params file");
+    }
+
+    let members_yaml = spec
+        .members
+        .iter()
+        .map(|member| {
+            format!(
+                r#"      {protocol_system}:
+        substreams_params:
+          {substreams_module_name}: "@config/{substreams_file_name}"
+"#,
+                protocol_system = member.protocol_system,
+                substreams_module_name = member.substreams_module_name,
+                substreams_file_name = member.substreams_file_name,
+            )
+        })
+        .collect::<String>();
+    let extractors_yaml = spec
+        .members
+        .iter()
+        .map(|member| {
+            format!(
+                r#"  {protocol_system}:
+    name: "{protocol_system}"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "{protocol_type_name}"
+        financial_type: "Swap"
+    module_name: "{module_name}"
+    family_runtime:
+      family: "{family_name}"
+"#,
+                protocol_system = member.protocol_system,
+                protocol_type_name = member.protocol_type_name,
+                module_name = member.module_name,
+                family_name = spec.family_name,
+            )
+        })
+        .collect::<String>();
+    let shared_module = registry
+        .output_module_for_family(spec.family_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected registered family runtime output module for `{}`",
+                spec.family_name
+            )
+        });
+    let extractors_config = root.join(spec.extractors_file_name);
+    std::fs::write(
+        &extractors_config,
+        format!(
+            r#"family_runtimes:
+  {family_name}:
+    shared_spkg: "{}"
+    shared_module: "{shared_module}"
+    bootstrap:
+      params: "@config/shared_bootstrap.yaml"
+    members:
+{members_yaml}extractors:
+{extractors_yaml}
+"#,
+            shared_spkg_path.display(),
+            family_name = spec.family_name,
+            shared_module = shared_module,
+            members_yaml = members_yaml,
+            extractors_yaml = extractors_yaml,
+        ),
+    )
+    .expect("write combined extractors config");
+
+    extractors_config
+}
+
+#[cfg(test)]
+pub fn write_record_substreams_family_fixture_inputs(
+    shared_spkg_path: &std::path::Path,
+) -> std::path::PathBuf {
+    const MEMBERS: &[RecordSubstreamsFixtureMemberSpec<'_>] = &[
+        RecordSubstreamsFixtureMemberSpec {
+            protocol_system: "uniswap_v2",
+            protocol_type_name: "uniswap_v2_pool",
+            module_name: "v2_map_pool_events",
+            substreams_module_name: "v2_map_pool_events",
+            substreams_file_name: "uniswap_v2_substreams.yaml",
+            substreams_body: r#"includes:
+  - "shared_bootstrap.yaml"
+params:
+  pools:
+    - "0x1111111111111111111111111111111111111111"
+"#,
+        },
+        RecordSubstreamsFixtureMemberSpec {
+            protocol_system: "uniswap_v3",
+            protocol_type_name: "uniswap_v3_pool",
+            module_name: "v3_map_protocol_changes",
+            substreams_module_name: "v3_map_events",
+            substreams_file_name: "uniswap_v3_substreams.yaml",
+            substreams_body: r#"includes:
+  - "shared_bootstrap.yaml"
+params:
+  pools:
+    - "0x2222222222222222222222222222222222222222"
+"#,
+        },
+    ];
+    write_record_substreams_combined_family_fixture_inputs(
+        shared_spkg_path,
+        RecordSubstreamsFixtureFamilySpec {
+            temp_prefix: "record-family-config",
+            extractors_file_name: "extractors.combined.yaml",
+            family_name: "uniswap",
+            shared_bootstrap_body: r#"start_block: 42
+params:
+  pools:
+    - "0x1111111111111111111111111111111111111111"
+    - "0x2222222222222222222222222222222222222222"
+"#,
+            members: MEMBERS,
+        },
+        default_family_runtime_registry(),
+    )
+}
+
+#[cfg(test)]
+pub fn write_record_substreams_future_family_fixture_inputs(
+    shared_spkg_path: &std::path::Path,
+) -> std::path::PathBuf {
+    const MEMBERS: &[RecordSubstreamsFixtureMemberSpec<'_>] = &[
+        RecordSubstreamsFixtureMemberSpec {
+            protocol_system: "future_v1",
+            protocol_type_name: "future_v1_pool",
+            module_name: "future_v1_map_protocol_changes",
+            substreams_module_name: "future_v1_map_events",
+            substreams_file_name: "future_v1_substreams.yaml",
+            substreams_body: r#"includes:
+  - "shared_bootstrap.yaml"
+params:
+  pools:
+    - "0x00000000000000000000000000000000000000a1"
+  pool_tokens:
+    - "0x00000000000000000000000000000000000000a1:0x00000000000000000000000000000000000000a1:0x00000000000000000000000000000000000000b1"
+"#,
+        },
+        RecordSubstreamsFixtureMemberSpec {
+            protocol_system: "future_v2",
+            protocol_type_name: "future_v2_pool",
+            module_name: "future_v2_map_protocol_changes",
+            substreams_module_name: "future_v2_map_events",
+            substreams_file_name: "future_v2_substreams.yaml",
+            substreams_body: r#"includes:
+  - "shared_bootstrap.yaml"
+params:
+  pools:
+    - "0x00000000000000000000000000000000000000b2"
+  pool_tokens:
+    - "0x00000000000000000000000000000000000000b2:0x00000000000000000000000000000000000000a2:0x00000000000000000000000000000000000000b2"
+"#,
+        },
+    ];
+    write_record_substreams_combined_family_fixture_inputs(
+        shared_spkg_path,
+        RecordSubstreamsFixtureFamilySpec {
+            temp_prefix: "record-future-family-config",
+            extractors_file_name: "extractors.future.combined.yaml",
+            family_name: "future_swap",
+            shared_bootstrap_body: r#"start_block: 99
+params:
+  pools:
+    - "0x00000000000000000000000000000000000000a1"
+    - "0x00000000000000000000000000000000000000b2"
+  pool_tokens:
+    - "0x00000000000000000000000000000000000000a1:0x00000000000000000000000000000000000000a1:0x00000000000000000000000000000000000000b1"
+    - "0x00000000000000000000000000000000000000b2:0x00000000000000000000000000000000000000a2:0x00000000000000000000000000000000000000b2"
+"#,
+            members: MEMBERS,
+        },
+        future_family_runtime_registry_for_record_substreams_tests(),
+    )
+}
+
+#[cfg(test)]
+pub fn write_record_substreams_ambiguous_fixture_inputs(
+    shared_spkg_path: &std::path::Path,
+) -> std::path::PathBuf {
+    let config_path = write_record_substreams_family_fixture_inputs(shared_spkg_path);
+    let mut config = std::fs::read_to_string(&config_path)
+        .expect("read base combined-family record-substreams config");
+    config.push_str(
+        r#"
+  curve:
+    name: "curve"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 77
+    protocol_types:
+      - name: "curve_pool"
+        financial_type: "Swap"
+    spkg: "protocols/substreams/ethereum-curve/ethereum-curve-v0.3.2.spkg"
+    module_name: "map_protocol_changes"
+"#,
+    );
+    std::fs::write(&config_path, config)
+        .expect("write ambiguous record-substreams config with standalone target");
+    config_path
+}
+
+#[cfg(test)]
+fn future_family_branch_materializer<'a>(
+    _rpc: &'a EthereumRpcClient,
+    _branch: &'a BootstrapBranchDescriptor,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>,
+> {
+    Box::pin(async {
+        Err(ExtractionError::Setup(
+            "future family branch materializer should not run in record-substreams tests"
+                .to_string(),
+        ))
+    })
+}
+
+#[cfg(test)]
+const FUTURE_FAMILY_RUNTIME_SPEC: FamilyRuntimeSpec = shared_family_runtime_spec(
+    "future_swap",
+    &[
+        shared_family_member_spec(
+            "future_v1",
+            &["futurev1"],
+            Some(shared_bootstrap_member_runtime(
+                BootstrapStrategy::UniswapV2Rpc,
+                SharedBootstrapParamsParser::PoolList,
+                future_family_branch_materializer,
+            )),
+        ),
+        shared_family_member_spec(
+            "future_v2",
+            &["futurev2"],
+            Some(shared_bootstrap_member_runtime(
+                BootstrapStrategy::UniswapV2Rpc,
+                SharedBootstrapParamsParser::PoolList,
+                future_family_branch_materializer,
+            )),
+        ),
+    ],
+    "map_future_swap_family_protocol_changes",
+    "future_swap_family",
+    "family::future_swap",
+    None,
+);
+
+#[cfg(test)]
+pub fn future_family_runtime_registry_for_record_substreams_tests() -> FamilyRuntimeRegistry<'static>
+{
+    FamilyRuntimeRegistry::new(&[FUTURE_FAMILY_RUNTIME_SPEC])
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoCombinedFamilyIdentitySpec {
+    pub family_name: String,
+    pub output_module: String,
+    pub shared_spkg: String,
+    pub extractors_config_path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoCombinedFamilyFixtureCaptureSpec {
+    pub family_name: String,
+    pub extractors_config_path: std::path::PathBuf,
+    pub output_module: String,
+    pub output_path: std::path::PathBuf,
+    pub start_block: i64,
+    pub stop_block: String,
+    pub params: Vec<String>,
+}
+
+#[cfg(test)]
+pub fn repo_combined_family_extractors_config_path_for_tests(
+    file_name: &str,
+) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file_name)
+}
+
+#[cfg(test)]
+pub fn combined_family_real_history_slice_fixture_path_for_recorder_for_tests() -> std::path::PathBuf
+{
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("combined_family_real_history_slice.json")
+}
+
+#[cfg(test)]
+pub fn repo_combined_family_identity_for_tests(file_name: &str) -> RepoCombinedFamilyIdentitySpec {
+    let config_path = repo_combined_family_extractors_config_path_for_tests(file_name);
+    #[derive(Deserialize)]
+    struct SharedFamilyRuntimeConfigForTests {
+        shared_spkg: String,
+    }
+
+    #[derive(Deserialize)]
+    struct SharedFamilyRuntimeConfigFileForTests {
+        family_runtimes: HashMap<String, SharedFamilyRuntimeConfigForTests>,
+    }
+
+    let raw = std::fs::read_to_string(&config_path).expect("read repo combined family config");
+    let parsed: SharedFamilyRuntimeConfigFileForTests =
+        serde_yaml::from_str(&raw).expect("parse repo combined family config");
+    assert_eq!(
+        parsed.family_runtimes.len(),
+        1,
+        "expected repo combined config to declare exactly one family runtime"
+    );
+
+    let (family_name, family_runtime) = parsed
+        .family_runtimes
+        .into_iter()
+        .next()
+        .expect("repo combined family runtime");
+    let output_module = default_family_runtime_registry()
+        .shared_runtime_metadata_for_family(&family_name)
+        .map(|metadata| metadata.output_module)
+        .unwrap_or_else(|| {
+            panic!("expected registered family runtime output module for `{family_name}`")
+        })
+        .to_string();
+
+    RepoCombinedFamilyIdentitySpec {
+        family_name,
+        output_module,
+        shared_spkg: family_runtime.shared_spkg,
+        extractors_config_path: config_path,
+    }
+}
+
+#[cfg(test)]
+pub fn repo_combined_family_capture_spec_for_tests(
+    file_name: &str,
+    output_path: std::path::PathBuf,
+    start_block: i64,
+    stop_block: impl Into<String>,
+    params: Vec<String>,
+) -> RepoCombinedFamilyFixtureCaptureSpec {
+    let identity = repo_combined_family_identity_for_tests(file_name);
+    RepoCombinedFamilyFixtureCaptureSpec {
+        family_name: identity.family_name,
+        extractors_config_path: identity.extractors_config_path,
+        output_module: identity.output_module,
+        output_path,
+        start_block,
+        stop_block: stop_block.into(),
+        params,
+    }
+}
+
+#[cfg(test)]
+pub fn combined_family_real_history_slice_capture_spec_for_tests(
+) -> RepoCombinedFamilyFixtureCaptureSpec {
+    repo_combined_family_capture_spec_for_tests(
+        "extractors.uniswap_v2_v3.combined.yaml",
+        combined_family_real_history_slice_fixture_path_for_recorder_for_tests(),
+        25_384_601,
+        "+2",
+        vec![],
+    )
+}
+
+#[cfg(test)]
+pub fn repo_combined_family_expected_spkg_for_tests() -> String {
+    repo_combined_family_identity_for_tests("extractors.uniswap_v2_v3.combined.yaml").shared_spkg
+}
+
+#[cfg(test)]
+pub fn repo_combined_family_record_cli_args_for_tests(
+    spec: &RepoCombinedFamilyFixtureCaptureSpec,
+    output_path: &std::path::Path,
+    start_block: i64,
+    stop_block: &str,
+    params: &[&str],
+) -> Vec<String> {
+    let mut cli_args = vec![
+        "tycho-indexer".to_string(),
+        "--database-url".to_string(),
+        "postgres://unused".to_string(),
+        "--endpoint".to_string(),
+        "http://localhost:9000".to_string(),
+        "--rpc-url".to_string(),
+        "http://localhost:8545".to_string(),
+        "record-substreams".to_string(),
+        "--substreams-api-token".to_string(),
+        "token".to_string(),
+        "--extractors-config".to_string(),
+        spec.extractors_config_path
+            .to_string_lossy()
+            .to_string(),
+        "--start-block".to_string(),
+        start_block.to_string(),
+        "--stop-block".to_string(),
+        stop_block.to_string(),
+        "--output".to_string(),
+        output_path
+            .to_string_lossy()
+            .to_string(),
+    ];
+    for param in params {
+        cli_args.push("--params".to_string());
+        cli_args.push((*param).to_string());
+    }
+    cli_args
+}
+
+#[cfg(test)]
+fn shell_escape_cli_arg_for_tests(arg: &str) -> String {
+    if arg.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'/' | b'.' | b':' | b'+' | b'=')
+    }) {
+        return arg.to_string();
+    }
+
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(test)]
+pub fn render_repo_combined_family_record_command_for_tests(cli_args: &[String]) -> String {
+    cli_args
+        .iter()
+        .map(|arg| shell_escape_cli_arg_for_tests(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedBootstrapPoolSeed {
+    pub protocol_system: String,
+    pub protocol_type_name: String,
+    pub component_id: String,
+    pub token0: String,
+    pub token1: String,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedBootstrapSeedUniverseSpec {
+    pub chain: Chain,
+    pub protocol_types: Vec<ProtocolType>,
+    pub pools: Vec<SharedBootstrapPoolSeed>,
+}
+
+#[cfg(test)]
+fn parse_bootstrap_query_value_for_tests<'a>(params: &'a str, key: &str) -> Option<&'a str> {
+    params.split('&').find_map(|pair| {
+        let (param_key, value) = pair.split_once('=')?;
+        (param_key == key).then_some(value)
+    })
+}
+
+#[cfg(test)]
+pub fn shared_bootstrap_seed_universe_spec_from_config_path_with_registry_for_tests(
+    config_path: &std::path::Path,
+    registry: FamilyRuntimeRegistry<'_>,
+) -> SharedBootstrapSeedUniverseSpec {
+    let config = ExtractorConfigs::from_yaml_with_registry(
+        config_path
+            .to_str()
+            .expect("shared bootstrap seed config path should be utf8"),
+        registry,
+    )
+    .expect("load shared bootstrap seed config");
+    let runtime_targets = config
+        .resolved_runtime_targets_with_registry(registry)
+        .expect("resolve runtime targets for shared bootstrap seed extraction");
+    let runtime_target = runtime_targets
+        .require_unique(&format!(
+            "shared bootstrap seed extraction from `{}` requires exactly one runtime target",
+            config_path.display()
+        ))
+        .expect("shared bootstrap seed config should resolve one runtime target");
+
+    shared_bootstrap_seed_universe_spec_from_runtime_target_for_tests(
+        runtime_target,
+        &config_path.display().to_string(),
+    )
+}
+
+#[cfg(test)]
+pub fn shared_bootstrap_seed_universe_spec_from_runtime_target_for_tests(
+    runtime_target: &crate::extractor::family_runtime::ResolvedRuntimeTarget<'_>,
+    config_label: &str,
+) -> SharedBootstrapSeedUniverseSpec {
+    let mut seeds = Vec::new();
+    let mut protocol_types = Vec::new();
+    let mut seen_protocol_types = std::collections::HashSet::new();
+
+    for extractor in runtime_target.extractor_configs() {
+        let protocol_system = extractor.protocol_system().to_string();
+        for protocol_type in extractor.protocol_types() {
+            if seen_protocol_types.insert(protocol_type.name().to_string()) {
+                protocol_types.push(ProtocolType::new(
+                    protocol_type.name().to_string(),
+                    protocol_type.financial_type(),
+                    None,
+                    ImplementationType::Custom,
+                ));
+            }
+        }
+        let protocol_type_name = match extractor.protocol_types() {
+            [protocol_type] => protocol_type.name().to_string(),
+            protocol_types => panic!(
+                "expected exactly one protocol_type for shared bootstrap seed extraction from `{}` / `{}`, found {:?}",
+                config_label,
+                protocol_system,
+                protocol_types
+                    .iter()
+                    .map(|protocol_type| protocol_type.name())
+                    .collect::<Vec<_>>()
+            ),
+        };
+        let resolved_params = extractor
+            .substreams_params
+            .values()
+            .find(|params| params.contains("pool_tokens="))
+            .cloned()
+            .or_else(|| {
+                let bootstrap_params = extractor
+                    .bootstrap
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "expected bootstrap config for shared bootstrap seed extraction from `{}` / `{}`",
+                            config_label, protocol_system
+                        )
+                    })
+                    .params
+                    .clone();
+
+                if bootstrap_params.contains("pool_tokens=") {
+                    Some(bootstrap_params)
+                } else if bootstrap_params.contains("routes:")
+                    || bootstrap_params.contains("includes:")
+                {
+                    Some(
+                        crate::config::parse_substreams_params_yaml(
+                            &protocol_system,
+                            &bootstrap_params,
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "resolve shared bootstrap substreams params from `{}` / `{}`: {err}",
+                                config_label, protocol_system
+                            )
+                        })
+                        .1,
+                    )
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected resolved substreams params with pool_tokens for shared bootstrap seed extraction from `{}` / `{}`",
+                    config_label, protocol_system
+                )
+            });
+
+        let pool_tokens = parse_bootstrap_query_value_for_tests(&resolved_params, "pool_tokens")
+            .unwrap_or("")
+            .split(',')
+            .filter(|entry| !entry.is_empty());
+
+        for pool_token in pool_tokens {
+            let mut parts = pool_token.split(':');
+            let component_id = parts
+                .next()
+                .expect("pool_tokens entry should include pool")
+                .to_string();
+            let token0 = parts
+                .next()
+                .expect("pool_tokens entry should include token0")
+                .to_string();
+            let token1 = parts
+                .next()
+                .expect("pool_tokens entry should include token1")
+                .to_string();
+            assert!(
+                parts.next().is_none(),
+                "pool_tokens entry should only contain pool:token0:token1, got {pool_token}"
+            );
+
+            seeds.push(SharedBootstrapPoolSeed {
+                protocol_system: protocol_system.clone(),
+                protocol_type_name: protocol_type_name.clone(),
+                component_id,
+                token0,
+                token1,
+            });
+        }
+    }
+
+    seeds.sort_by(|left, right| {
+        left.protocol_system
+            .cmp(&right.protocol_system)
+            .then_with(|| left.component_id.cmp(&right.component_id))
+    });
+    seeds.dedup_by(|left, right| {
+        left.protocol_system == right.protocol_system && left.component_id == right.component_id
+    });
+    SharedBootstrapSeedUniverseSpec {
+        chain: runtime_target.chain(),
+        protocol_types,
+        pools: seeds,
+    }
+}
+
+#[cfg(test)]
+pub fn repo_unique_runtime_target_shared_bootstrap_seed_universe_spec_for_tests(
+    extractors_file_name: &str,
+) -> SharedBootstrapSeedUniverseSpec {
+    let config_path = repo_combined_family_extractors_config_path_for_tests(extractors_file_name);
+    shared_bootstrap_seed_universe_spec_from_config_path_with_registry_for_tests(
+        &config_path,
+        default_family_runtime_registry(),
+    )
+}
+
+#[cfg(test)]
+pub fn repo_combined_family_bootstrap_pool_seeds_for_tests(
+    extractors_file_name: &str,
+) -> Vec<SharedBootstrapPoolSeed> {
+    repo_unique_runtime_target_shared_bootstrap_seed_universe_spec_for_tests(extractors_file_name)
+        .pools
+}
+
+#[cfg(test)]
+pub fn decode_hex_address_bytes_for_tests(value: &str) -> Bytes {
+    Bytes::from(
+        hex::decode(value.trim_start_matches("0x"))
+            .unwrap_or_else(|err| panic!("decode hex address {value}: {err}")),
+    )
+}
+
+#[cfg(test)]
+pub async fn seed_repo_runtime_target_shared_bootstrap_universe_for_tests(
+    direct_gw: &tycho_storage::postgres::direct::DirectGateway,
+    extractors_file_name: &str,
+) -> HashMap<String, std::collections::HashSet<String>> {
+    use tycho_common::models::{
+        blockchain::{Block, Transaction},
+        contract::{Account, AccountDelta},
+        token::Token,
+        ChangeType,
+    };
+
+    let seed_spec =
+        repo_unique_runtime_target_shared_bootstrap_seed_universe_spec_for_tests(extractors_file_name);
+    let chain = seed_spec.chain;
+
+    let seed_block = Block::new(
+        25_384_600,
+        chain,
+        Bytes::from(vec![0x4a; 32]),
+        Bytes::from(vec![0x3a; 32]),
+        chrono::DateTime::from_timestamp(1_718_500_000, 0)
+            .expect("valid shared bootstrap seed timestamp")
+            .naive_utc(),
+    );
+    direct_gw
+        .upsert_block(std::slice::from_ref(&seed_block))
+        .await
+        .expect("seed shared bootstrap block");
+    let seed_tx = Transaction::new(
+        Bytes::from(vec![0x5a; 32]),
+        seed_block.hash.clone(),
+        Bytes::from(vec![0x7a; 20]),
+        None,
+        0,
+    );
+    direct_gw
+        .upsert_tx(std::slice::from_ref(&seed_tx))
+        .await
+        .expect("seed shared bootstrap tx");
+    let seed_timestamp = seed_block.ts;
+    direct_gw
+        .add_protocol_types(&seed_spec.protocol_types)
+        .await
+        .expect("seed shared bootstrap protocol types");
+    let mut tokens_by_address: HashMap<String, Token> = HashMap::new();
+    let mut protocol_components = Vec::with_capacity(seed_spec.pools.len());
+    let mut contract_accounts = Vec::with_capacity(seed_spec.pools.len());
+    let mut contract_deltas = Vec::with_capacity(seed_spec.pools.len());
+    let mut component_ids_by_system: HashMap<String, std::collections::HashSet<String>> =
+        HashMap::new();
+
+    for seed in seed_spec.pools {
+        for token_address in [&seed.token0, &seed.token1] {
+            tokens_by_address
+                .entry(token_address.clone())
+                .or_insert_with(|| {
+                    Token::new(
+                        &decode_hex_address_bytes_for_tests(token_address),
+                        token_address,
+                        18,
+                        0,
+                        &[],
+                        chain,
+                        100,
+                    )
+                });
+        }
+        let contract_address = Bytes::from(decode_hex_address_bytes_for_tests(&seed.component_id));
+        component_ids_by_system
+            .entry(seed.protocol_system.clone())
+            .or_default()
+            .insert(seed.component_id.clone());
+        let contract = Account::new(
+            chain,
+            contract_address.clone(),
+            format!("SharedBootstrap{}", seed.protocol_type_name),
+            HashMap::new(),
+            Bytes::new(),
+            HashMap::new(),
+            Bytes::new(),
+            Bytes::new(),
+            seed_tx.hash.clone(),
+            seed_tx.hash.clone(),
+            Some(seed_tx.hash.clone()),
+        );
+        let contract_delta: AccountDelta = contract.clone().into();
+        contract_accounts.push(contract);
+        contract_deltas.push((seed_tx.hash.clone(), contract_delta));
+        protocol_components.push(ProtocolComponent::new(
+            &seed.component_id,
+            &seed.protocol_system,
+            &seed.protocol_type_name,
+            chain,
+            vec![
+                decode_hex_address_bytes_for_tests(&seed.token0),
+                decode_hex_address_bytes_for_tests(&seed.token1),
+            ],
+            vec![contract_address],
+            HashMap::new(),
+            ChangeType::Creation,
+            seed_tx.hash.clone(),
+            seed_timestamp,
+        ));
+    }
+
+    let tokens = tokens_by_address.into_values().collect::<Vec<_>>();
+    direct_gw
+        .add_tokens(&tokens)
+        .await
+        .expect("seed shared bootstrap tokens");
+    for contract in &contract_accounts {
+        direct_gw
+            .insert_contract(contract)
+            .await
+            .expect("seed shared bootstrap contract");
+    }
+    direct_gw
+        .update_contracts(&contract_deltas)
+        .await
+        .expect("seed shared bootstrap contract state");
+    direct_gw
+        .add_protocol_components(&protocol_components)
+        .await
+        .expect("seed shared bootstrap universe components");
+
+    component_ids_by_system
 }
 
 pub fn family_block_response_from_block_changes(

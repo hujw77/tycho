@@ -91,7 +91,11 @@ impl BlockChanges {
         self,
         db_committed_block_height: Option<u64>,
     ) -> Result<BlockAggregatedChanges, ExtractionError> {
-        if db_committed_block_height.is_some_and(|h| h > self.finalized_block_height) {
+        let has_updates = !self.txs_with_update.is_empty()
+            || !self.block_contract_changes.is_empty()
+            || !self.trace_results.is_empty();
+        if has_updates && db_committed_block_height.is_some_and(|h| h > self.finalized_block_height)
+        {
             return Err(ExtractionError::ReorgBufferError(format!(
                 "Database committed block height {:?} is greater than finalized_block_height {}",
                 db_committed_block_height, self.finalized_block_height
@@ -895,7 +899,7 @@ mod test {
             Block::default(),
             5,
             false,
-            Vec::new(),
+            vec![TxWithChanges::default()],
             Vec::new(),
         );
 
@@ -911,6 +915,30 @@ mod test {
             }
             _ => panic!("unexpected error type"),
         }
+    }
+
+    #[test]
+    fn into_aggregated_allows_empty_progress_only_message_after_newer_shared_commit() {
+        let changes = BlockChanges::new(
+            "test".to_string(),
+            Chain::Ethereum,
+            Block::default(),
+            5,
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let aggregated = changes
+            .into_aggregated(Some(6))
+            .expect("empty progress-only message should tolerate newer shared commit height");
+
+        assert_eq!(aggregated.db_committed_block_height, Some(6));
+        assert!(aggregated.state_deltas.is_empty());
+        assert!(aggregated.account_deltas.is_empty());
+        assert!(aggregated
+            .new_protocol_components
+            .is_empty());
     }
 
     #[test]

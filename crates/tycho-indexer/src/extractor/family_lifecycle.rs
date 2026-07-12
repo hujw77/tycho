@@ -4,12 +4,14 @@ use tycho_ethereum::rpc::EthereumRpcClient;
 
 use crate::extractor::{
     family_runtime::{
-        MaterializeBootstrapPlanFn, ResolvedFamilyExecutionConfig,
-        ResolvedSharedBootstrapBranchRuntime,
+        PreparedSubstreamsRequest, ResolvedFamilyExecutionConfig, ResolvedFamilyRuntime,
+        ResolvedRuntimeTarget,
     },
     models::BlockChanges,
     shared_bootstrap::{
-        materialize_plan_block, split_plan_block_by_protocol_system, SharedBootstrapPlan,
+        commit_materialized_bootstrap, decide_bootstrap_completion,
+        split_plan_block_by_protocol_system, BootstrapCompletionDecision,
+        BootstrapCompletionPolicy, BootstrapCompletionSnapshot, SharedBootstrapPlan,
     },
     ExtractionError, Extractor,
 };
@@ -27,6 +29,118 @@ fn find_family_extractor_for_protocol_system<'a>(
 pub(crate) struct ResolvedFamilyStreamPosition {
     pub start_block: i64,
     pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FamilyResumeCursorState {
+    Fresh,
+    Stream(String),
+    BootstrapMarker(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FamilyResumeState {
+    last_processed_block: Option<u64>,
+    cursor: FamilyResumeCursorState,
+}
+
+fn parse_bootstrap_cursor_marker(cursor: &str) -> Option<u64> {
+    cursor
+        .strip_prefix("bootstrap@")
+        .and_then(|block| block.parse::<u64>().ok())
+}
+
+async fn resolve_family_resume_state(
+    extractors: &HashMap<String, Arc<dyn Extractor>>,
+) -> Result<FamilyResumeState, ExtractionError> {
+    let (resume_blocks, missing_progress) = collect_family_progress(extractors).await;
+
+    validate_family_progress_consistency(
+        &resume_blocks,
+        &missing_progress,
+        "before stream resume",
+    )?;
+
+    if resume_blocks.is_empty() {
+        return Ok(FamilyResumeState {
+            last_processed_block: None,
+            cursor: FamilyResumeCursorState::Fresh,
+        });
+    }
+
+    let Some((_, first_block)) = resume_blocks.first() else {
+        return Err(ExtractionError::Setup("family runner has no branch progress".to_string()));
+    };
+    if resume_blocks
+        .iter()
+        .any(|(_, block_number)| block_number != first_block)
+    {
+        return Err(ExtractionError::Setup(format!(
+            "family runner requires aligned branch progress, found {:?}",
+            resume_blocks
+        )));
+    }
+
+    let mut resolved_cursor = None;
+    let mut bootstrap_cursor_block = None;
+    for (extractor_id, extractor) in extractors {
+        let cursor = extractor.get_cursor().await;
+        if cursor.is_empty() {
+            return Err(ExtractionError::Setup(format!(
+                "family runner requires a persisted shared cursor for resumed branch `{extractor_id}`"
+            )));
+        }
+
+        if let Some(marker_block) = parse_bootstrap_cursor_marker(&cursor) {
+            if resolved_cursor.is_some() {
+                return Err(ExtractionError::Setup(format!(
+                    "family runner cannot mix bootstrap-only marker cursors with persisted shared stream cursors, found bootstrap marker `{cursor}` for resumed branch `{extractor_id}`"
+                )));
+            }
+
+            if let Some(existing_block) = bootstrap_cursor_block {
+                if existing_block != marker_block {
+                    return Err(ExtractionError::Setup(format!(
+                        "family runner requires aligned bootstrap-only marker cursors, found bootstrap blocks `{existing_block}` and `{marker_block}`"
+                    )));
+                }
+            } else {
+                bootstrap_cursor_block = Some(marker_block);
+            }
+            continue;
+        }
+
+        if bootstrap_cursor_block.is_some() {
+            return Err(ExtractionError::Setup(format!(
+                "family runner cannot mix persisted shared stream cursors with bootstrap-only marker cursors, found stream cursor `{cursor}` for resumed branch `{extractor_id}`"
+            )));
+        }
+
+        if let Some(existing) = &resolved_cursor {
+            if existing != &cursor {
+                return Err(ExtractionError::Setup(format!(
+                    "family runner requires aligned branch cursors, found `{existing}` and `{cursor}`"
+                )));
+            }
+        } else {
+            resolved_cursor = Some(cursor);
+        }
+    }
+
+    let cursor = if let Some(marker_block) = bootstrap_cursor_block {
+        if marker_block != *first_block {
+            return Err(ExtractionError::Setup(format!(
+                "family runner requires bootstrap-only marker cursor block `{marker_block}` to match last processed block `{first_block}`"
+            )));
+        }
+        FamilyResumeCursorState::BootstrapMarker(marker_block)
+    } else {
+        FamilyResumeCursorState::Stream(
+            resolved_cursor.expect("resumed family branches should resolve one shared cursor"),
+        )
+    };
+
+    Ok(FamilyResumeState { last_processed_block: Some(*first_block), cursor })
 }
 
 pub(crate) async fn run_family_bootstrap_if_needed(
@@ -50,8 +164,7 @@ pub(crate) async fn run_family_bootstrap_if_needed(
     let merged_changes = materialize_family_bootstrap_block(
         rpc_client,
         plan,
-        family_execution.shared_bootstrap_plan_materializer,
-        &family_execution.shared_bootstrap_branches,
+        &family_execution.shared_bootstrap_execution,
     )
     .await?;
     apply_family_bootstrap_plan(extractors, plan, merged_changes).await
@@ -61,62 +174,26 @@ pub(crate) async fn family_bootstrap_already_completed(
     extractors: &HashMap<String, Arc<dyn Extractor>>,
     bootstrap_block: u64,
 ) -> Result<bool, ExtractionError> {
-    let mut completed_blocks = Vec::new();
-    let mut missing_completion = Vec::new();
-
-    for (extractor_id, extractor) in extractors {
-        match extractor
-            .get_completed_bootstrap_block()
-            .await?
-        {
-            Some(block) => completed_blocks.push((extractor_id.clone(), block)),
-            None => missing_completion.push(extractor_id.clone()),
-        }
-    }
-
-    if completed_blocks.is_empty() {
-        return Ok(false);
-    }
-
-    if !missing_completion.is_empty() {
-        return Err(ExtractionError::Setup(format!(
-            "family runner requires consistent shared bootstrap completion before bootstrap run; completed branches: {:?}, missing branches: {:?}",
-            completed_blocks, missing_completion
-        )));
-    }
-
-    let first_completed = completed_blocks[0].1;
-    if completed_blocks
-        .iter()
-        .any(|(_, completed_block)| *completed_block != first_completed)
-    {
-        return Err(ExtractionError::Setup(format!(
-            "family runner requires aligned shared bootstrap completion blocks, found {:?}",
-            completed_blocks
-        )));
-    }
-
-    if first_completed != bootstrap_block {
-        return Err(ExtractionError::Setup(format!(
-            "family runner requires configured shared bootstrap block `{bootstrap_block}` to match persisted completed bootstrap block `{first_completed}`"
-        )));
-    }
-
-    Ok(true)
+    let snapshot = collect_family_bootstrap_completion_snapshot(extractors).await?;
+    Ok(matches!(
+        decide_bootstrap_completion(
+            &snapshot,
+            bootstrap_block,
+            "family runner",
+            BootstrapCompletionPolicy::RequireConfiguredMatch,
+        )?,
+        BootstrapCompletionDecision::AlreadyCompleted
+    ))
 }
 
 pub(crate) async fn materialize_family_bootstrap_block(
     rpc_client: &EthereumRpcClient,
     plan: &SharedBootstrapPlan,
-    shared_bootstrap_plan_materializer: MaterializeBootstrapPlanFn,
-    shared_bootstrap_branches: &[ResolvedSharedBootstrapBranchRuntime],
+    shared_bootstrap_execution: &crate::extractor::family_runtime::ResolvedSharedBootstrapExecution,
 ) -> Result<BlockChanges, ExtractionError> {
-    if !shared_bootstrap_branches.is_empty() {
-        return shared_bootstrap_plan_materializer(rpc_client, plan, shared_bootstrap_branches)
-            .await;
-    }
-
-    materialize_plan_block(rpc_client, plan).await
+    shared_bootstrap_execution
+        .materialize_plan(rpc_client, plan)
+        .await
 }
 
 pub(crate) async fn collect_family_progress(
@@ -136,6 +213,25 @@ pub(crate) async fn collect_family_progress(
     }
 
     (resume_blocks, missing_progress)
+}
+
+async fn collect_family_bootstrap_completion_snapshot(
+    extractors: &HashMap<String, Arc<dyn Extractor>>,
+) -> Result<BootstrapCompletionSnapshot, ExtractionError> {
+    let mut completed_blocks = Vec::new();
+    let mut missing_completion = Vec::new();
+
+    for (extractor_id, extractor) in extractors {
+        match extractor
+            .get_completed_bootstrap_block()
+            .await?
+        {
+            Some(block) => completed_blocks.push((extractor_id.clone(), block)),
+            None => missing_completion.push(extractor_id.clone()),
+        }
+    }
+
+    Ok(BootstrapCompletionSnapshot { completed_blocks, missing_completion })
 }
 
 pub(crate) fn validate_family_progress_consistency(
@@ -164,16 +260,18 @@ pub(crate) async fn apply_family_bootstrap_plan(
 
     let bootstrap_block_hash = merged_changes.block.hash.clone();
     let split_changes = split_plan_block_by_protocol_system(merged_changes)?;
+    let mut branch_targets = Vec::with_capacity(plan.branches.len());
     let mut shared_state_extractor = None;
 
     for branch in &plan.branches {
-        let extractor = find_family_extractor_for_protocol_system(extractors, &branch.protocol_system)
-            .ok_or_else(|| {
-                ExtractionError::Setup(format!(
-                    "missing family bootstrap extractor for {}",
-                    branch.protocol_system
-                ))
-            })?;
+        let extractor =
+            find_family_extractor_for_protocol_system(extractors, &branch.protocol_system)
+                .ok_or_else(|| {
+                    ExtractionError::Setup(format!(
+                        "missing family bootstrap extractor for {}",
+                        branch.protocol_system
+                    ))
+                })?;
         let changes = split_changes
             .get(&branch.protocol_system)
             .cloned()
@@ -183,10 +281,7 @@ pub(crate) async fn apply_family_bootstrap_plan(
                     branch.protocol_system
                 ))
             })?;
-        extractor
-            .handle_block_changes(changes, format!("bootstrap@{}", plan.bootstrap_block))
-            .await?;
-        extractor.flush().await?;
+        branch_targets.push((extractor.clone(), changes));
         if shared_state_extractor.is_none() {
             shared_state_extractor = Some(extractor.clone());
         }
@@ -195,10 +290,13 @@ pub(crate) async fn apply_family_bootstrap_plan(
     let Some(shared_state_extractor) = shared_state_extractor else {
         return Ok(());
     };
-
-    shared_state_extractor
-        .mark_bootstrap_completed(plan.bootstrap_block, bootstrap_block_hash)
-        .await?;
+    commit_materialized_bootstrap(
+        branch_targets,
+        shared_state_extractor,
+        plan.bootstrap_block,
+        bootstrap_block_hash,
+    )
+    .await?;
 
     Ok(())
 }
@@ -227,61 +325,44 @@ pub(crate) async fn resolve_family_stream_position(
     extractors: &HashMap<String, Arc<dyn Extractor>>,
     family_execution: &ResolvedFamilyExecutionConfig,
 ) -> Result<ResolvedFamilyStreamPosition, ExtractionError> {
-    let (resume_blocks, missing_progress) = collect_family_progress(extractors).await;
+    let resume_state = resolve_family_resume_state(extractors).await?;
 
-    validate_family_progress_consistency(
-        &resume_blocks,
-        &missing_progress,
-        "before stream resume",
-    )?;
-
-    if resume_blocks.is_empty() {
-        return Ok(ResolvedFamilyStreamPosition {
+    match resume_state.last_processed_block {
+        None => Ok(ResolvedFamilyStreamPosition {
             start_block: family_execution.configured_start_block,
             cursor: None,
-        });
-    }
+        }),
+        Some(last_processed_block) => {
+            let next = last_processed_block
+                .checked_add(1)
+                .ok_or_else(|| ExtractionError::Setup("block number overflow".to_string()))?;
+            let start_block = i64::try_from(next)
+                .map_err(|_| ExtractionError::Setup("block number exceeds i64".to_string()))?;
+            let cursor = match resume_state.cursor {
+                FamilyResumeCursorState::Fresh => None,
+                FamilyResumeCursorState::Stream(cursor) => Some(cursor),
+                FamilyResumeCursorState::BootstrapMarker(_) => None,
+            };
 
-    let Some((_, first_block)) = resume_blocks.first() else {
-        return Err(ExtractionError::Setup("family runner has no branch progress".to_string()));
-    };
-    if resume_blocks
-        .iter()
-        .any(|(_, block_number)| block_number != first_block)
-    {
-        return Err(ExtractionError::Setup(format!(
-            "family runner requires aligned branch progress, found {:?}",
-            resume_blocks
-        )));
-    }
-
-    let mut resolved_cursor = None;
-    for (extractor_id, extractor) in extractors {
-        let cursor = extractor.get_cursor().await;
-        if cursor.is_empty() {
-            return Err(ExtractionError::Setup(format!(
-                "family runner requires a persisted shared cursor for resumed branch `{extractor_id}`"
-            )));
-        }
-
-        if let Some(existing) = &resolved_cursor {
-            if existing != &cursor {
-                return Err(ExtractionError::Setup(format!(
-                    "family runner requires aligned branch cursors, found `{existing}` and `{cursor}`"
-                )));
-            }
-        } else {
-            resolved_cursor = Some(cursor);
+            Ok(ResolvedFamilyStreamPosition { start_block, cursor })
         }
     }
+}
 
-    let next = first_block
-        .checked_add(1)
-        .ok_or_else(|| ExtractionError::Setup("block number overflow".to_string()))?;
-    let start_block = i64::try_from(next)
-        .map_err(|_| ExtractionError::Setup("block number exceeds i64".to_string()))?;
+impl<'a> ResolvedFamilyRuntime<'a> {
+    pub(crate) async fn prepare_substreams_request(
+        &self,
+        extractors: &HashMap<String, Arc<dyn Extractor>>,
+        rpc_client: &EthereumRpcClient,
+    ) -> Result<PreparedSubstreamsRequest, ExtractionError> {
+        run_family_bootstrap_if_needed(extractors, &self.execution, rpc_client).await?;
 
-    Ok(ResolvedFamilyStreamPosition { start_block, cursor: resolved_cursor })
+        let stream_position = resolve_family_stream_position(extractors, &self.execution).await?;
+        let request = ResolvedRuntimeTarget::Family(self.clone())
+            .substreams_execution_request_with_start_block(stream_position.start_block)?;
+
+        Ok(PreparedSubstreamsRequest { request, cursor: stream_position.cursor })
+    }
 }
 
 #[cfg(test)]
@@ -289,9 +370,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::find_family_extractor_for_protocol_system;
-    use crate::extractor::{
-        MockExtractor,
-    };
+    use crate::extractor::MockExtractor;
 
     #[tokio::test]
     async fn find_family_extractor_for_protocol_system_ignores_map_key_aliases() {

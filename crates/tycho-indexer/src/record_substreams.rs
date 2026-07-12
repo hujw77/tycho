@@ -5,8 +5,9 @@ use tycho_indexer::{
     cli::{GlobalArgs, RecordSubstreamsArgs},
     extractor::{
         family_runtime::{
-            default_family_runtime_registry, select_resolved_runtime_target, FamilyRuntimeRegistry,
-            ResolvedRuntimeTargetSelector, ResolvedSubstreamsExecutionRequest,
+            default_family_runtime_registry, FamilyRuntimeRegistry, ResolvedRuntimeTarget,
+            ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets,
+            ResolvedSubstreamsExecutionRequest,
         },
         runner::load_substreams_package,
         ExtractionError,
@@ -52,20 +53,24 @@ pub(crate) fn derived_record_target_selector_from_args(
     }
 }
 
+fn infer_derived_record_target<'a>(
+    targets: &'a ResolvedRuntimeTargets<'a>,
+    extractors_config_path: &str,
+) -> Result<&'a ResolvedRuntimeTarget<'a>, ExtractionError> {
+    targets.resolve_target(
+        None,
+        &format!(
+            "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
+        ),
+        extractors_config_path,
+    )
+}
+
 pub(crate) fn render_record_substreams_request_json(
     request: &ResolvedSubstreamsExecutionRequest,
 ) -> Result<String, ExtractionError> {
     serde_json::to_string_pretty(request)
         .map_err(|err| ExtractionError::Setup(format!("Failed to serialize request: {err}")))
-}
-
-fn merge_record_substreams_params(
-    base: &mut HashMap<String, String>,
-    overrides: &HashMap<String, String>,
-) {
-    for (key, value) in overrides {
-        base.insert(key.clone(), value.clone());
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -82,25 +87,42 @@ pub(crate) fn resolve_record_substreams_request_with_registry(
     let override_params = parse_substreams_params(&record_args.params)?;
 
     if let Some(extractors_config_path) = &record_args.extractors_config {
-        let selector = derived_record_target_selector_from_args(record_args)?;
-
         let extractors_config =
             ExtractorConfigs::from_yaml_with_registry(extractors_config_path, registry).map_err(
                 |err| ExtractionError::Setup(format!("Failed to load extractors config. {err}")),
             )?;
         let targets = extractors_config.resolved_runtime_targets_with_registry(registry)?;
-        let target = select_resolved_runtime_target(targets, selector)
-            .ok_or_else(|| selector.not_found_error(extractors_config_path))?;
+        let selector = match (record_args.family.as_deref(), record_args.protocol_system.as_deref())
+        {
+            (None, None) => None,
+            _ => Some(derived_record_target_selector_from_args(record_args)?),
+        };
+        let target = match selector {
+            Some(selector) => targets.resolve_target(
+                Some(selector),
+                &format!(
+                    "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
+                ),
+                extractors_config_path,
+            )?,
+            None => infer_derived_record_target(&targets, extractors_config_path)?,
+        };
         let default_resolved = target.substreams_execution_request()?;
-        let effective_start_block = record_args
-            .start_block
-            .unwrap_or(default_resolved.start_block);
-        let mut resolved =
-            target.substreams_execution_request_with_start_block(effective_start_block)?;
-        resolved.stop_block = record_args
-            .stop_block(resolved.start_block)
-            .unwrap_or(resolved.stop_block as i64) as u64;
-        merge_record_substreams_params(&mut resolved.params, &override_params);
+        let effective_start_block =
+            record_args.start_block.unwrap_or(default_resolved.start_block);
+        let effective_stop_block = record_args
+            .stop_block(effective_start_block)
+            .unwrap_or(default_resolved.stop_block as i64);
+        let resolved = targets.resolve_substreams_execution_request(
+            selector,
+            &format!(
+                "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
+            ),
+            extractors_config_path,
+            Some(effective_start_block),
+            Some(effective_stop_block),
+            &override_params,
+        )?;
         return Ok(resolved);
     }
 

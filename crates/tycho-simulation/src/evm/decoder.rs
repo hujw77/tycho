@@ -9,7 +9,9 @@ use alloy::primitives::{Address, U256};
 use thiserror::Error;
 use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{debug, error, info, warn};
-use tycho_client::feed::{synchronizer::ComponentWithState, BlockHeader, FeedMessage, HeaderLike};
+use tycho_client::feed::{
+    synchronizer::ComponentWithState, BlockHeader, FeedMessage, HeaderLike, SynchronizerState,
+};
 use tycho_common::{
     dto::{ChangeType, ProtocolStateDelta},
     models::{blockchain::BlockAggregatedChanges, token::Token, Chain},
@@ -109,6 +111,22 @@ impl<H> TychoStreamDecoder<H>
 where
     H: HeaderLike + Clone + Sync + Send + 'static + std::fmt::Debug,
 {
+    fn sync_state_block_info(
+        sync_states: &HashMap<String, SynchronizerState>,
+    ) -> Option<(u64, bool)> {
+        sync_states
+            .values()
+            .filter_map(|state| match state {
+                SynchronizerState::Ready(header)
+                | SynchronizerState::Delayed(header)
+                | SynchronizerState::Advanced(header) => {
+                    Some((header.number, header.partial_block_index.is_some()))
+                }
+                _ => None,
+            })
+            .max_by_key(|(number, _)| *number)
+    }
+
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(DecoderState::default())),
@@ -236,13 +254,21 @@ where
         let mut contracts_map = HashMap::new();
         let mut msg_failed_components = HashSet::new();
 
+        if msg.state_msgs.is_empty() {
+            let (block_number_or_timestamp, is_partial) =
+                Self::sync_state_block_info(&msg.sync_states)
+                    .ok_or_else(|| StreamDecodeError::Fatal("Missing block!".into()))?;
+            return Ok(Update::new(block_number_or_timestamp, HashMap::new(), HashMap::new())
+                .set_is_partial(is_partial)
+                .set_sync_states(msg.sync_states.clone()));
+        }
+
         let header = msg
             .state_msgs
             .values()
             .next()
-            .ok_or_else(|| StreamDecodeError::Fatal("Missing block!".into()))?
-            .header
-            .clone();
+            .map(|msg| msg.header.clone())
+            .ok_or_else(|| StreamDecodeError::Fatal("Missing block!".into()))?;
 
         let block_number_or_timestamp = header
             .clone()
@@ -1283,6 +1309,47 @@ mod tests {
         assert_eq!(res2.states.len(), 1);
         assert_eq!(res1.sync_states.len(), 1);
         assert_eq!(res2.sync_states.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_decode_accepts_sync_only_message() {
+        let decoder = setup_decoder(true).await;
+        let header = BlockHeader {
+            number: 123,
+            hash: Bytes::from(vec![0x12; 32]),
+            parent_hash: Bytes::from(vec![0x34; 32]),
+            revert: false,
+            timestamp: 456,
+            partial_block_index: None,
+        };
+        let msg = FeedMessage {
+            state_msgs: HashMap::new(),
+            sync_states: HashMap::from([(
+                "uniswap_v2".to_string(),
+                SynchronizerState::Ready(header.clone()),
+            )]),
+        };
+
+        let res = decoder
+            .decode(&msg)
+            .await
+            .expect("sync-only messages should decode");
+
+        assert_eq!(res.block_number_or_timestamp, 123);
+        assert!(res.states.is_empty());
+        assert!(res.new_pairs.is_empty());
+        assert_eq!(res.sync_states.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_decode_rejects_message_without_headers() {
+        let decoder = setup_decoder(true).await;
+        let msg = FeedMessage { state_msgs: HashMap::new(), sync_states: HashMap::new() };
+
+        match decoder.decode(&msg).await {
+            Err(StreamDecodeError::Fatal(msg)) => assert_eq!(msg, "Missing block!"),
+            Ok(_) => panic!("expected Missing block! for message without any headers"),
+        }
     }
 
     #[tokio::test]

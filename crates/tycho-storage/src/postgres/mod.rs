@@ -138,7 +138,7 @@ use std::{
 };
 
 use chrono::NaiveDateTime;
-use diesel::{prelude::*, sql_query};
+use diesel::{prelude::*, sql_query, sql_types::Bool};
 use diesel_async::{
     pooled_connection::{deadpool::Pool, AsyncDieselConnectionManager},
     AsyncPgConnection, RunQueryDsl,
@@ -467,7 +467,8 @@ pub(crate) async fn ensure_daily_partition_for_valid_to(
         .and_hms_opt(0, 0, 0)
         .expect("midnight should be valid");
     let end = start + chrono::Duration::days(1);
-    let partition_name = format!("{parent_table}_p{}", start.format("%Y_%m_%d"));
+    rename_legacy_daily_partition_if_present(parent_table, start.date(), conn).await?;
+    let partition_name = daily_partition_name(parent_table, start.date());
     let statement = format!(
         "CREATE TABLE IF NOT EXISTS public.{partition_name} \
          PARTITION OF public.{parent_table} \
@@ -494,6 +495,56 @@ pub(crate) async fn ensure_daily_partitions_for_valid_tos(
     for valid_to in valid_tos {
         ensure_daily_partition_for_valid_to(parent_table, valid_to, conn).await?;
     }
+
+    Ok(())
+}
+
+fn daily_partition_name(parent_table: &str, date: chrono::NaiveDate) -> String {
+    // Match the pg_partman `datetime_string = YYYYMMDD` configuration used by live Tycho DBs.
+    format!("{parent_table}_p{}", date.format("%Y%m%d"))
+}
+
+fn legacy_daily_partition_name(parent_table: &str, date: chrono::NaiveDate) -> String {
+    format!("{parent_table}_p{}", date.format("%Y_%m_%d"))
+}
+
+#[derive(QueryableByName)]
+struct ExistsRow {
+    #[diesel(sql_type = Bool)]
+    exists: bool,
+}
+
+async fn table_exists(
+    conn: &mut AsyncPgConnection,
+    fully_qualified_name: &str,
+) -> Result<bool, StorageError> {
+    let row: ExistsRow = sql_query("SELECT to_regclass($1) IS NOT NULL AS exists")
+        .bind::<diesel::sql_types::Text, _>(fully_qualified_name)
+        .get_result(conn)
+        .await
+        .map_err(PostgresError::from)?;
+    Ok(row.exists)
+}
+
+async fn rename_legacy_daily_partition_if_present(
+    parent_table: &str,
+    date: chrono::NaiveDate,
+    conn: &mut AsyncPgConnection,
+) -> Result<(), StorageError> {
+    let legacy_partition_name = legacy_daily_partition_name(parent_table, date);
+    let partition_name = daily_partition_name(parent_table, date);
+    let legacy_regclass = format!("public.{legacy_partition_name}");
+    let current_regclass = format!("public.{partition_name}");
+
+    if !table_exists(conn, &legacy_regclass).await? || table_exists(conn, &current_regclass).await?
+    {
+        return Ok(());
+    }
+
+    sql_query(format!("ALTER TABLE public.{legacy_partition_name} RENAME TO {partition_name}"))
+        .execute(conn)
+        .await
+        .map_err(|err| storage_error_from_diesel(err, parent_table, &partition_name, None))?;
 
     Ok(())
 }
@@ -934,6 +985,142 @@ pub mod testing {
 
         teardown(&mut connection).await;
         res.unwrap();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{LazyLock, Mutex};
+
+        use chrono::NaiveDate;
+        use diesel::sql_query;
+        use diesel_async::RunQueryDsl;
+
+        use super::{serial_db_tests_require_available_database, try_prepare_serial_test_database};
+        use crate::postgres::{
+            daily_partition_name, legacy_daily_partition_name, testing::run_against_db,
+        };
+
+        static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+        fn set_env_var(name: &str, value: &str) {
+            // SAFETY: tests serialize access to process env through ENV_LOCK.
+            unsafe { std::env::set_var(name, value) }
+        }
+
+        fn remove_env_var(name: &str) {
+            // SAFETY: tests serialize access to process env through ENV_LOCK.
+            unsafe { std::env::remove_var(name) }
+        }
+
+        #[test]
+        fn serial_db_tests_default_to_non_strict_local_mode() {
+            let _guard = ENV_LOCK.lock().expect("lock env");
+            remove_env_var("CI");
+            remove_env_var("TYCHO_REQUIRE_TEST_DB");
+
+            assert!(
+                !serial_db_tests_require_available_database(),
+                "local tests without explicit strict flags should allow DB-backed regressions to skip"
+            );
+        }
+
+        #[test]
+        fn serial_db_prepare_reports_skip_message_when_database_is_unavailable_in_non_strict_mode()
+        {
+            let _guard = ENV_LOCK.lock().expect("lock env");
+            remove_env_var("CI");
+            remove_env_var("TYCHO_REQUIRE_TEST_DB");
+            set_env_var("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:1/tycho_test");
+
+            let err = try_prepare_serial_test_database()
+                .expect_err("unreachable local DB should not prepare successfully");
+            assert!(
+                err.contains("serial DB test skipped because database is unavailable"),
+                "unexpected non-strict DB preparation error: {err}"
+            );
+        }
+
+        #[test]
+        fn serial_db_prepare_requires_reachable_database_in_strict_mode() {
+            let _guard = ENV_LOCK.lock().expect("lock env");
+            remove_env_var("CI");
+            set_env_var("TYCHO_REQUIRE_TEST_DB", "1");
+            set_env_var("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:1/tycho_test");
+
+            let err = try_prepare_serial_test_database()
+                .expect_err("strict mode should fail when the DB is unreachable");
+            assert!(
+                err.contains("serial DB tests require a reachable database"),
+                "unexpected strict DB preparation error: {err}"
+            );
+        }
+
+        #[test]
+        fn daily_partition_name_matches_pg_partman_datetime_string() {
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 24).expect("valid date");
+            assert_eq!(
+                crate::postgres::daily_partition_name("protocol_state", date),
+                "protocol_state_p20260624"
+            );
+        }
+
+        #[tokio::test]
+        async fn ensure_daily_partition_renames_legacy_partition_name_before_create() {
+            run_against_db(|pool| async move {
+                let mut conn = pool.get().await.expect("connection ok");
+                let date = NaiveDate::from_ymd_opt(2024, 6, 18).expect("valid date");
+                let legacy_name = legacy_daily_partition_name("protocol_state", date);
+                let current_name = daily_partition_name("protocol_state", date);
+
+                sql_query(format!("DROP TABLE IF EXISTS public.{current_name} CASCADE"))
+                    .execute(&mut conn)
+                    .await
+                    .expect("drop current partition");
+                sql_query(format!("DROP TABLE IF EXISTS public.{legacy_name} CASCADE"))
+                    .execute(&mut conn)
+                    .await
+                    .expect("drop legacy partition");
+
+                sql_query(format!(
+                    "CREATE TABLE public.{legacy_name} PARTITION OF public.protocol_state \
+                     FOR VALUES FROM ('2024-06-18 00:00:00+00') TO ('2024-06-19 00:00:00+00')"
+                ))
+                .execute(&mut conn)
+                .await
+                .expect("create legacy partition");
+
+                crate::postgres::ensure_daily_partition_for_valid_to(
+                    "protocol_state",
+                    date.and_hms_opt(12, 0, 0)
+                        .expect("valid ts"),
+                    &mut conn,
+                )
+                .await
+                .expect("ensure partition should rename legacy partition");
+
+                let current_exists: bool = sql_query(
+                    "SELECT to_regclass('public.protocol_state_p20240618') IS NOT NULL AS exists",
+                )
+                .get_result::<crate::postgres::ExistsRow>(&mut conn)
+                .await
+                .expect("query current partition existence")
+                .exists;
+                let legacy_exists: bool = sql_query(
+                    "SELECT to_regclass('public.protocol_state_p2024_06_18') IS NOT NULL AS exists",
+                )
+                .get_result::<crate::postgres::ExistsRow>(&mut conn)
+                .await
+                .expect("query legacy partition existence")
+                .exists;
+
+                assert!(current_exists, "current partition name should exist after ensure");
+                assert!(
+                    !legacy_exists,
+                    "legacy partition name should be renamed away before create"
+                );
+            })
+            .await;
+        }
     }
 }
 

@@ -1,4 +1,15 @@
-SELECT cron.unschedule('clean_transaction_table');
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        PERFORM cron.unschedule('clean_transaction_table');
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Skipping clean_transaction_table cron removal in database %: %',
+            current_database(),
+            SQLERRM;
+END;
+$$;
 
 DROP FUNCTION IF EXISTS clean_transaction_table();
 

@@ -15,8 +15,7 @@ use tycho_ethereum::{rpc::EthereumRpcClient, services::account_extractor::EVMAcc
 use tycho_storage::postgres::cache::CachedGateway;
 
 use crate::extractor::family_runtime::{
-    coalesce_initialized_accounts_requests, ResolvedInitializedAccountsRequest,
-    ResolvedRuntimeTarget,
+    ResolvedInitializedAccountsRequest, ResolvedRuntimeTargets,
 };
 
 async fn with_transaction<F, Fut, R>(gw: &CachedGateway, block: &Block, f: F) -> R
@@ -139,15 +138,17 @@ pub async fn initialize_runtime_target_accounts(
     }
 }
 
-pub async fn initialize_resolved_runtime_target_accounts<'a>(
-    targets: impl IntoIterator<Item = &'a ResolvedRuntimeTarget<'a>>,
-    rpc: &EthereumRpcClient,
-    cached_gw: &CachedGateway,
-) {
-    initialize_runtime_target_accounts(
-        coalesce_initialized_accounts_requests(targets),
-        rpc,
-        cached_gw,
-    )
-    .await;
+impl<'a> ResolvedRuntimeTargets<'a> {
+    pub async fn initialize_accounts(
+        &self,
+        rpc: &EthereumRpcClient,
+        cached_gw: &CachedGateway,
+    ) {
+        initialize_runtime_target_accounts(
+            self.coalesced_initialized_accounts_requests(),
+            rpc,
+            cached_gw,
+        )
+        .await;
+    }
 }

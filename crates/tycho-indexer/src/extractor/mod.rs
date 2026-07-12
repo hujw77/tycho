@@ -36,17 +36,23 @@ pub mod chain_state;
 mod dynamic_contract_indexer;
 pub mod family_dispatch;
 pub mod family_lifecycle;
+pub mod family_managed_startup;
 pub mod family_registry;
+pub mod family_runner_wiring;
+pub mod family_runtime_execution;
 pub mod family_runtime;
 pub mod family_uniswap;
+pub mod extractor_lifecycle;
 pub mod models;
 pub mod post_processors;
 pub mod protobuf_deserialisation;
 pub mod protocol_cache;
 pub mod protocol_extractor;
+pub(crate) mod protocol_message_registry;
 pub mod reorg_buffer;
 pub mod runner;
 pub mod shared_bootstrap;
+pub mod standalone_managed_startup;
 pub mod startup;
 pub mod token_analysis_cron;
 mod u256_num;
@@ -95,6 +101,27 @@ pub enum RPCError {
 }
 
 pub type ExtractorMsg = Arc<BlockAggregatedChanges>;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExtractorProgressSnapshot {
+    pub cursor: String,
+    pub last_processed_block: Option<Block>,
+    pub completed_bootstrap_block: Option<u64>,
+}
+
+pub async fn load_extractor_progress_snapshot(
+    extractor: &dyn Extractor,
+) -> Result<ExtractorProgressSnapshot, ExtractionError> {
+    Ok(ExtractorProgressSnapshot {
+        cursor: extractor.get_cursor().await,
+        last_processed_block: extractor
+            .get_last_processed_block()
+            .await,
+        completed_bootstrap_block: extractor
+            .get_completed_bootstrap_block()
+            .await?,
+    })
+}
 
 #[automock]
 #[async_trait]

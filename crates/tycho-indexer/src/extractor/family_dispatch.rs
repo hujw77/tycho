@@ -20,6 +20,12 @@ pub struct FamilyDispatcherSeed {
     pub contract_systems: HashMap<Vec<u8>, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FamilyBranchMembership {
+    protocol_systems: HashSet<String>,
+    protocol_type_to_system: HashMap<String, String>,
+}
+
 impl FamilyBranchSpec {
     pub fn from_extractor_config(config: &ExtractorConfig) -> Result<Self, ExtractionError> {
         if config.protocol_types().is_empty() {
@@ -57,22 +63,45 @@ impl FamilyBranchSpec {
             .collect()
     }
 
+    fn resolve_membership<'a>(
+        branches: impl IntoIterator<Item = &'a FamilyBranchSpec>,
+    ) -> Result<FamilyBranchMembership, ExtractionError> {
+        let mut protocol_systems = HashSet::new();
+        let mut protocol_type_to_system = HashMap::new();
+
+        for branch in branches {
+            protocol_systems.insert(branch.protocol_system.clone());
+            for protocol_type_name in &branch.protocol_type_names {
+                if let Some(existing) = protocol_type_to_system
+                    .insert(protocol_type_name.clone(), branch.protocol_system.clone())
+                {
+                    return Err(ExtractionError::Setup(format!(
+                        "protocol type `{protocol_type_name}` is assigned to both `{existing}` and `{}`",
+                        branch.protocol_system
+                    )));
+                }
+            }
+        }
+
+        Ok(FamilyBranchMembership { protocol_systems, protocol_type_to_system })
+    }
+
     pub async fn dispatcher_seed_from_protocol_cache(
         branches: &[FamilyBranchSpec],
         protocol_cache: &ProtocolMemoryCache,
-    ) -> FamilyDispatcherSeed {
-        let protocol_systems = Self::protocol_system_set(branches.iter());
+    ) -> Result<FamilyDispatcherSeed, ExtractionError> {
+        let membership = Self::resolve_membership(branches.iter())?;
         let component_systems = protocol_cache
-            .component_protocol_systems(&protocol_systems)
+            .component_protocol_systems(&membership.protocol_systems)
             .await;
         let contract_systems = protocol_cache
-            .contract_protocol_systems(&protocol_systems)
+            .contract_protocol_systems(&membership.protocol_systems)
             .await
             .into_iter()
             .map(|(contract, protocol_system)| (contract.to_vec(), protocol_system))
             .collect();
 
-        FamilyDispatcherSeed { component_systems, contract_systems }
+        Ok(FamilyDispatcherSeed { component_systems, contract_systems })
     }
 }
 
@@ -88,26 +117,12 @@ impl FamilyBlockChangesDispatcher {
     pub fn new(
         branches: impl IntoIterator<Item = FamilyBranchSpec>,
     ) -> Result<Self, ExtractionError> {
-        let mut branch_protocol_systems = HashSet::new();
-        let mut protocol_type_to_system = HashMap::new();
-
-        for branch in branches {
-            branch_protocol_systems.insert(branch.protocol_system.clone());
-            for protocol_type_name in branch.protocol_type_names {
-                if let Some(existing) = protocol_type_to_system
-                    .insert(protocol_type_name.clone(), branch.protocol_system.clone())
-                {
-                    return Err(ExtractionError::Setup(format!(
-                        "protocol type `{protocol_type_name}` is assigned to both `{existing}` and `{}`",
-                        branch.protocol_system
-                    )));
-                }
-            }
-        }
+        let branches = branches.into_iter().collect::<Vec<_>>();
+        let membership = FamilyBranchSpec::resolve_membership(branches.iter())?;
 
         Ok(Self {
-            branch_protocol_systems,
-            protocol_type_to_system,
+            branch_protocol_systems: membership.protocol_systems,
+            protocol_type_to_system: membership.protocol_type_to_system,
             component_to_system: HashMap::new(),
             contract_to_system: HashMap::new(),
         })
@@ -121,6 +136,88 @@ impl FamilyBlockChangesDispatcher {
         dispatcher.register_component_systems(seed.component_systems);
         dispatcher.register_contract_systems(seed.contract_systems);
         Ok(dispatcher)
+    }
+
+    pub async fn from_protocol_cache(
+        branches: &[FamilyBranchSpec],
+        protocol_cache: &ProtocolMemoryCache,
+    ) -> Result<Self, ExtractionError> {
+        let seed =
+            FamilyBranchSpec::dispatcher_seed_from_protocol_cache(branches, protocol_cache).await;
+        Self::new_with_seed(branches.iter().cloned(), seed?)
+    }
+
+    pub async fn hydrate_from_protocol_cache_by_component_ids(
+        &mut self,
+        protocol_cache: &ProtocolMemoryCache,
+        component_ids: &HashSet<String>,
+    ) -> Result<bool, ExtractionError> {
+        let components = protocol_cache
+            .ensure_protocol_components_by_id(component_ids)
+            .await?;
+
+        let mut hydrated_components = HashMap::new();
+        let mut hydrated_contracts = HashMap::new();
+        for component in components.into_values() {
+            if !self
+                .branch_protocol_systems
+                .contains(&component.protocol_system)
+            {
+                continue;
+            }
+            hydrated_components.insert(component.id.clone(), component.protocol_system.clone());
+            for contract in component.contract_addresses {
+                hydrated_contracts.insert(contract.to_vec(), component.protocol_system.clone());
+            }
+        }
+
+        if hydrated_components.is_empty() && hydrated_contracts.is_empty() {
+            return Ok(false);
+        }
+
+        self.register_component_systems(hydrated_components);
+        self.register_contract_systems(hydrated_contracts);
+        Ok(true)
+    }
+
+    pub async fn dispatch_block_scoped_data_with_protocol_cache_fallback(
+        &mut self,
+        block_scoped_data: BlockScopedData,
+        protocol_cache: &ProtocolMemoryCache,
+    ) -> Result<HashMap<String, BlockScopedData>, ExtractionError> {
+        match self.dispatch_block_scoped_data(block_scoped_data.clone()) {
+            Ok(dispatched) => Ok(dispatched),
+            Err(err) => {
+                if !Self::should_hydrate_from_dispatch_error(&err) {
+                    return Err(err);
+                }
+
+                let referenced_component_ids =
+                    Self::referenced_component_ids_from_block_scoped_data(&block_scoped_data)?;
+                if referenced_component_ids.is_empty() {
+                    return Err(err);
+                }
+
+                if !self
+                    .hydrate_from_protocol_cache_by_component_ids(
+                        protocol_cache,
+                        &referenced_component_ids,
+                    )
+                    .await?
+                {
+                    return Err(err);
+                }
+
+                self.dispatch_block_scoped_data(block_scoped_data)
+            }
+        }
+    }
+
+    fn should_hydrate_from_dispatch_error(err: &ExtractionError) -> bool {
+        matches!(
+            err,
+            ExtractionError::DecodeError(message) if message.contains("unknown component `")
+        )
     }
 
     pub fn register_component_system(
@@ -157,11 +254,47 @@ impl FamilyBlockChangesDispatcher {
             .extend(contract_systems);
     }
 
+    fn admit_component_change(
+        &mut self,
+        component_change: &substreams::ProtocolComponent,
+    ) -> Result<String, ExtractionError> {
+        let protocol_type_name = component_change
+            .protocol_type
+            .as_ref()
+            .map(|protocol_type| protocol_type.name.clone())
+            .ok_or_else(|| {
+                ExtractionError::DecodeError(format!(
+                    "component `{}` is missing protocol_type",
+                    component_change.id
+                ))
+            })?;
+        let protocol_system = self
+            .protocol_type_to_system
+            .get(&protocol_type_name)
+            .cloned()
+            .ok_or_else(|| {
+                ExtractionError::DecodeError(format!(
+                    "unknown protocol type `{protocol_type_name}` while routing component `{}`",
+                    component_change.id
+                ))
+            })?;
+
+        self.component_to_system
+            .insert(component_change.id.clone(), protocol_system.clone());
+        for contract in &component_change.contracts {
+            self.contract_to_system
+                .insert(contract.clone(), protocol_system.clone());
+        }
+
+        Ok(protocol_system)
+    }
+
     pub fn dispatch_block_changes(
         &mut self,
         msg: substreams::BlockChanges,
     ) -> Result<HashMap<String, substreams::BlockChanges>, ExtractionError> {
         let block = msg.block.clone();
+        self.pre_register_block_components(&msg)?;
         let mut txs_by_system: HashMap<String, Vec<substreams::TransactionChanges>> =
             HashMap::new();
         let mut tx_systems_by_hash: HashMap<Vec<u8>, HashSet<String>> = HashMap::new();
@@ -277,6 +410,19 @@ impl FamilyBlockChangesDispatcher {
         Ok(dispatched)
     }
 
+    fn pre_register_block_components(
+        &mut self,
+        msg: &substreams::BlockChanges,
+    ) -> Result<(), ExtractionError> {
+        for tx_changes in &msg.changes {
+            for component_change in &tx_changes.component_changes {
+                self.admit_component_change(component_change)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn dispatch_block_scoped_data(
         &mut self,
         block_scoped_data: BlockScopedData,
@@ -326,6 +472,72 @@ impl FamilyBlockChangesDispatcher {
             .collect())
     }
 
+    pub fn referenced_component_ids_from_block_scoped_data(
+        block_scoped_data: &BlockScopedData,
+    ) -> Result<HashSet<String>, ExtractionError> {
+        let output = block_scoped_data
+            .output
+            .as_ref()
+            .ok_or_else(|| {
+                ExtractionError::DecodeError("Missing output in block scoped data".to_string())
+            })?;
+        let map_output = output
+            .map_output
+            .as_ref()
+            .ok_or_else(|| {
+                ExtractionError::DecodeError(
+                    "Missing map_output in block scoped data's output".to_string(),
+                )
+            })?;
+
+        if !map_output
+            .type_url
+            .ends_with("BlockChanges")
+        {
+            return Err(ExtractionError::DecodeError(format!(
+                "family dispatcher only supports BlockChanges outputs, got {}",
+                map_output.type_url
+            )));
+        }
+
+        let raw_msg = substreams::BlockChanges::decode(map_output.value.as_slice())?;
+        Self::referenced_component_ids_from_block_changes(&raw_msg)
+    }
+
+    pub fn referenced_component_ids_from_block_changes(
+        msg: &substreams::BlockChanges,
+    ) -> Result<HashSet<String>, ExtractionError> {
+        let mut component_ids = HashSet::new();
+
+        for tx_changes in &msg.changes {
+            for component_change in &tx_changes.component_changes {
+                component_ids.insert(component_change.id.clone());
+            }
+            for entity_change in &tx_changes.entity_changes {
+                component_ids.insert(entity_change.component_id.clone());
+            }
+            for balance_change in &tx_changes.balance_changes {
+                let component_id =
+                    String::from_utf8(balance_change.component_id.clone()).map_err(|err| {
+                        ExtractionError::DecodeError(format!(
+                            "balance change component id is not utf8: {err}"
+                        ))
+                    })?;
+                component_ids.insert(component_id);
+            }
+            for entrypoint in &tx_changes.entrypoints {
+                component_ids.insert(entrypoint.component_id.clone());
+            }
+            for entrypoint_params in &tx_changes.entrypoint_params {
+                if let Some(component_id) = &entrypoint_params.component_id {
+                    component_ids.insert(component_id.clone());
+                }
+            }
+        }
+
+        Ok(component_ids)
+    }
+
     fn dispatch_transaction_changes(
         &mut self,
         tx_changes: substreams::TransactionChanges,
@@ -338,33 +550,7 @@ impl FamilyBlockChangesDispatcher {
         let mut touched_systems = HashSet::new();
 
         for component_change in tx_changes.component_changes {
-            let protocol_type_name = component_change
-                .protocol_type
-                .as_ref()
-                .map(|protocol_type| protocol_type.name.clone())
-                .ok_or_else(|| {
-                    ExtractionError::DecodeError(format!(
-                        "component `{}` is missing protocol_type",
-                        component_change.id
-                    ))
-                })?;
-            let protocol_system = self
-                .protocol_type_to_system
-                .get(&protocol_type_name)
-                .cloned()
-                .ok_or_else(|| {
-                    ExtractionError::DecodeError(format!(
-                        "unknown protocol type `{protocol_type_name}` while routing component `{}`",
-                        component_change.id
-                    ))
-                })?;
-
-            self.component_to_system
-                .insert(component_change.id.clone(), protocol_system.clone());
-            for contract in &component_change.contracts {
-                self.contract_to_system
-                    .insert(contract.clone(), protocol_system.clone());
-            }
+            let protocol_system = self.admit_component_change(&component_change)?;
             touched_systems.insert(protocol_system.clone());
             split_txs
                 .entry(protocol_system)
@@ -578,6 +764,67 @@ mod tests {
             change: 0,
             slots: vec![],
             token_balances: vec![],
+        }
+    }
+
+    fn family_block_scoped_data_with_component_balance(
+        component_id: &str,
+        token: Vec<u8>,
+        block_number: u64,
+        cursor: &str,
+    ) -> BlockScopedData {
+        let block = substreams::Block {
+            number: block_number,
+            hash: vec![0x01; 32],
+            parent_hash: vec![0x02; 32],
+            ts: 1_718_000_000 + block_number,
+        };
+        let tx = substreams::Transaction {
+            hash: vec![0xaa; 32],
+            from: vec![0x11; 20],
+            to: vec![0x22; 20],
+            index: 0,
+        };
+        let block_changes = substreams::BlockChanges {
+            block: Some(block),
+            changes: vec![substreams::TransactionChanges {
+                tx: Some(tx),
+                contract_changes: vec![],
+                entity_changes: vec![],
+                component_changes: vec![],
+                balance_changes: vec![substreams::BalanceChange {
+                    component_id: component_id.as_bytes().to_vec(),
+                    token,
+                    balance: vec![0x01],
+                }],
+                entrypoints: vec![],
+                entrypoint_params: vec![],
+            }],
+            storage_changes: vec![],
+        };
+
+        BlockScopedData {
+            output: Some(MapModuleOutput {
+                name: "map_family_protocol_changes".to_string(),
+                map_output: Some(prost_types::Any {
+                    type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
+                    value: block_changes.encode_to_vec(),
+                }),
+                debug_info: None,
+            }),
+            clock: Some(Clock {
+                id: block_number.to_string(),
+                number: block_number,
+                timestamp: None,
+            }),
+            cursor: cursor.to_string(),
+            final_block_height: block_number,
+            debug_map_outputs: vec![],
+            debug_store_outputs: vec![],
+            attestation: "test_attestation".to_string(),
+            is_partial: false,
+            partial_index: None,
+            is_last_partial: None,
         }
     }
 
@@ -1260,6 +1507,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn routes_same_block_updates_when_component_registration_arrives_in_later_transaction() {
+        let mut dispatcher = FamilyBlockChangesDispatcher::new([
+            branch("uniswap_v2", "uniswap_v2_pool"),
+            branch("uniswap_v3", "uniswap_v3_pool"),
+        ])
+        .expect("dispatcher builds");
+
+        let first_tx = substreams::Transaction {
+            hash: vec![0xaa; 32],
+            from: vec![0x11; 20],
+            to: vec![0x22; 20],
+            index: 0,
+        };
+        let second_tx = substreams::Transaction {
+            hash: vec![0xbb; 32],
+            from: vec![0x11; 20],
+            to: vec![0x22; 20],
+            index: 1,
+        };
+
+        let dispatched = dispatcher
+            .dispatch_block_changes(substreams::BlockChanges {
+                block: Some(test_block()),
+                changes: vec![
+                    substreams::TransactionChanges {
+                        tx: Some(first_tx),
+                        contract_changes: vec![],
+                        entity_changes: vec![substreams::EntityChanges {
+                            component_id: "late-v3-pool".to_string(),
+                            attributes: vec![],
+                        }],
+                        component_changes: vec![],
+                        balance_changes: vec![substreams::BalanceChange {
+                            component_id: b"late-v3-pool".to_vec(),
+                            token: vec![0xa0; 20],
+                            balance: vec![0x01],
+                        }],
+                        entrypoints: vec![],
+                        entrypoint_params: vec![],
+                    },
+                    substreams::TransactionChanges {
+                        tx: Some(second_tx),
+                        contract_changes: vec![],
+                        entity_changes: vec![],
+                        component_changes: vec![substreams::ProtocolComponent {
+                            id: "late-v3-pool".to_string(),
+                            protocol_type: Some(substreams::ProtocolType {
+                                name: "uniswap_v3_pool".to_string(),
+                                ..Default::default()
+                            }),
+                            contracts: vec![vec![0x83; 20]],
+                            ..Default::default()
+                        }],
+                        balance_changes: vec![],
+                        entrypoints: vec![],
+                        entrypoint_params: vec![],
+                    },
+                ],
+                storage_changes: vec![],
+            })
+            .expect("same-block out-of-order admission dispatch succeeds");
+
+        assert_eq!(dispatched["uniswap_v3"].changes.len(), 2);
+        assert_eq!(
+            dispatched["uniswap_v3"].changes[0].entity_changes[0].component_id,
+            "late-v3-pool"
+        );
+        assert_eq!(
+            String::from_utf8(
+                dispatched["uniswap_v3"].changes[0].balance_changes[0]
+                    .component_id
+                    .clone()
+            )
+            .expect("balance change component id should be utf8"),
+            "late-v3-pool"
+        );
+        assert_eq!(dispatched["uniswap_v3"].changes[1].component_changes[0].id, "late-v3-pool");
+    }
+
     #[tokio::test]
     async fn derives_dispatcher_seed_from_protocol_cache() {
         let cache = ProtocolMemoryCache::new(
@@ -1299,7 +1626,9 @@ mod tests {
 
         let branches =
             vec![branch("uniswap_v2", "uniswap_v2_pool"), branch("uniswap_v3", "uniswap_v3_pool")];
-        let seed = FamilyBranchSpec::dispatcher_seed_from_protocol_cache(&branches, &cache).await;
+        let seed = FamilyBranchSpec::dispatcher_seed_from_protocol_cache(&branches, &cache)
+            .await
+            .expect("dispatcher seed derives from cache");
 
         assert_eq!(
             seed.component_systems
@@ -1320,6 +1649,141 @@ mod tests {
             seed.contract_systems
                 .get(&vec![0x82; 20]),
             Some(&"uniswap_v3".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrates_dispatcher_from_protocol_cache_by_component_ids() {
+        let cache = ProtocolMemoryCache::new(
+            Chain::Ethereum,
+            Duration::seconds(60),
+            std::sync::Arc::new(MockGateway::new()),
+        );
+        cache
+            .add_components(vec![
+                tycho_common::models::protocol::ProtocolComponent::new(
+                    "seeded-v2-pool",
+                    "uniswap_v2",
+                    "uniswap_v2_pool",
+                    Chain::Ethereum,
+                    Vec::new(),
+                    vec![tycho_common::Bytes::from(vec![0x81; 20])],
+                    HashMap::new(),
+                    tycho_common::models::ChangeType::Creation,
+                    tycho_common::Bytes::default(),
+                    chrono::NaiveDateTime::default(),
+                ),
+                tycho_common::models::protocol::ProtocolComponent::new(
+                    "other-pool",
+                    "curve",
+                    "curve_pool",
+                    Chain::Ethereum,
+                    Vec::new(),
+                    vec![tycho_common::Bytes::from(vec![0x91; 20])],
+                    HashMap::new(),
+                    tycho_common::models::ChangeType::Creation,
+                    tycho_common::Bytes::default(),
+                    chrono::NaiveDateTime::default(),
+                ),
+            ])
+            .await
+            .expect("add cached components");
+
+        let branches = vec![branch("uniswap_v2", "uniswap_v2_pool")];
+        let mut dispatcher =
+            FamilyBlockChangesDispatcher::new(branches).expect("dispatcher builds");
+
+        let hydrated = dispatcher
+            .hydrate_from_protocol_cache_by_component_ids(
+                &cache,
+                &HashSet::from(["seeded-v2-pool".to_string(), "other-pool".to_string()]),
+            )
+            .await
+            .expect("dispatcher hydrates from cache");
+
+        assert!(hydrated);
+        assert_eq!(
+            dispatcher
+                .component_to_system
+                .get("seeded-v2-pool"),
+            Some(&"uniswap_v2".to_string())
+        );
+        assert_eq!(
+            dispatcher
+                .contract_to_system
+                .get(&vec![0x81; 20]),
+            Some(&"uniswap_v2".to_string())
+        );
+        assert_eq!(
+            dispatcher
+                .component_to_system
+                .get("other-pool"),
+            None
+        );
+        assert_eq!(
+            dispatcher
+                .contract_to_system
+                .get(&vec![0x91; 20]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_block_scoped_data_with_protocol_cache_fallback_hydrates_unknown_component() {
+        let cache = ProtocolMemoryCache::new(
+            Chain::Ethereum,
+            Duration::seconds(60),
+            std::sync::Arc::new(MockGateway::new()),
+        );
+        cache
+            .add_components(vec![tycho_common::models::protocol::ProtocolComponent::new(
+                "seeded-v2-pool",
+                "uniswap_v2",
+                "uniswap_v2_pool",
+                Chain::Ethereum,
+                Vec::new(),
+                vec![tycho_common::Bytes::from(vec![0x81; 20])],
+                HashMap::new(),
+                tycho_common::models::ChangeType::Creation,
+                tycho_common::Bytes::default(),
+                chrono::NaiveDateTime::default(),
+            )])
+            .await
+            .expect("add cached component");
+
+        let branches = vec![branch("uniswap_v2", "uniswap_v2_pool")];
+        let mut dispatcher =
+            FamilyBlockChangesDispatcher::new(branches).expect("dispatcher builds");
+
+        let dispatched = dispatcher
+            .dispatch_block_scoped_data_with_protocol_cache_fallback(
+                family_block_scoped_data_with_component_balance(
+                    "seeded-v2-pool",
+                    vec![0x81; 20],
+                    43,
+                    "cursor-43",
+                ),
+                &cache,
+            )
+            .await
+            .expect("dispatcher should hydrate from cache and redispatch");
+
+        let output = dispatched["uniswap_v2"]
+            .output
+            .as_ref()
+            .expect("branch output");
+        let map_output = output
+            .map_output
+            .as_ref()
+            .expect("branch map output");
+        let block_changes = substreams::BlockChanges::decode(map_output.value.as_slice())
+            .expect("decode dispatched block changes");
+
+        assert_eq!(block_changes.changes.len(), 1);
+        assert_eq!(
+            String::from_utf8(block_changes.changes[0].balance_changes[0].component_id.clone())
+                .expect("component id should be utf8"),
+            "seeded-v2-pool"
         );
     }
 }

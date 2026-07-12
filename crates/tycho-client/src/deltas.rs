@@ -405,6 +405,9 @@ impl Inner {
 
 /// Tycho client websocket implementation.
 impl WsDeltasClient {
+    pub const DEFAULT_WS_BUFFER_SIZE: usize = 128;
+    pub const DEFAULT_SUBSCRIPTION_BUFFER_SIZE: usize = 128;
+
     // Construct a new client with 5 reconnection attempts.
     #[allow(clippy::result_large_err)]
     pub fn new(ws_uri: &str, auth_key: Option<&str>) -> Result<Self, DeltasError> {
@@ -415,8 +418,8 @@ impl WsDeltasClient {
             uri,
             auth_key: auth_key.map(|s| s.to_string()),
             inner: Arc::new(Mutex::new(None)),
-            ws_buffer_size: 128,
-            subscription_buffer_size: 128,
+            ws_buffer_size: Self::DEFAULT_WS_BUFFER_SIZE,
+            subscription_buffer_size: Self::DEFAULT_SUBSCRIPTION_BUFFER_SIZE,
             conn_notify: Arc::new(Notify::new()),
             max_reconnects: 5,
             retry_cooldown: Duration::from_millis(500),
@@ -440,13 +443,23 @@ impl WsDeltasClient {
             uri,
             auth_key: auth_key.map(|s| s.to_string()),
             inner: Arc::new(Mutex::new(None)),
-            ws_buffer_size: 128,
-            subscription_buffer_size: 128,
+            ws_buffer_size: Self::DEFAULT_WS_BUFFER_SIZE,
+            subscription_buffer_size: Self::DEFAULT_SUBSCRIPTION_BUFFER_SIZE,
             conn_notify: Arc::new(Notify::new()),
             max_reconnects,
             retry_cooldown,
             dead: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub fn with_buffer_sizes(
+        mut self,
+        ws_buffer_size: usize,
+        subscription_buffer_size: usize,
+    ) -> Self {
+        self.ws_buffer_size = ws_buffer_size;
+        self.subscription_buffer_size = subscription_buffer_size;
+        self
     }
 
     // Construct a new client with custom buffer sizes (for testing)

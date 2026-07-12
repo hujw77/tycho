@@ -55,6 +55,19 @@ fn duplicate_protocol_state_latest_keys(
     duplicates.into_iter().collect()
 }
 
+fn duplicate_protocol_state_input_keys(rows: &[(i64, String, i64)]) -> Vec<(i64, String, i64)> {
+    let mut seen = HashSet::with_capacity(rows.len());
+    let mut duplicates = BTreeSet::new();
+
+    for row in rows {
+        if !seen.insert(row.clone()) {
+            duplicates.insert(row.clone());
+        }
+    }
+
+    duplicates.into_iter().collect()
+}
+
 // Private methods
 impl PostgresGateway {
     async fn use_latest_protocol_view(
@@ -674,12 +687,12 @@ impl PostgresGateway {
         .await?;
 
         // establish component-contract junction
-        let contract_addresses: HashSet<Address> = new
+        let contract_addresses: HashSet<Address> = filtered_new_protocol_components
             .iter()
-            .flat_map(|pc| pc.contract_addresses.clone())
+            .flat_map(|pc| pc.contract_addresses.iter().cloned())
             .collect();
 
-        let pc_contract_map = new
+        let pc_contract_map = filtered_new_protocol_components
             .iter()
             .flat_map(|pc| {
                 let pc_id = protocol_db_id_map
@@ -935,8 +948,7 @@ impl PostgresGateway {
         .collect();
 
         let mut state_data = Vec::new();
-        let mut seen_state_keys = HashSet::new();
-        let mut duplicate_state_keys = HashSet::new();
+        let mut seen_state_keys = Vec::new();
         for state in new {
             let tx = state
                 .tx
@@ -960,10 +972,7 @@ impl PostgresGateway {
                     .updated_attributes
                     .iter()
                     .map(|(attribute, value)| {
-                        let state_key = (component_db_id, attribute.clone(), *tx_ts);
-                        if !seen_state_keys.insert(state_key.clone()) {
-                            duplicate_state_keys.insert(state_key);
-                        }
+                        seen_state_keys.push((component_db_id, attribute.clone(), *tx_id));
                         WithOrdinal::new(
                             VersioningEntry::Update(orm::NewProtocolState::new(
                                 component_db_id,
@@ -982,10 +991,7 @@ impl PostgresGateway {
                     .deleted_attributes
                     .iter()
                     .map(|attr| {
-                        let state_key = (component_db_id, attr.clone(), *tx_ts);
-                        if !seen_state_keys.insert(state_key.clone()) {
-                            duplicate_state_keys.insert(state_key);
-                        }
+                        seen_state_keys.push((component_db_id, attr.clone(), *tx_id));
                         WithOrdinal::new(
                             VersioningEntry::Deletion(((component_db_id, attr.clone()), *tx_ts)),
                             (component_db_id, attr, tx_ts, tx_index),
@@ -994,10 +1000,11 @@ impl PostgresGateway {
             );
         }
 
+        let duplicate_state_keys = duplicate_protocol_state_input_keys(&seen_state_keys);
         if !duplicate_state_keys.is_empty() {
             warn!(
                 ?duplicate_state_keys,
-                "Duplicate protocol state keys detected before versioning"
+                "Duplicate protocol state keys detected within a single transaction before versioning"
             );
         }
 
@@ -2130,6 +2137,20 @@ mod test {
             .unwrap();
 
         conn
+    }
+
+    #[test]
+    fn duplicate_protocol_state_input_keys_only_flags_same_transaction_duplicates() {
+        let duplicates = duplicate_protocol_state_input_keys(&[
+            (1, "reserve0".to_string(), 100),
+            (1, "reserve0".to_string(), 101),
+            (1, "reserve0".to_string(), 100),
+            (1, "reserve1".to_string(), 100),
+            (2, "tick".to_string(), 200),
+            (2, "tick".to_string(), 201),
+        ]);
+
+        assert_eq!(duplicates, vec![(1, "reserve0".to_string(), 100)]);
     }
 
     /// This sets up the data needed to test the gateway. Returns the inserted chain's DB id and the

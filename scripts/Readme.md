@@ -180,3 +180,158 @@ Optional overrides:
 - `TYCHO_COMBINED_FIXTURE_STOP_BLOCK`
 - `TYCHO_COMBINED_FIXTURE_OUTPUT`
 - `TYCHO_COMBINED_FIXTURE_CONFIG`
+
+## Combined Uniswap live Fynd E2E
+
+Use `scripts/check-combined-family-fynd-live-e2e.sh` to standardize the live combined-family
+Fynd route-return and quote-settlement checks against a local Tycho RPC plus a live Ethereum RPC.
+
+Check whether the sibling `fynd` repository is present and whether the local Tycho endpoint is
+reachable:
+
+```bash
+scripts/check-combined-family-fynd-live-e2e.sh doctor
+```
+
+Fail fast when the local Tycho endpoint is not ready:
+
+```bash
+scripts/check-combined-family-fynd-live-e2e.sh doctor --strict
+```
+
+Print the exact combined-family route + settlement command sequence before running it:
+
+```bash
+scripts/check-combined-family-fynd-live-e2e.sh command all
+```
+
+Run only the combined-family route-return ignored test:
+
+```bash
+scripts/check-combined-family-fynd-live-e2e.sh run-route
+```
+
+Run only the combined-family quote-settlement ignored test:
+
+```bash
+scripts/check-combined-family-fynd-live-e2e.sh run-settlement
+```
+
+Run both combined-family ignored tests in sequence:
+
+```bash
+scripts/check-combined-family-fynd-live-e2e.sh run-all
+```
+
+Optional overrides:
+
+- `FYND_REPO_ROOT`
+- `FYND_E2E_TYCHO_URL`
+- `FYND_E2E_RPC_URL`
+- `FYND_E2E_RUST_LOG`
+- `TYCHO_STREAM_WS_BUFFER_SIZE`
+- `TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE`
+
+## Combined Uniswap indexer startup
+
+Use `scripts/run-combined-family-indexer.sh` to standardize the local combined-family Tycho
+indexer startup command.
+
+Check whether the local startup environment is ready:
+
+```bash
+scripts/run-combined-family-indexer.sh doctor
+```
+
+Fail fast when required inputs such as `SUBSTREAMS_API_TOKEN` or the local Postgres endpoint are
+missing:
+
+```bash
+scripts/run-combined-family-indexer.sh doctor --strict
+```
+
+Print the exact startup command:
+
+```bash
+scripts/run-combined-family-indexer.sh command
+```
+
+Start the combined-family indexer directly:
+
+```bash
+scripts/run-combined-family-indexer.sh run
+```
+
+Optional overrides:
+
+- `AUTH_API_KEY`
+- `SUBSTREAMS_API_TOKEN`
+- `TYCHO_INDEXER_ENDPOINT`
+- `TYCHO_INDEXER_DATABASE_URL`
+- `TYCHO_INDEXER_RPC_URL`
+- `TYCHO_INDEXER_EXTRACTORS_CONFIG`
+- `TYCHO_INDEXER_RUST_LOG`
+
+Notes:
+
+- `AUTH_API_KEY` defaults to `dummy` for local operator runs, matching the current indexer
+  startup requirement without forcing a separate secret-management step.
+- the script prints and runs `export SUBSTREAMS_API_TOKEN=...` before
+  `--api_token "$SUBSTREAMS_API_TOKEN"` so the combined-family startup path does not regress to
+  the shell-expansion bug where an inline env assignment leaves `--api_token` empty
+
+## Combined Uniswap validation surface
+
+Use `scripts/check-combined-family.sh` as the top-level Phase 3 validation entrypoint. It
+composes:
+
+- the repo-local DB-backed combined-family regression gate
+- the live combined-family Fynd E2E gate
+
+Check aggregate readiness:
+
+```bash
+scripts/check-combined-family.sh doctor
+```
+
+Fail fast when either the local DB-backed gate or the live Tycho/Fynd gate is not ready:
+
+```bash
+scripts/check-combined-family.sh doctor --strict
+```
+
+Print the exact repo-local regression command:
+
+```bash
+scripts/check-combined-family.sh command repo
+```
+
+Print the exact live Fynd E2E command sequence:
+
+```bash
+scripts/check-combined-family.sh command live
+```
+
+Print the full Phase 3 validation command sequence:
+
+```bash
+scripts/check-combined-family.sh command all
+```
+
+Run only the repo-local DB-backed regression gate:
+
+```bash
+scripts/check-combined-family.sh run-repo
+```
+
+Run only the live Fynd E2E gate:
+
+```bash
+scripts/check-combined-family.sh run-live
+```
+
+Run the full combined-family validation sequence:
+
+```bash
+scripts/check-combined-family.sh run-all
+```

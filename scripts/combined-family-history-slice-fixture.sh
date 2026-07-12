@@ -18,6 +18,7 @@ Modes:
   record     Capture the checked-in combined-family history-slice fixture.
 
 Optional environment overrides:
+  TYCHO_COMBINED_FIXTURE_FAMILY        Default: auto-resolve from extractors config
   TYCHO_COMBINED_FIXTURE_START_BLOCK   Default: 25384601
   TYCHO_COMBINED_FIXTURE_STOP_BLOCK    Default: +2
   TYCHO_COMBINED_FIXTURE_OUTPUT        Default:
@@ -69,6 +70,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+FAMILY_NAME="${TYCHO_COMBINED_FIXTURE_FAMILY:-}"
 START_BLOCK="${TYCHO_COMBINED_FIXTURE_START_BLOCK:-25384601}"
 STOP_BLOCK="${TYCHO_COMBINED_FIXTURE_STOP_BLOCK:-+2}"
 OUTPUT_PATH="${TYCHO_COMBINED_FIXTURE_OUTPUT:-${REPO_ROOT}/crates/tycho-indexer/tests/fixtures/combined_family_real_history_slice.json}"
@@ -82,29 +84,32 @@ BASE_CMD=(
   record-substreams
   --substreams-api-token token
   --extractors-config "${EXTRACTORS_CONFIG}"
-  --family uniswap
   --start-block "${START_BLOCK}"
   --stop-block "${STOP_BLOCK}"
   --output "${OUTPUT_PATH}"
 )
 
+if [[ -n "${FAMILY_NAME}" ]]; then
+  BASE_CMD+=(--family "${FAMILY_NAME}")
+fi
+
 render_record_cmd() {
   local endpoint="${TYCHO_RECORD_ENDPOINT:-<set TYCHO_RECORD_ENDPOINT>}"
   local rpc_url="${TYCHO_RECORD_RPC_URL:-<set TYCHO_RECORD_RPC_URL>}"
   local api_token="${SUBSTREAMS_API_TOKEN:-<set SUBSTREAMS_API_TOKEN>}"
-  cat <<EOF
-cargo run --bin tycho-indexer -- \\
-  --database-url postgres://unused \\
-  --endpoint $(shell_escape "${endpoint}") \\
-  --rpc-url $(shell_escape "${rpc_url}") \\
-  record-substreams \\
-  --substreams-api-token $(shell_escape "${api_token}") \\
-  --extractors-config $(shell_escape "${EXTRACTORS_CONFIG}") \\
-  --family uniswap \\
-  --start-block $(shell_escape "${START_BLOCK}") \\
-  --stop-block $(shell_escape "${STOP_BLOCK}") \\
-  --output $(shell_escape "${OUTPUT_PATH}")
-EOF
+  printf '%s\n' "cargo run --bin tycho-indexer -- \\"
+  printf '%s\n' "  --database-url postgres://unused \\"
+  printf '%s\n' "  --endpoint $(shell_escape "${endpoint}") \\"
+  printf '%s\n' "  --rpc-url $(shell_escape "${rpc_url}") \\"
+  printf '%s\n' "  record-substreams \\"
+  printf '%s\n' "  --substreams-api-token $(shell_escape "${api_token}") \\"
+  printf '%s\n' "  --extractors-config $(shell_escape "${EXTRACTORS_CONFIG}") \\"
+  if [[ -n "${FAMILY_NAME}" ]]; then
+    printf '%s\n' "  --family $(shell_escape "${FAMILY_NAME}") \\"
+  fi
+  printf '%s\n' "  --start-block $(shell_escape "${START_BLOCK}") \\"
+  printf '%s\n' "  --stop-block $(shell_escape "${STOP_BLOCK}") \\"
+  printf '%s\n' "  --output $(shell_escape "${OUTPUT_PATH}")"
 }
 
 doctor() {
@@ -128,6 +133,7 @@ doctor() {
 
   cat <<EOF
 ready=${ready}
+family_name=${FAMILY_NAME:-auto}
 start_block=${START_BLOCK}
 stop_block=${STOP_BLOCK}
 extractors_config=${EXTRACTORS_CONFIG}
@@ -158,17 +164,22 @@ case "${MODE}" in
     require_env TYCHO_RECORD_RPC_URL
     require_env SUBSTREAMS_API_TOKEN
     cd "${REPO_ROOT}"
-    cargo run --bin tycho-indexer -- \
-      --database-url postgres://unused \
-      --endpoint "${TYCHO_RECORD_ENDPOINT}" \
-      --rpc-url "${TYCHO_RECORD_RPC_URL}" \
-      record-substreams \
-      --substreams-api-token "${SUBSTREAMS_API_TOKEN}" \
-      --extractors-config "${EXTRACTORS_CONFIG}" \
-      --family uniswap \
-      --start-block "${START_BLOCK}" \
-      --stop-block "${STOP_BLOCK}" \
+    RECORD_CMD=(
+      cargo run --bin tycho-indexer --
+      --database-url postgres://unused
+      --endpoint "${TYCHO_RECORD_ENDPOINT}"
+      --rpc-url "${TYCHO_RECORD_RPC_URL}"
+      record-substreams
+      --substreams-api-token "${SUBSTREAMS_API_TOKEN}"
+      --extractors-config "${EXTRACTORS_CONFIG}"
+      --start-block "${START_BLOCK}"
+      --stop-block "${STOP_BLOCK}"
       --output "${OUTPUT_PATH}"
+    )
+    if [[ -n "${FAMILY_NAME}" ]]; then
+      RECORD_CMD+=(--family "${FAMILY_NAME}")
+    fi
+    "${RECORD_CMD[@]}"
     ;;
   *)
     echo "unknown mode: ${MODE}" >&2

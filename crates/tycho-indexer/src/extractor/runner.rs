@@ -41,16 +41,26 @@ use crate::{
             dci::DynamicContractIndexer,
             hooks::{hook_dci::UniswapV4HookDCI, hooks_dci_builder::UniswapV4HookDCIBuilder},
         },
-        family_dispatch::{FamilyBlockChangesDispatcher, FamilyBranchSpec},
-        family_lifecycle::{resolve_family_stream_position, run_family_bootstrap_if_needed},
+        extractor_lifecycle::{
+            decide_standalone_bootstrap_action, load_standalone_progress_snapshot,
+            resolve_standalone_stream_start_block, StandaloneBootstrapAction,
+        },
+        family_managed_startup::{
+            build_family_managed_runner, FamilyRuntimeBuildContext,
+        },
         family_runtime::{
-            ResolvedFamilyRuntime, ResolvedRuntimeTarget, ResolvedStandaloneRuntime,
-            ResolvedSubstreamsExecutionRequest,
+            default_family_runtime_registry, FamilyRuntimeConfig, PreparedSubstreamsRequest,
+            ResolvedRuntimeTarget, ResolvedRuntimeTargets, ResolvedStandaloneRuntime,
         },
         post_processors::POST_PROCESSOR_REGISTRY,
         protocol_cache::ProtocolMemoryCache,
         protocol_extractor::{ExtractorPgGateway, ProtocolExtractor},
-        shared_bootstrap::{materialize_plan_block, SharedBootstrapPlan},
+        protocol_message_registry::AuxiliaryProtocolMessageDecoder,
+        shared_bootstrap::{commit_materialized_bootstrap, SharedBootstrapPlan},
+        standalone_managed_startup::{
+            build_standalone_managed_runner_from_startup, prepare_standalone_managed_startup,
+            StandaloneRuntimeBuildContext,
+        },
         ExtractionError, Extractor, ExtractorExtension, ExtractorMsg,
     },
     pb::sf::substreams::{rpc::v2::BlockScopedData, v1::Package},
@@ -61,22 +71,80 @@ use crate::{
 };
 
 #[cfg(test)]
+use crate::extractor::family_dispatch::FamilyBranchSpec;
+#[cfg(test)]
+use crate::extractor::family_dispatch::FamilyBlockChangesDispatcher;
+#[cfg(test)]
+use crate::extractor::family_runtime_execution::FamilyRuntimeState;
+#[cfg(test)]
+use crate::extractor::family_runner_wiring::{
+    extractors_by_protocol_system, FamilyBranchRuntimeWiring, FamilyBranchSubscriptionIndex,
+};
+#[cfg(test)]
 use crate::extractor::family_lifecycle::{
     apply_family_bootstrap_plan, family_bootstrap_already_completed, resolve_family_stream_cursor,
-    resolve_family_stream_start, validate_family_progress_consistency,
+    resolve_family_stream_position, resolve_family_stream_start, run_family_bootstrap_if_needed,
+    validate_family_progress_consistency,
 };
 #[cfg(test)]
 use crate::extractor::family_runtime::{
-    empty_resolved_family_execution_config_for_tests,
     resolved_family_execution_config_from_extractor_configs_for_tests,
-    validate_family_runtime_membership, DetectedFamilyRuntime, ResolvedFamilyExecutionConfig,
+    validate_family_runtime_membership, DetectedFamilyRuntime,
     ResolvedSharedBootstrapBranchRuntime,
 };
 #[cfg(test)]
+use crate::extractor::family_managed_startup::PreparedFamilyRunnerStartup;
+#[cfg(test)]
+use crate::extractor::family_managed_startup::build_family_managed_runner_from_startup;
+#[cfg(test)]
 use crate::testing::{
-    family_detected_runtime_for_tests, family_detected_runtime_with_members_for_tests,
-    family_resolved_shared_stream_for_tests,
+    family_detected_runtime_from_configs_for_tests, family_detected_runtime_with_members_for_tests,
+    family_output_module_for_tests, family_shared_extractor_id_for_tests,
+    family_shared_stream_name_for_tests,
 };
+#[cfg(test)]
+use crate::testing::MockGateway;
+
+#[cfg(test)]
+fn uniswap_shared_stream_for_tests(
+    shared_spkg: &str,
+) -> crate::extractor::family_runtime::ResolvedSharedFamilyStream {
+    default_family_runtime_registry()
+        .resolved_shared_stream_for_family(Chain::Ethereum, "uniswap", shared_spkg)
+        .expect("registered uniswap shared stream")
+}
+
+#[cfg(test)]
+fn family_runtime_state_for_tests(
+    extractors: &HashMap<String, Arc<dyn Extractor>>,
+    dispatcher: FamilyBlockChangesDispatcher,
+) -> FamilyRuntimeState {
+    let protocol_cache = ProtocolMemoryCache::new(
+        Chain::Ethereum,
+        chrono::Duration::seconds(60),
+        Arc::new(MockGateway::new()),
+    );
+    FamilyRuntimeState::new(extractors, dispatcher, protocol_cache)
+}
+
+#[cfg(test)]
+fn family_runner_for_tests(
+    extractors: HashMap<String, Arc<dyn Extractor>>,
+    substreams: SubstreamsStream,
+    subscriptions: BranchSubscriptionsMap,
+    dispatcher: FamilyBlockChangesDispatcher,
+) -> FamilyExtractorRunner {
+    let runtime_state = family_runtime_state_for_tests(&extractors, dispatcher);
+    FamilyExtractorRunner::new(
+        extractors,
+        substreams,
+        subscriptions,
+        mpsc::channel(4).1,
+        None,
+        false,
+        runtime_state,
+    )
+}
 
 /// Enum to handle both standard DCI and UniswapV4 Hook DCI
 #[allow(clippy::large_enum_variant)]
@@ -152,7 +220,7 @@ pub struct ExtractorHandle {
 }
 
 impl ExtractorHandle {
-    fn new(id: ExtractorIdentity, control_tx: Sender<ControlMessage>) -> Self {
+    pub(crate) fn new(id: ExtractorIdentity, control_tx: Sender<ControlMessage>) -> Self {
         Self { id, control_tx }
     }
 
@@ -196,8 +264,8 @@ impl MessageSender for ExtractorHandle {
 }
 
 // Define the SubscriptionsMap type alias
-type SubscriptionsMap = HashMap<u64, Sender<ExtractorMsg>>;
-type BranchSubscriptionsMap = HashMap<String, Arc<Mutex<SubscriptionsMap>>>;
+pub(crate) type SubscriptionsMap = HashMap<u64, Sender<ExtractorMsg>>;
+pub(crate) type BranchSubscriptionsMap = HashMap<String, Arc<Mutex<SubscriptionsMap>>>;
 
 pub struct ExtractorRunner {
     extractor: Arc<dyn Extractor>,
@@ -210,6 +278,8 @@ pub struct ExtractorRunner {
     runtime_handle: Option<Handle>,
     partial_blocks: bool,
 }
+
+pub use crate::extractor::family_runtime_execution::FamilyExtractorRunner;
 
 pub enum ManagedRunner {
     Single(ExtractorRunner),
@@ -225,15 +295,132 @@ impl ManagedRunner {
     }
 }
 
-pub struct FamilyExtractorRunner {
-    extractors: HashMap<String, Arc<dyn Extractor>>,
-    substreams: SubstreamsStream,
-    subscriptions: BranchSubscriptionsMap,
-    next_subscriber_id: u64,
-    control_rx: Receiver<ControlMessage>,
-    runtime_handle: Option<Handle>,
-    partial_blocks: bool,
-    dispatcher: FamilyBlockChangesDispatcher,
+impl<'a> ResolvedRuntimeTargets<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_managed_runners(
+        self,
+        chain_state: ChainState,
+        endpoint_url: &str,
+        s3_bucket: Option<&str>,
+        substreams_api_token: &str,
+        cached_gw: &CachedGateway,
+        database_insert_batch_size: usize,
+        token_pre_processor: &EthereumTokenPreProcessor,
+        rpc_client: &EthereumRpcClient,
+        runtime: Option<Handle>,
+        partial_blocks: bool,
+    ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
+        let chain = self
+            .as_slice()
+            .first()
+            .map(ResolvedRuntimeTarget::chain)
+            .expect("resolved runtime targets should not be empty");
+
+        info!("Building protocol cache");
+        let protocol_cache = ProtocolMemoryCache::new(
+            chain,
+            chrono::Duration::seconds(900),
+            Arc::new(cached_gw.clone()),
+        );
+        protocol_cache.populate().await?;
+
+        self.initialize_accounts(rpc_client, cached_gw).await;
+
+        let mut runners = Vec::new();
+        let mut extractor_handles = Vec::new();
+
+        for target in self.into_inner() {
+            let (runner, handles) = target
+                .build_managed_runner(
+                    chain_state,
+                    endpoint_url,
+                    s3_bucket,
+                    substreams_api_token,
+                    cached_gw,
+                    database_insert_batch_size,
+                    token_pre_processor,
+                    &protocol_cache,
+                    rpc_client,
+                    runtime.clone(),
+                    partial_blocks,
+                )
+                .await?;
+            runners.push(runner);
+            extractor_handles.extend(handles);
+        }
+
+        Ok((runners, extractor_handles))
+    }
+}
+
+impl<'a> ResolvedRuntimeTarget<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_managed_runner(
+        self,
+        chain_state: ChainState,
+        endpoint_url: &str,
+        s3_bucket: Option<&str>,
+        substreams_api_token: &str,
+        cached_gw: &CachedGateway,
+        database_insert_batch_size: usize,
+        token_pre_processor: &EthereumTokenPreProcessor,
+        protocol_cache: &ProtocolMemoryCache,
+        rpc_client: &EthereumRpcClient,
+        runtime: Option<Handle>,
+        partial_blocks: bool,
+    ) -> Result<(ManagedRunner, Vec<ExtractorHandle>), ExtractionError> {
+        match self {
+            ResolvedRuntimeTarget::Family(family) => build_family_managed_runner(
+                    family,
+                    FamilyRuntimeBuildContext {
+                        chain_state,
+                        endpoint_url,
+                        s3_bucket,
+                        substreams_api_token,
+                        cached_gw,
+                        database_insert_batch_size,
+                        token_pre_processor,
+                        protocol_cache,
+                        rpc_client,
+                        partial_blocks,
+                    },
+                    runtime,
+                    partial_blocks,
+                    false,
+                )
+                .await,
+            ResolvedRuntimeTarget::Standalone(standalone) => {
+                let prepared_startup = prepare_standalone_managed_startup(
+                    standalone.extractor_config,
+                    StandaloneRuntimeBuildContext {
+                        chain_state,
+                        endpoint_url,
+                        s3_bucket,
+                        substreams_api_token,
+                        cached_gw,
+                        database_insert_batch_size,
+                        token_pre_processor,
+                        protocol_cache,
+                        rpc_client,
+                        partial_blocks,
+                        final_block_only: false,
+                    },
+                )
+                .await?;
+                Ok(build_standalone_managed_runner_from_startup(
+                    prepared_startup,
+                    runtime,
+                    partial_blocks,
+                ))
+            }
+        }
+    }
+}
+
+pub(crate) struct PreparedSingleRunnerStartup {
+    pub(crate) extractor: Arc<dyn Extractor>,
+    pub(crate) extractor_id: ExtractorIdentity,
+    pub(crate) stream: SubstreamsStream,
 }
 
 impl ExtractorRunner {
@@ -416,7 +603,7 @@ impl ExtractorRunner {
     /// then optionally adds a partial copy of the message (for full blocks with partials enabled)
     /// and/or the result of collect_and_process_full_block (for final partials).
     #[instrument(skip_all, fields(partial_blocks_enabled, is_partial = data.is_partial))]
-    async fn process_block_data(
+    pub(crate) async fn process_block_data(
         extractor: &dyn Extractor,
         data: &BlockScopedData,
         partial_blocks_enabled: bool,
@@ -471,7 +658,10 @@ impl ExtractorRunner {
 
     // TODO: add message tracing_id to the log
     #[instrument(skip_all, fields(subscriber_count))]
-    async fn propagate_msg(subscribers: &Arc<Mutex<SubscriptionsMap>>, message: ExtractorMsg) {
+    pub(crate) async fn propagate_msg(
+        subscribers: &Arc<Mutex<SubscriptionsMap>>,
+        message: ExtractorMsg,
+    ) {
         trace!(msg = %message, "Propagating message to subscribers.");
         // TODO: rename variable here instead
         let arced_message = message;
@@ -504,189 +694,6 @@ impl ExtractorRunner {
     }
 }
 
-impl FamilyExtractorRunner {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        extractors: HashMap<String, Arc<dyn Extractor>>,
-        substreams: SubstreamsStream,
-        subscriptions: BranchSubscriptionsMap,
-        control_rx: Receiver<ControlMessage>,
-        runtime_handle: Option<Handle>,
-        partial_blocks: bool,
-        dispatcher: FamilyBlockChangesDispatcher,
-    ) -> Self {
-        Self {
-            extractors,
-            substreams,
-            subscriptions,
-            next_subscriber_id: 0,
-            control_rx,
-            runtime_handle,
-            partial_blocks,
-            dispatcher,
-        }
-    }
-
-    pub fn run(mut self) -> JoinHandle<Result<(), ExtractionError>> {
-        let runtime = self
-            .runtime_handle
-            .clone()
-            .unwrap_or_else(|| Handle::current());
-
-        runtime.spawn(async move {
-            let family_id = self
-                .extractors
-                .keys()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut partials_in_block: u32 = 0;
-
-            loop {
-                let loop_span = info_span!(
-                    parent: None,
-                    "extractor_family",
-                    extractor_id = %family_id,
-                    sf_trace_id = tracing::field::Empty,
-                    block_number = tracing::field::Empty,
-                    otel.status_code = tracing::field::Empty,
-                );
-
-                let should_continue = async {
-                    tokio::select! {
-                        Some(ctrl) = self.control_rx.recv() => {
-                            match ctrl {
-                                ControlMessage::Stop => {
-                                    warn!("Family runner stop signal received; exiting!");
-                                    return Ok(false);
-                                }
-                                ControlMessage::Subscribe { extractor_id, sender } => {
-                                    self.subscribe(extractor_id, sender).await;
-                                }
-                            }
-                        }
-                        val = self.substreams.next().instrument(info_span!("substreams_waiting")) => {
-                            match val {
-                                None => {
-                                    error!("family stream ended");
-                                    tracing::Span::current().record("otel.status_code", "error");
-                                    return Err(ExtractionError::SubstreamsError(format!("{family_id}: stream ended")));
-                                }
-                                Some(Ok(BlockResponse::New(data))) => {
-                                    let block_number = data.clock.as_ref().map(|v| v.number).unwrap_or(0);
-                                    tracing::Span::current().record("block_number", block_number);
-
-                                    if data.is_partial {
-                                        partials_in_block += 1;
-                                    }
-                                    if data.is_last_partial == Some(true) || data.partial_index.is_none() {
-                                        partials_in_block = 0;
-                                    }
-
-                                    let mut branch_payloads = self
-                                        .dispatcher
-                                        .dispatch_block_scoped_data(data)?
-                                        .into_iter()
-                                        .collect::<Vec<_>>();
-                                    branch_payloads
-                                        .sort_by(|(left, _), (right, _)| left.cmp(right));
-                                    let mut pending_msgs = Vec::new();
-                                    for (extractor_id, branch_data) in branch_payloads {
-                                        let Some(extractor) = self.extractors.get(&extractor_id) else {
-                                            return Err(ExtractionError::Setup(format!(
-                                                "family runner missing extractor for {extractor_id}"
-                                            )));
-                                        };
-                                        let msgs = ExtractorRunner::process_block_data(
-                                            extractor.as_ref(),
-                                            &branch_data,
-                                            self.partial_blocks,
-                                        )
-                                        .await
-                                        .map_err(|err| {
-                                            error!(error = %err, extractor_id = %extractor_id, "Error while processing family branch block data");
-                                            tracing::Span::current().record("otel.status_code", "error");
-                                            err
-                                        })?;
-                                        let subscribers = self
-                                            .subscriptions
-                                            .get(&extractor_id)
-                                            .expect("branch subscriptions initialized")
-                                            .clone();
-                                        for msg in msgs {
-                                            pending_msgs.push((subscribers.clone(), msg));
-                                        }
-                                    }
-                                    for (subscribers, msg) in pending_msgs {
-                                        ExtractorRunner::propagate_msg(&subscribers, msg).await;
-                                    }
-                                }
-                                Some(Ok(BlockResponse::Undo(undo_signal))) => {
-                                    partials_in_block = 0;
-                                    for (extractor_id, extractor) in &self.extractors {
-                                        match extractor.handle_revert(undo_signal.clone()).await {
-                                            Ok(Some(msg)) => {
-                                                let subscribers = self
-                                                    .subscriptions
-                                                    .get(extractor_id)
-                                                    .expect("branch subscriptions initialized");
-                                                ExtractorRunner::propagate_msg(subscribers, msg).await;
-                                            }
-                                            Ok(None) => {}
-                                            Err(err) => {
-                                                error!(error = %err, extractor_id = %extractor_id, "Error while processing family revert");
-                                                tracing::Span::current().record("otel.status_code", "error");
-                                                return Err(err);
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(Ok(BlockResponse::Ended)) => {
-                                    for extractor in self.extractors.values() {
-                                        extractor.flush().await?;
-                                    }
-                                    tracing::Span::current().record("otel.status_code", "ok");
-                                    return Ok(false);
-                                }
-                                Some(Err(err)) => {
-                                    error!(error = %err, "Family stream terminated with error.");
-                                    tracing::Span::current().record("otel.status_code", "error");
-                                    return Err(ExtractionError::SubstreamsError(err.to_string()));
-                                }
-                            }
-                        }
-                    }
-                    tracing::Span::current().record("otel.status_code", "ok");
-                    Ok(true)
-                }.instrument(loop_span).await?;
-
-                if !should_continue {
-                    break Ok(());
-                }
-            }
-        })
-    }
-
-    async fn subscribe(&mut self, extractor_id: ExtractorIdentity, sender: Sender<ExtractorMsg>) {
-        let subscriber_id = self.next_subscriber_id;
-        self.next_subscriber_id += 1;
-        tracing::Span::current().record("subscriber_id", subscriber_id);
-        info!(?subscriber_id, ?extractor_id, "New family branch subscription");
-
-        if let Some(subscribers) = self
-            .subscriptions
-            .get(&extractor_id.name)
-        {
-            subscribers
-                .lock()
-                .await
-                .insert(subscriber_id, sender);
-        } else {
-            warn!(?extractor_id, "Ignoring subscription for unknown family branch extractor");
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProtocolTypeConfig {
     name: String,
@@ -700,6 +707,10 @@ impl ProtocolTypeConfig {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn financial_type(&self) -> FinancialType {
+        self.financial_type.clone()
     }
 }
 
@@ -716,37 +727,6 @@ pub struct BootstrapConfig {
     pub strategy: BootstrapStrategy,
     pub start_block: i64,
     pub params: String,
-}
-
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
-pub struct FamilyRuntimeConfig {
-    pub family: String,
-    #[serde(default)]
-    pub shared_spkg: Option<String>,
-    #[serde(default)]
-    pub shared_module: Option<String>,
-    #[serde(default)]
-    pub durability_scope: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SharedStreamTarget<'a> {
-    pub spkg: &'a str,
-    pub module: &'a str,
-}
-
-impl FamilyRuntimeConfig {
-    pub fn shared_spkg(&self) -> Option<&str> {
-        self.shared_spkg.as_deref()
-    }
-
-    pub fn shared_module(&self) -> Option<&str> {
-        self.shared_module.as_deref()
-    }
-
-    pub fn durability_scope(&self) -> Option<&str> {
-        self.durability_scope.as_deref()
-    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -849,78 +829,6 @@ impl ExtractorConfig {
         &self.module_name
     }
 
-    pub fn family_runtime(&self) -> Option<&FamilyRuntimeConfig> {
-        self.family_runtime.as_ref()
-    }
-
-    pub fn family_shared_spkg(&self) -> Option<&str> {
-        self.family_runtime
-            .as_ref()
-            .and_then(FamilyRuntimeConfig::shared_spkg)
-    }
-
-    pub fn family_shared_module(&self) -> Option<&str> {
-        self.family_runtime
-            .as_ref()
-            .and_then(FamilyRuntimeConfig::shared_module)
-    }
-
-    pub fn family_durability_scope(&self) -> Option<String> {
-        self.family_runtime
-            .as_ref()
-            .and_then(|runtime| {
-                runtime
-                    .durability_scope()
-                    .map(ToString::to_string)
-            })
-    }
-
-    pub fn require_family_shared_stream_target(
-        &self,
-    ) -> Result<Option<SharedStreamTarget<'_>>, ExtractionError> {
-        match self.family_runtime() {
-            Some(runtime) => {
-                let spkg = runtime.shared_spkg().ok_or_else(|| {
-                    ExtractionError::Setup(format!(
-                        "extractor `{}` uses family runtime `{}` without a resolved shared_spkg",
-                        self.name(),
-                        runtime.family
-                    ))
-                })?;
-                let module = runtime.shared_module().ok_or_else(|| {
-                    ExtractionError::Setup(format!(
-                        "extractor `{}` uses family runtime `{}` without a resolved shared_module",
-                        self.name(),
-                        runtime.family
-                    ))
-                })?;
-                Ok(Some(SharedStreamTarget { spkg, module }))
-            }
-            None => Ok(None),
-        }
-    }
-
-    pub fn require_family_durability_scope(&self) -> Result<Option<String>, ExtractionError> {
-        match self.family_runtime() {
-            Some(runtime) => runtime
-                .durability_scope()
-                .map(|scope| Some(scope.to_string()))
-                .ok_or_else(|| {
-                    ExtractionError::Setup(format!(
-                        "extractor `{}` uses family runtime `{}` without a resolved durability_scope",
-                        self.name(),
-                        runtime.family
-                    ))
-                }),
-            None => Ok(None),
-        }
-    }
-
-    pub fn with_family_runtime(mut self, family_runtime: Option<FamilyRuntimeConfig>) -> Self {
-        self.family_runtime = family_runtime;
-        self
-    }
-
     pub fn with_protocol_system(mut self, protocol_system: impl Into<String>) -> Self {
         self.protocol_system = protocol_system.into();
         self
@@ -957,6 +865,7 @@ pub struct ExtractorBuilder {
     extractor: Option<Arc<dyn Extractor>>,
     rpc_client: Option<EthereumRpcClient>,
     database_insert_batch_size: Option<usize>,
+    auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
     final_block_only: bool,
     partial_blocks: bool,
     /// Handle of the tokio runtime on which the extraction tasks will be run.
@@ -965,6 +874,24 @@ pub struct ExtractorBuilder {
 }
 
 impl ExtractorBuilder {
+    pub(crate) fn build_from_startup(
+        prepared_startup: PreparedSingleRunnerStartup,
+        runtime_handle: Option<Handle>,
+        partial_blocks: bool,
+    ) -> (ExtractorRunner, ExtractorHandle) {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
+        let runner = ExtractorRunner::new(
+            prepared_startup.extractor,
+            prepared_startup.stream,
+            Arc::new(Mutex::new(HashMap::new())),
+            ctrl_rx,
+            runtime_handle,
+            partial_blocks,
+        );
+
+        (runner, ExtractorHandle::new(prepared_startup.extractor_id, ctrl_tx))
+    }
+
     pub fn new(
         config: &ExtractorConfig,
         endpoint_url: &str,
@@ -979,6 +906,7 @@ impl ExtractorBuilder {
             extractor: None,
             rpc_client: None,
             database_insert_batch_size: None,
+            auxiliary_protocol_message_decoders: Vec::new(),
             final_block_only: false,
             partial_blocks: false,
             runtime_handle: None,
@@ -1025,6 +953,29 @@ impl ExtractorBuilder {
     pub fn database_insert_batch_size(mut self, database_insert_batch_size: usize) -> Self {
         self.database_insert_batch_size = Some(database_insert_batch_size);
         self
+    }
+
+    pub(crate) fn auxiliary_protocol_message_decoders(
+        mut self,
+        decoders: Vec<AuxiliaryProtocolMessageDecoder>,
+    ) -> Self {
+        self.auxiliary_protocol_message_decoders = decoders;
+        self
+    }
+
+    pub(crate) fn into_protocol_system_and_extractor(self) -> (String, Arc<dyn Extractor>) {
+        (
+            self.config.protocol_system().to_string(),
+            self.extractor
+                .clone()
+                .expect("extractor initialized in build()"),
+        )
+    }
+
+    pub(crate) fn initialized_extractor(&self) -> Arc<dyn Extractor> {
+        self.extractor
+            .clone()
+            .expect("extractor initialized in build()")
     }
 
     #[cfg(test)]
@@ -1111,7 +1062,8 @@ impl ExtractorBuilder {
 
         let family_durability_scope = self
             .config
-            .require_family_durability_scope()?;
+            .require_resolved_family_runtime_metadata()?
+            .map(|metadata| metadata.durability_scope.to_string());
 
         let gw = ExtractorPgGateway::new(
             &self.config.name,
@@ -1188,7 +1140,7 @@ impl ExtractorBuilder {
             .database_insert_batch_size
             .unwrap_or_default();
 
-        self.extractor = Some(Arc::new(
+        let extractor =
             ProtocolExtractor::<ExtractorPgGateway, EthereumTokenPreProcessor, DCIPlugin<_>>::new(
                 gw,
                 database_insert_batch_size,
@@ -1200,12 +1152,14 @@ impl ExtractorBuilder {
                     .to_string(),
                 protocol_cache.clone(),
                 protocol_types,
+                self.auxiliary_protocol_message_decoders.clone(),
                 token_pre_processor.clone(),
                 post_processor,
                 dci_plugin,
             )
-            .await?,
-        ));
+            .await?;
+
+        self.extractor = Some(Arc::new(extractor));
 
         Ok(self)
     }
@@ -1222,7 +1176,11 @@ impl ExtractorBuilder {
             .ok_or_else(|| {
                 ExtractionError::Setup("missing RPC client for bootstrap".to_string())
             })?;
-        let plan = SharedBootstrapPlan::for_extractor_config(&self.config, bootstrap)?;
+        let registry = default_family_runtime_registry();
+        let plan =
+            SharedBootstrapPlan::for_extractor_config_with_registry(&self.config, bootstrap, registry)?;
+        let shared_bootstrap_execution = registry
+            .resolve_shared_bootstrap_execution_for_protocol_system(self.config.protocol_system())?;
 
         info!(
             extractor_id = %extractor_id,
@@ -1241,17 +1199,17 @@ impl ExtractorBuilder {
             );
         }
 
-        let changes = materialize_plan_block(rpc_client, &plan).await?;
+        let changes = shared_bootstrap_execution
+            .materialize_plan(rpc_client, &plan)
+            .await?;
         let bootstrap_block_hash = changes.block.hash.clone();
-
-        extractor
-            .handle_block_changes(changes, format!("bootstrap@{}", plan.bootstrap_block))
-            .await?;
-
-        extractor.flush().await?;
-        extractor
-            .mark_bootstrap_completed(plan.bootstrap_block, bootstrap_block_hash)
-            .await?;
+        commit_materialized_bootstrap(
+            vec![(extractor.clone(), changes)],
+            extractor,
+            plan.bootstrap_block,
+            bootstrap_block_hash,
+        )
+        .await?;
 
         info!(
             extractor_id = %extractor_id,
@@ -1260,6 +1218,82 @@ impl ExtractorBuilder {
         );
 
         Ok(())
+    }
+
+    pub(crate) async fn prepare_substreams_request(
+        &self,
+        extractor: Arc<dyn Extractor>,
+        extractor_id: &ExtractorIdentity,
+    ) -> Result<PreparedSubstreamsRequest, ExtractionError> {
+        let runtime_target = ResolvedRuntimeTarget::Standalone(ResolvedStandaloneRuntime {
+            protocol_system: self.config.protocol_system(),
+            extractor_config: &self.config,
+        });
+        let default_request = runtime_target.substreams_execution_request()?;
+        let mut progress = load_standalone_progress_snapshot(extractor.as_ref()).await?;
+        match decide_standalone_bootstrap_action(
+            &progress,
+            &self.config.name,
+            self.config.bootstrap.as_ref(),
+        )? {
+            StandaloneBootstrapAction::Skip => {}
+            StandaloneBootstrapAction::AlreadyCompleted { .. } => {
+                let bootstrap = self
+                    .config
+                    .bootstrap
+                    .as_ref()
+                    .expect("completed bootstrap action requires bootstrap config");
+                info!(
+                    extractor_id = %extractor_id,
+                    bootstrap_block = bootstrap.start_block,
+                    "Bootstrap already completed in storage; skipping bootstrap run"
+                );
+            }
+            StandaloneBootstrapAction::Run { .. } => {
+                let bootstrap = self
+                    .config
+                    .bootstrap
+                    .as_ref()
+                    .expect("run bootstrap action requires bootstrap config");
+                info!(
+                    bootstrap_block = bootstrap.start_block,
+                    extractor_id = %extractor_id,
+                    "Running bootstrap block before starting event stream"
+                );
+                tokio::select! {
+                    res = self.run_bootstrap_once(
+                        extractor.clone(),
+                        bootstrap,
+                        extractor_id,
+                    ) => res?,
+                    _ = tokio::signal::ctrl_c() => {
+                        warn!(
+                            extractor_id = %extractor_id,
+                            bootstrap_block = bootstrap.start_block,
+                            "Bootstrap interrupted by SIGINT before extractor startup completed"
+                        );
+                        return Err(ExtractionError::Unknown(format!(
+                            "bootstrap interrupted for {extractor_id}"
+                        )));
+                    }
+                }
+                progress = load_standalone_progress_snapshot(extractor.as_ref()).await?;
+            }
+        }
+
+        let start_block = resolve_standalone_stream_start_block(&progress, default_request.start_block)?;
+
+        if let Some(block) = &progress.last_processed_block {
+            info!(
+                start_block,
+                last_committed_block = block.number,
+                config_start_block = self.config.start_block,
+                "Fresh start: resuming from block after last committed"
+            );
+        }
+
+        let request = runtime_target.substreams_execution_request_with_start_block(start_block)?;
+        Ok(PreparedSubstreamsRequest { request, cursor: None })
     }
 
     /// Converts this builder into a ready-to-run ExtractorRunner and its associated handle.
@@ -1287,386 +1321,75 @@ impl ExtractorBuilder {
     /// - Package decoding fails due to corrupted or invalid data
     #[instrument(name = "extractor_runner_build", skip(self), fields(extractor_id))]
     pub async fn into_runner(self) -> Result<(ExtractorRunner, ExtractorHandle), ExtractionError> {
+        let runtime_handle = self.runtime_handle.clone();
+        let partial_blocks = self.partial_blocks;
         let extractor = self
             .extractor
             .clone()
             .expect("Extractor not set");
         let extractor_id = extractor.get_id();
-        let runtime_target = ResolvedRuntimeTarget::Standalone(ResolvedStandaloneRuntime {
-            protocol_system: self.config.protocol_system(),
-            extractor_config: &self.config,
-        });
-        let default_request = runtime_target.substreams_execution_request()?;
-
-        tracing::Span::current().record("id", format!("{extractor_id}"));
-
-        let loaded_substreams = load_substreams_package(
+        let prepared_request = self
+            .prepare_substreams_request(extractor.clone(), &extractor_id)
+            .await?;
+        let stream = load_stream_for_prepared_request(
+            &prepared_request,
             self.s3_bucket.as_deref(),
-            &default_request.spkg,
             &self.endpoint_url,
-            Some(self.token.clone()),
-        )
-        .await?;
-
-        // Determine the start block for the Substreams stream.
-        //
-        // We never pass a cursor on fresh start (process restart). Instead, we
-        // resume from the block after the last one committed to DB. This is safe
-        // because we only commit finalized block -1 to the DB. So we know last committed block + 1
-        // is finalized.
-        let mut last_block = extractor
-            .get_last_processed_block()
-            .await;
-        if last_block.is_none() {
-            if let Some(bootstrap) = &self.config.bootstrap {
-                let completed_bootstrap_block = extractor
-                    .get_completed_bootstrap_block()
-                    .await?;
-                let configured_bootstrap_block =
-                    u64::try_from(bootstrap.start_block).map_err(|_| {
-                        ExtractionError::Setup(format!(
-                            "bootstrap start_block must be non-negative for extractor `{}`",
-                            self.config.name
-                        ))
-                    })?;
-
-                if completed_bootstrap_block == Some(configured_bootstrap_block) {
-                    info!(
-                        extractor_id = %extractor_id,
-                        bootstrap_block = bootstrap.start_block,
-                        "Bootstrap already completed in storage; skipping bootstrap run"
-                    );
-                } else {
-                    info!(
-                        bootstrap_block = bootstrap.start_block,
-                        extractor_id = %extractor_id,
-                        "Running bootstrap block before starting event stream"
-                    );
-                    tokio::select! {
-                        res = self.run_bootstrap_once(
-                            extractor.clone(),
-                            bootstrap,
-                            &extractor_id,
-                        ) => res?,
-                        _ = tokio::signal::ctrl_c() => {
-                            warn!(
-                                extractor_id = %extractor_id,
-                                bootstrap_block = bootstrap.start_block,
-                                "Bootstrap interrupted by SIGINT before extractor startup completed"
-                            );
-                            return Err(ExtractionError::Unknown(format!(
-                                "bootstrap interrupted for {extractor_id}"
-                            )));
-                        }
-                    }
-                    last_block = extractor
-                        .get_last_processed_block()
-                        .await;
-                }
-            }
-        }
-
-        // `None` means no blocks have been committed for this protocol yet (fresh
-        // indexing), so fall back to the configured start block.
-        let start_block = last_block
-            .as_ref()
-            .map(|b| {
-                let next = b
-                    .number
-                    .checked_add(1)
-                    .ok_or_else(|| ExtractionError::Setup("block number overflow".to_string()))?;
-                i64::try_from(next)
-                    .map_err(|_| ExtractionError::Setup("block number exceeds i64".to_string()))
-            })
-            .transpose()?
-            .unwrap_or(default_request.start_block);
-
-        if let Some(block) = &last_block {
-            info!(
-                start_block,
-                last_committed_block = block.number,
-                config_start_block = self.config.start_block,
-                "Fresh start: resuming from block after last committed"
-            );
-        }
-
-        let request = runtime_target.substreams_execution_request_with_start_block(start_block)?;
-        let stream = build_substreams_stream_from_request(
-            &request,
-            loaded_substreams,
-            None,
+            &self.token,
             self.final_block_only,
             self.partial_blocks,
-        );
-
-        let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
-        let runner = ExtractorRunner::new(
-            extractor,
-            stream,
-            Arc::new(Mutex::new(HashMap::new())),
-            ctrl_rx,
-            self.runtime_handle,
-            self.partial_blocks,
-        );
-
-        Ok((runner, ExtractorHandle::new(extractor_id, ctrl_tx)))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn build_family_runner(
-    resolved_family: &ResolvedFamilyRuntime<'_>,
-    chain_state: ChainState,
-    endpoint_url: &str,
-    s3_bucket: Option<&str>,
-    substreams_api_token: &str,
-    cached_gw: &CachedGateway,
-    database_insert_batch_size: usize,
-    token_pre_processor: &EthereumTokenPreProcessor,
-    protocol_cache: &ProtocolMemoryCache,
-    rpc_client: &EthereumRpcClient,
-    runtime: Option<Handle>,
-    partial_blocks: bool,
-) -> Result<(ManagedRunner, Vec<ExtractorHandle>), ExtractionError> {
-    let extractor_configs = &resolved_family.extractor_configs;
-    let family_execution = &resolved_family.execution;
-    let built_builders = build_extractors_for_configs(
-        extractor_configs,
-        chain_state,
-        endpoint_url,
-        s3_bucket,
-        substreams_api_token,
-        cached_gw,
-        database_insert_batch_size,
-        token_pre_processor,
-        protocol_cache,
-        rpc_client,
-        partial_blocks,
-    )
-    .await?;
-    let mut built_extractors = HashMap::new();
-    let mut handles = Vec::new();
-
-    for builder in built_builders {
-        let extractor = builder
-            .extractor
-            .clone()
-            .expect("extractor initialized in build()");
-        built_extractors.insert(
-            builder
-                .config
-                .protocol_system()
-                .to_string(),
-            extractor,
-        );
-    }
-
-    run_family_bootstrap_if_needed(&built_extractors, family_execution, rpc_client).await?;
-
-    let stream_position =
-        resolve_family_stream_position(&built_extractors, family_execution).await?;
-    let request = ResolvedRuntimeTarget::Family(resolved_family.clone())
-        .substreams_execution_request_with_start_block(stream_position.start_block)?;
-
-    let loaded_substreams = load_substreams_package(
-        s3_bucket,
-        &family_execution.shared_stream.spkg,
-        endpoint_url,
-        Some(substreams_api_token.to_string()),
-    )
-    .await?;
-    let stream = build_family_substreams_stream(
-        &request,
-        loaded_substreams,
-        stream_position.cursor,
-        partial_blocks,
-    );
-
-    let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
-    let mut subscriptions = HashMap::new();
-    for (extractor_name, extractor) in &built_extractors {
-        subscriptions.insert(extractor_name.clone(), Arc::new(Mutex::new(HashMap::new())));
-        handles.push(ExtractorHandle::new(extractor.get_id(), ctrl_tx.clone()));
-    }
-
-    let dispatcher =
-        build_family_dispatcher_from_cache(&family_execution.branch_specs, protocol_cache).await?;
-    let runner = FamilyExtractorRunner::new(
-        built_extractors,
-        stream,
-        subscriptions,
-        ctrl_rx,
-        runtime,
-        partial_blocks,
-        dispatcher,
-    );
-
-    Ok((ManagedRunner::Family(runner), handles))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn build_runner_for_runtime_target(
-    target: ResolvedRuntimeTarget<'_>,
-    chain_state: ChainState,
-    endpoint_url: &str,
-    s3_bucket: Option<&str>,
-    substreams_api_token: &str,
-    cached_gw: &CachedGateway,
-    database_insert_batch_size: usize,
-    token_pre_processor: &EthereumTokenPreProcessor,
-    protocol_cache: &ProtocolMemoryCache,
-    rpc_client: &EthereumRpcClient,
-    runtime: Option<Handle>,
-    partial_blocks: bool,
-) -> Result<(ManagedRunner, Vec<ExtractorHandle>), ExtractionError> {
-    let runtime = runtime.unwrap_or_else(Handle::current);
-
-    match target {
-        ResolvedRuntimeTarget::Family(family) => {
-            build_family_runner(
-                &family,
-                chain_state,
-                endpoint_url,
-                s3_bucket,
-                substreams_api_token,
-                cached_gw,
-                database_insert_batch_size,
-                token_pre_processor,
-                protocol_cache,
-                rpc_client,
-                Some(runtime),
-                partial_blocks,
-            )
-            .await
-        }
-        ResolvedRuntimeTarget::Standalone(standalone) => {
-            let mut builders = build_extractors_for_configs(
-                &[standalone.extractor_config],
-                chain_state,
-                endpoint_url,
-                s3_bucket,
-                substreams_api_token,
-                cached_gw,
-                database_insert_batch_size,
-                token_pre_processor,
-                protocol_cache,
-                rpc_client,
-                partial_blocks,
-            )
-            .await?;
-            let builder = builders.pop().ok_or_else(|| {
-                ExtractionError::Setup(
-                    "standalone runtime target produced no extractor builder".to_string(),
-                )
-            })?;
-            let (runner, handle) = builder
-                .set_runtime(runtime)
-                .into_runner()
-                .await?;
-
-            Ok((ManagedRunner::Single(runner), vec![handle]))
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn build_runners_for_runtime_targets(
-    targets: Vec<ResolvedRuntimeTarget<'_>>,
-    chain_state: ChainState,
-    endpoint_url: &str,
-    s3_bucket: Option<&str>,
-    substreams_api_token: &str,
-    cached_gw: &CachedGateway,
-    database_insert_batch_size: usize,
-    token_pre_processor: &EthereumTokenPreProcessor,
-    protocol_cache: &ProtocolMemoryCache,
-    rpc_client: &EthereumRpcClient,
-    runtime: Option<Handle>,
-    partial_blocks: bool,
-) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
-    let mut runners = Vec::new();
-    let mut extractor_handles = Vec::new();
-
-    for target in targets {
-        let (runner, handles) = build_runner_for_runtime_target(
-            target,
-            chain_state,
-            endpoint_url,
-            s3_bucket,
-            substreams_api_token,
-            cached_gw,
-            database_insert_batch_size,
-            token_pre_processor,
-            protocol_cache,
-            rpc_client,
-            runtime.clone(),
-            partial_blocks,
         )
         .await?;
-        runners.push(runner);
-        extractor_handles.extend(handles);
+        let prepared_startup = PreparedSingleRunnerStartup { extractor, extractor_id, stream };
+        Ok(Self::build_from_startup(prepared_startup, runtime_handle, partial_blocks))
     }
-
-    Ok((runners, extractor_handles))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn build_extractors_for_configs(
-    extractor_configs: &[&ExtractorConfig],
-    chain_state: ChainState,
-    endpoint_url: &str,
-    s3_bucket: Option<&str>,
-    substreams_api_token: &str,
-    cached_gw: &CachedGateway,
-    database_insert_batch_size: usize,
-    token_pre_processor: &EthereumTokenPreProcessor,
-    protocol_cache: &ProtocolMemoryCache,
-    rpc_client: &EthereumRpcClient,
-    partial_blocks: bool,
-) -> Result<Vec<ExtractorBuilder>, ExtractionError> {
-    let mut builders = Vec::with_capacity(extractor_configs.len());
-
-    for extractor_config in extractor_configs {
-        let builder =
-            ExtractorBuilder::new(extractor_config, endpoint_url, s3_bucket, substreams_api_token)
-                .database_insert_batch_size(database_insert_batch_size)
-                .partial_blocks(partial_blocks)
-                .build(chain_state, cached_gw, token_pre_processor, protocol_cache, rpc_client)
-                .await?;
-        builders.push(builder);
-    }
-
-    Ok(builders)
-}
-
-fn build_family_substreams_stream(
-    request: &ResolvedSubstreamsExecutionRequest,
+fn build_substreams_stream_from_prepared_request(
+    prepared_request: &PreparedSubstreamsRequest,
     loaded_substreams: LoadedSubstreamsPackage,
-    cursor: Option<String>,
-    partial_blocks: bool,
-) -> SubstreamsStream {
-    build_substreams_stream_from_request(request, loaded_substreams, cursor, false, partial_blocks)
-}
-
-fn build_substreams_stream_from_request(
-    request: &ResolvedSubstreamsExecutionRequest,
-    loaded_substreams: LoadedSubstreamsPackage,
-    cursor: Option<String>,
     final_block_only: bool,
     partial_blocks: bool,
 ) -> SubstreamsStream {
     SubstreamsStream::new(
         loaded_substreams.endpoint,
-        cursor,
+        prepared_request.cursor.clone(),
         Some(loaded_substreams.spkg),
-        request.module.clone(),
-        request.start_block,
-        request.stop_block,
+        prepared_request.request.module.clone(),
+        prepared_request.request.start_block,
+        prepared_request.request.stop_block,
         final_block_only,
-        request.extractor_id.clone(),
+        prepared_request
+            .request
+            .extractor_id
+            .clone(),
         partial_blocks,
-        request.params.clone(),
+        prepared_request.request.params.clone(),
     )
+}
+
+async fn load_stream_for_prepared_request(
+    prepared_request: &PreparedSubstreamsRequest,
+    s3_bucket: Option<&str>,
+    endpoint_url: &str,
+    substreams_api_token: &str,
+    final_block_only: bool,
+    partial_blocks: bool,
+) -> Result<SubstreamsStream, ExtractionError> {
+    let loaded_substreams = load_substreams_package(
+        s3_bucket,
+        &prepared_request.request.spkg,
+        endpoint_url,
+        Some(substreams_api_token.to_string()),
+    )
+    .await?;
+
+    Ok(build_substreams_stream_from_prepared_request(
+        prepared_request,
+        loaded_substreams,
+        final_block_only,
+        partial_blocks,
+    ))
 }
 
 #[cfg(test)]
@@ -1675,50 +1398,6 @@ fn validate_family_runner_membership(
     extractor_configs: &[&ExtractorConfig],
 ) -> Result<(), ExtractionError> {
     validate_family_runtime_membership(family, extractor_configs)
-}
-
-async fn build_family_dispatcher_from_cache(
-    branch_specs: &[FamilyBranchSpec],
-    protocol_cache: &ProtocolMemoryCache,
-) -> Result<FamilyBlockChangesDispatcher, ExtractionError> {
-    let seed =
-        FamilyBranchSpec::dispatcher_seed_from_protocol_cache(branch_specs, protocol_cache).await;
-    FamilyBlockChangesDispatcher::new_with_seed(branch_specs.iter().cloned(), seed)
-}
-
-pub(crate) fn merge_substreams_params(
-    merged: &mut HashMap<String, String>,
-    incoming: &HashMap<String, String>,
-    extractor_name: &str,
-) -> Result<(), ExtractionError> {
-    for (key, value) in incoming {
-        if let Some(existing) = merged.get(key) {
-            if existing != value {
-                return Err(ExtractionError::Setup(format!(
-                    "conflicting substreams param `{key}` while building family runner for `{extractor_name}`"
-                )));
-            }
-        } else {
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn merged_family_substreams_params(
-    extractor_configs: &[&ExtractorConfig],
-) -> Result<HashMap<String, String>, ExtractionError> {
-    let mut merged_substreams_params = HashMap::new();
-
-    for config in extractor_configs {
-        merge_substreams_params(
-            &mut merged_substreams_params,
-            &config.substreams_params,
-            config.name(),
-        )?;
-    }
-
-    Ok(merged_substreams_params)
 }
 
 async fn download_file_from_s3(
@@ -1826,8 +1505,8 @@ mod test {
     use super::*;
     use crate::{
         extractor::{
-            family_lifecycle::ResolvedFamilyStreamPosition, protocol_cache::ProtocolDataCache,
-            MockExtractor,
+            family_lifecycle::ResolvedFamilyStreamPosition,
+            family_runtime::ResolvedFamilyRuntime, protocol_cache::ProtocolDataCache, MockExtractor,
         },
         pb::sf::substreams::v1::Clock,
         testing::MockGateway,
@@ -1899,7 +1578,7 @@ mod test {
 
         BlockScopedData {
             output: Some(MapModuleOutput {
-                name: "map_uniswap_family_protocol_changes".to_string(),
+                name: family_output_module_for_tests("uniswap"),
                 map_output: Some(prost_types::Any {
                     type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
                     value: family_changes.encode_to_vec(),
@@ -1918,10 +1597,91 @@ mod test {
         }
     }
 
-    fn empty_family_execution_config(configured_start_block: i64) -> ResolvedFamilyExecutionConfig {
-        let mut execution = empty_resolved_family_execution_config_for_tests();
-        execution.configured_start_block = configured_start_block;
-        execution
+    fn make_uniswap_family_bootstrap_test_configs() -> [ExtractorConfig; 2] {
+        [
+            ExtractorConfig {
+                name: "uniswap_v2".to_owned(),
+                protocol_system: "uniswap_v2".to_string(),
+                start_block: 42,
+                protocol_types: vec![ProtocolTypeConfig::new(
+                    "uniswap_v2_pool".to_string(),
+                    FinancialType::Swap,
+                )],
+                substreams_params: HashMap::from([(
+                    "map_pool_events".to_string(),
+                    "factory=0x01".to_string(),
+                )]),
+                bootstrap: Some(BootstrapConfig {
+                    strategy: BootstrapStrategy::UniswapV2Rpc,
+                    start_block: 42,
+                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
+                        .to_owned(),
+                }),
+                ..Default::default()
+            },
+            ExtractorConfig {
+                name: "uniswap_v3".to_owned(),
+                protocol_system: "uniswap_v3".to_string(),
+                start_block: 42,
+                protocol_types: vec![ProtocolTypeConfig::new(
+                    "uniswap_v3_pool".to_string(),
+                    FinancialType::Swap,
+                )],
+                substreams_params: HashMap::from([(
+                    "map_events".to_string(),
+                    "factory=0x02".to_string(),
+                )]),
+                bootstrap: Some(BootstrapConfig {
+                    strategy: BootstrapStrategy::UniswapV3Rpc,
+                    start_block: 42,
+                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
+                        .to_owned(),
+                }),
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn make_uniswap_family_runtime_test_configs(
+        v2_start_block: i64,
+        v3_start_block: i64,
+    ) -> [ExtractorConfig; 2] {
+        [
+            ExtractorConfig {
+                name: "uniswap_v2".to_owned(),
+                protocol_system: "uniswap_v2".to_string(),
+                start_block: v2_start_block,
+                protocol_types: vec![ProtocolTypeConfig::new(
+                    "uniswap_v2_pool".to_string(),
+                    FinancialType::Swap,
+                )],
+                ..Default::default()
+            },
+            ExtractorConfig {
+                name: "uniswap_v3".to_owned(),
+                protocol_system: "uniswap_v3".to_string(),
+                start_block: v3_start_block,
+                protocol_types: vec![ProtocolTypeConfig::new(
+                    "uniswap_v3_pool".to_string(),
+                    FinancialType::Swap,
+                )],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn resolved_family_runtime_from_configs_for_tests<'a>(
+        extractor_configs: &[&'a ExtractorConfig],
+        shared_spkg: &str,
+    ) -> ResolvedFamilyRuntime<'a> {
+        ResolvedFamilyRuntime {
+            family: family_detected_runtime_from_configs_for_tests(extractor_configs, shared_spkg),
+            extractor_configs: extractor_configs.to_vec(),
+            execution: resolved_family_execution_config_from_extractor_configs_for_tests(
+                extractor_configs,
+            )
+            .expect("family execution config should derive from test configs"),
+        }
     }
 
     fn make_family_follow_up_block_scoped_data(block_number: u64, cursor: &str) -> BlockScopedData {
@@ -1962,7 +1722,7 @@ mod test {
 
         BlockScopedData {
             output: Some(MapModuleOutput {
-                name: "map_uniswap_family_protocol_changes".to_string(),
+                name: family_output_module_for_tests("uniswap"),
                 map_output: Some(prost_types::Any {
                     type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
                     value: family_changes.encode_to_vec(),
@@ -2040,7 +1800,7 @@ mod test {
 
         BlockScopedData {
             output: Some(MapModuleOutput {
-                name: "map_uniswap_family_protocol_changes".to_string(),
+                name: family_output_module_for_tests("uniswap"),
                 map_output: Some(prost_types::Any {
                     type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
                     value: family_changes.encode_to_vec(),
@@ -2062,6 +1822,21 @@ mod test {
             is_last_partial: None,
         }
     }
+
+    #[path = "runner_family_tests.rs"]
+    mod family_runner_tests;
+
+    #[path = "runner_family_lifecycle_tests.rs"]
+    mod family_runner_lifecycle_tests;
+
+    #[path = "runner_family_planning_tests.rs"]
+    mod family_runner_planning_tests;
+
+    #[path = "runner_family_bootstrap_tests.rs"]
+    mod family_runner_bootstrap_tests;
+
+    #[path = "runner_family_runtime_metadata_tests.rs"]
+    mod family_runner_runtime_metadata_tests;
 
     #[test]
     fn test_extractor_config_without_dci_plugin() {
@@ -2267,6 +2042,12 @@ dci_plugin:
             .expect_get_last_processed_block()
             .returning(|| None);
         mock_extractor
+            .expect_get_cursor()
+            .returning(String::new);
+        mock_extractor
+            .expect_get_completed_bootstrap_block()
+            .returning(|| Ok(None));
+        mock_extractor
             .expect_flush()
             .returning(|| Ok(()));
         mock_extractor
@@ -2319,6 +2100,12 @@ dci_plugin:
         mock_extractor
             .expect_get_last_processed_block()
             .returning(|| None);
+        mock_extractor
+            .expect_get_cursor()
+            .returning(String::new);
+        mock_extractor
+            .expect_get_completed_bootstrap_block()
+            .returning(|| Ok(None));
         mock_extractor
             .expect_flush()
             .returning(|| Ok(()));
@@ -2387,6 +2174,12 @@ dci_plugin:
                 ))
             });
         mock_extractor
+            .expect_get_cursor()
+            .returning(String::new);
+        mock_extractor
+            .expect_get_completed_bootstrap_block()
+            .returning(|| Ok(None));
+        mock_extractor
             .expect_flush()
             .returning(|| Ok(()));
         mock_extractor
@@ -2438,6 +2231,9 @@ dci_plugin:
             .expect_get_last_processed_block()
             .returning(|| None);
         mock_extractor
+            .expect_get_cursor()
+            .returning(String::new);
+        mock_extractor
             .expect_get_completed_bootstrap_block()
             .returning(|| Ok(Some(42)));
         mock_extractor
@@ -2482,196 +2278,6 @@ dci_plugin:
             "should start from bootstrap block + 1 when bootstrap is already completed"
         );
         assert!(requests[0].start_cursor.is_empty(), "fresh start should have no cursor");
-    }
-
-    #[tokio::test]
-    async fn test_family_runner_dispatches_shared_stream_into_branch_extractors() {
-        let family_block = make_family_block_scoped_data();
-
-        let mut v2 = MockExtractor::new();
-        v2.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|inp: BlockScopedData| {
-                let raw = &inp
-                    .output
-                    .as_ref()
-                    .expect("output")
-                    .map_output
-                    .as_ref()
-                    .expect("map output")
-                    .value;
-                let decoded =
-                    substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
-                assert_eq!(decoded.changes.len(), 1);
-                assert_eq!(
-                    decoded.changes[0]
-                        .component_changes
-                        .len(),
-                    1
-                );
-                assert_eq!(decoded.changes[0].component_changes[0].id, "v2-pool");
-                Ok(Some(Arc::new(BlockAggregatedChanges::default())))
-            });
-        v2.expect_flush()
-            .once()
-            .returning(|| Ok(()));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|inp: BlockScopedData| {
-                let raw = &inp
-                    .output
-                    .as_ref()
-                    .expect("output")
-                    .map_output
-                    .as_ref()
-                    .expect("map output")
-                    .value;
-                let decoded =
-                    substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
-                assert_eq!(decoded.changes.len(), 1);
-                assert_eq!(
-                    decoded.changes[0]
-                        .component_changes
-                        .len(),
-                    1
-                );
-                assert_eq!(decoded.changes[0].component_changes[0].id, "v3-pool");
-                Ok(Some(Arc::new(BlockAggregatedChanges::default())))
-            });
-        v3.expect_flush()
-            .once()
-            .returning(|| Ok(()));
-
-        let v2_subscriptions = Arc::new(Mutex::new(HashMap::new()));
-        let v3_subscriptions = Arc::new(Mutex::new(HashMap::new()));
-        let (v2_tx, mut v2_rx) = mpsc::channel(4);
-        let (v3_tx, mut v3_rx) = mpsc::channel(4);
-        v2_subscriptions
-            .lock()
-            .await
-            .insert(0, v2_tx);
-        v3_subscriptions
-            .lock()
-            .await
-            .insert(0, v3_tx);
-
-        let dispatcher = FamilyBlockChangesDispatcher::new([
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v2".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-            },
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v3".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-            },
-        ])
-        .expect("dispatcher builds");
-
-        let runner = FamilyExtractorRunner::new(
-            HashMap::from([
-                ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-                ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-            ]),
-            SubstreamsStream::from_stream(Box::pin(stream::iter(vec![
-                Ok(BlockResponse::New(family_block)),
-                Ok(BlockResponse::Ended),
-            ]))),
-            HashMap::from([
-                ("uniswap_v2".to_string(), v2_subscriptions),
-                ("uniswap_v3".to_string(), v3_subscriptions),
-            ]),
-            mpsc::channel(4).1,
-            None,
-            false,
-            dispatcher,
-        );
-
-        runner.run().await.unwrap().unwrap();
-
-        assert!(v2_rx.recv().await.is_some(), "v2 subscriber should receive a message");
-        assert!(v3_rx.recv().await.is_some(), "v3 subscriber should receive a message");
-        assert!(v2_rx.try_recv().is_err(), "v2 should receive exactly one message");
-        assert!(v3_rx.try_recv().is_err(), "v3 should receive exactly one message");
-    }
-
-    #[tokio::test]
-    async fn test_family_runner_does_not_propagate_partial_branch_results_when_later_branch_fails()
-    {
-        let family_block = make_family_block_scoped_data();
-
-        let mut v2 = MockExtractor::new();
-        v2.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|_| Ok(Some(Arc::new(BlockAggregatedChanges::default()))));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|_| Err(ExtractionError::Unknown("simulated v3 failure".to_string())));
-
-        let v2_subscriptions = Arc::new(Mutex::new(HashMap::new()));
-        let v3_subscriptions = Arc::new(Mutex::new(HashMap::new()));
-        let (v2_tx, mut v2_rx) = mpsc::channel(4);
-        let (v3_tx, mut v3_rx) = mpsc::channel(4);
-        v2_subscriptions
-            .lock()
-            .await
-            .insert(0, v2_tx);
-        v3_subscriptions
-            .lock()
-            .await
-            .insert(0, v3_tx);
-
-        let dispatcher = FamilyBlockChangesDispatcher::new([
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v2".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-            },
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v3".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-            },
-        ])
-        .expect("dispatcher builds");
-
-        let runner = FamilyExtractorRunner::new(
-            HashMap::from([
-                ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-                ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-            ]),
-            SubstreamsStream::from_stream(Box::pin(stream::iter(vec![
-                Ok(BlockResponse::New(family_block)),
-                Ok(BlockResponse::Ended),
-            ]))),
-            HashMap::from([
-                ("uniswap_v2".to_string(), v2_subscriptions),
-                ("uniswap_v3".to_string(), v3_subscriptions),
-            ]),
-            mpsc::channel(4).1,
-            None,
-            false,
-            dispatcher,
-        );
-
-        let err = runner
-            .run()
-            .await
-            .unwrap()
-            .expect_err("family runner should fail");
-        assert!(
-            matches!(err, ExtractionError::Unknown(ref message) if message == "simulated v3 failure"),
-            "unexpected error: {err:?}"
-        );
-        assert!(
-            v2_rx.try_recv().is_err(),
-            "v2 subscriber should not receive a message from a failed family block"
-        );
-        assert!(
-            v3_rx.try_recv().is_err(),
-            "v3 subscriber should not receive a message from a failed family block"
-        );
     }
 
     #[tokio::test]
@@ -2767,7 +2373,7 @@ dci_plugin:
 
             BlockScopedData {
                 output: Some(MapModuleOutput {
-                    name: "map_uniswap_family_protocol_changes".to_string(),
+                    name: family_output_module_for_tests("uniswap"),
                     map_output: Some(prost_types::Any {
                         type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
                         value: family_changes.encode_to_vec(),
@@ -2859,6 +2465,7 @@ dci_plugin:
                             ImplementationType::Custom,
                         ),
                     )]),
+                    vec![],
                     token_processor,
                     None,
                     None,
@@ -2902,7 +2509,7 @@ dci_plugin:
             ])
             .expect("dispatcher builds");
 
-            let runner = FamilyExtractorRunner::new(
+            let runner = family_runner_for_tests(
                 HashMap::from([
                     ("uniswap_v2".to_string(), v2_extractor.clone() as Arc<dyn Extractor>),
                     ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
@@ -2933,9 +2540,6 @@ dci_plugin:
                     ("uniswap_v2".to_string(), Arc::new(Mutex::new(HashMap::new()))),
                     ("uniswap_v3".to_string(), Arc::new(Mutex::new(HashMap::new()))),
                 ]),
-                mpsc::channel(4).1,
-                None,
-                false,
                 dispatcher,
             );
 
@@ -3073,7 +2677,7 @@ dci_plugin:
         ])
         .expect("dispatcher builds");
 
-        let runner = FamilyExtractorRunner::new(
+        let runner = family_runner_for_tests(
             HashMap::from([
                 ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
                 ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
@@ -3083,9 +2687,6 @@ dci_plugin:
                 ("uniswap_v2".to_string(), Arc::new(Mutex::new(HashMap::new()))),
                 ("uniswap_v3".to_string(), Arc::new(Mutex::new(HashMap::new()))),
             ]),
-            mpsc::channel(4).1,
-            None,
-            false,
             dispatcher,
         );
 
@@ -3093,172 +2694,25 @@ dci_plugin:
     }
 
     #[tokio::test]
-    async fn test_family_runner_reconnects_and_dispatches_follow_up_updates() {
-        use std::sync::Mutex as StdMutex;
-
-        use crate::{
-            pb::sf::substreams::rpc::v2::{response::Message, Response, SessionInit},
-            substreams::{
-                mock::{start_scripted_mock_substreams, MockSubstreamsScript},
-                SubstreamsEndpoint,
-            },
-        };
-
-        fn session_response(start_block: u64) -> Response {
-            Response {
-                message: Some(Message::Session(SessionInit {
-                    trace_id: format!("trace-{start_block}"),
-                    resolved_start_block: start_block,
-                    linear_handoff_block: start_block,
-                    max_parallel_workers: 1,
-                    attestation_public_key: String::new(),
-                    chain_head: start_block,
-                    blocks_to_process_before_start_block: 0,
-                    effective_blocks_to_process_before_start_block: 0,
-                    blocks_to_process_after_start_block: 0,
-                    effective_blocks_to_process_after_start_block: 0,
-                })),
-            }
-        }
-
-        fn block_response(block: BlockScopedData) -> Response {
-            Response { message: Some(Message::BlockScopedData(block)) }
-        }
-
-        let first_block = make_family_block_scoped_data();
-        let second_block = make_family_follow_up_block_scoped_data(43, "cursor-43");
-        let (captured, addr) = start_scripted_mock_substreams(vec![
-            MockSubstreamsScript {
-                responses: vec![session_response(42), block_response(first_block.clone())],
-                grpc_status: "13",
-                grpc_message: Some("forced-reconnect"),
-            },
-            MockSubstreamsScript {
-                responses: vec![session_response(43), block_response(second_block.clone())],
-                grpc_status: "0",
-                grpc_message: None,
-            },
-        ])
-        .await;
-
-        let v2_calls = Arc::new(StdMutex::new(0usize));
-        let v3_calls = Arc::new(StdMutex::new(0usize));
-
+    async fn test_family_runner_subscribe_resolves_alias_named_handle_to_protocol_system() {
         let mut v2 = MockExtractor::new();
-        {
-            let v2_calls = v2_calls.clone();
-            v2.expect_handle_tick_scoped_data()
-                .times(2)
-                .returning(move |inp: BlockScopedData| {
-                    let raw = &inp
-                        .output
-                        .as_ref()
-                        .expect("output")
-                        .map_output
-                        .as_ref()
-                        .expect("map output")
-                        .value;
-                    let decoded =
-                        substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
-                    let mut call = v2_calls.lock().unwrap();
-                    *call += 1;
-                    match *call {
-                        1 => {
-                            assert_eq!(inp.cursor, "cursor-42");
-                            assert_eq!(
-                                decoded.changes[0]
-                                    .component_changes
-                                    .len(),
-                                1
-                            );
-                            assert_eq!(decoded.changes[0].component_changes[0].id, "v2-pool");
-                        }
-                        2 => {
-                            assert_eq!(inp.cursor, "cursor-43");
-                            assert_eq!(
-                                decoded.changes[0]
-                                    .component_changes
-                                    .len(),
-                                0
-                            );
-                            assert_eq!(decoded.changes[0].entity_changes.len(), 1);
-                            assert_eq!(
-                                decoded.changes[0].entity_changes[0].component_id,
-                                "v2-pool"
-                            );
-                        }
-                        _ => panic!("unexpected v2 call count"),
-                    }
-                    Ok(Some(Arc::new(BlockAggregatedChanges::default())))
-                });
-        }
+        v2.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v2_alias".to_string(),
+            });
+        v2.expect_protocol_system()
+            .return_const("uniswap_v2".to_string());
 
         let mut v3 = MockExtractor::new();
-        {
-            let v3_calls = v3_calls.clone();
-            v3.expect_handle_tick_scoped_data()
-                .times(2)
-                .returning(move |inp: BlockScopedData| {
-                    let raw = &inp
-                        .output
-                        .as_ref()
-                        .expect("output")
-                        .map_output
-                        .as_ref()
-                        .expect("map output")
-                        .value;
-                    let decoded =
-                        substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
-                    let mut call = v3_calls.lock().unwrap();
-                    *call += 1;
-                    match *call {
-                        1 => {
-                            assert_eq!(inp.cursor, "cursor-42");
-                            assert_eq!(
-                                decoded.changes[0]
-                                    .component_changes
-                                    .len(),
-                                1
-                            );
-                            assert_eq!(decoded.changes[0].component_changes[0].id, "v3-pool");
-                        }
-                        2 => {
-                            assert_eq!(inp.cursor, "cursor-43");
-                            assert_eq!(
-                                decoded.changes[0]
-                                    .component_changes
-                                    .len(),
-                                0
-                            );
-                            assert_eq!(decoded.changes[0].entity_changes.len(), 1);
-                            assert_eq!(
-                                decoded.changes[0].entity_changes[0].component_id,
-                                "v3-pool"
-                            );
-                        }
-                        _ => panic!("unexpected v3 call count"),
-                    }
-                    Ok(Some(Arc::new(BlockAggregatedChanges::default())))
-                });
-        }
+        v3.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v3_alias".to_string(),
+            });
+        v3.expect_protocol_system()
+            .return_const("uniswap_v3".to_string());
 
-        let endpoint = Arc::new(
-            SubstreamsEndpoint::new(format!("http://{addr}"), None)
-                .await
-                .expect("endpoint builds"),
-        );
-        let stream = SubstreamsStream::new(
-            endpoint,
-            None,
-            None,
-            "map_uniswap_family_protocol_changes".to_string(),
-            42,
-            0,
-            false,
-            "ethereum:uniswap_family".to_string(),
-            false,
-            HashMap::new(),
-        );
         let dispatcher = FamilyBlockChangesDispatcher::new([
             FamilyBranchSpec {
                 protocol_system: "uniswap_v2".to_string(),
@@ -3271,2161 +2725,274 @@ dci_plugin:
         ])
         .expect("dispatcher builds");
 
-        let runner = FamilyExtractorRunner::new(
+        let v2_subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let v3_subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let mut runner = family_runner_for_tests(
             HashMap::from([
                 ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
                 ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
             ]),
-            stream,
+            SubstreamsStream::from_stream(Box::pin(stream::empty())),
             HashMap::from([
-                ("uniswap_v2".to_string(), Arc::new(Mutex::new(HashMap::new()))),
-                ("uniswap_v3".to_string(), Arc::new(Mutex::new(HashMap::new()))),
+                ("uniswap_v2".to_string(), Arc::clone(&v2_subscriptions)),
+                ("uniswap_v3".to_string(), Arc::clone(&v3_subscriptions)),
             ]),
-            mpsc::channel(4).1,
-            None,
-            false,
             dispatcher,
         );
 
-        runner.run().await.unwrap().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        runner
+            .subscribe(
+                ExtractorIdentity { chain: Chain::Ethereum, name: "uniswap_v2_alias".to_string() },
+                tx,
+            )
+            .await;
 
-        let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 2, "expected initial request and reconnect");
-        assert!(requests[0].start_cursor.is_empty());
-        assert_eq!(requests[1].start_cursor, "cursor-42");
-        assert_eq!(*v2_calls.lock().unwrap(), 2);
-        assert_eq!(*v3_calls.lock().unwrap(), 2);
+        assert_eq!(
+            v2_subscriptions.lock().await.len(),
+            1,
+            "alias-named family handle should subscribe against protocol-system branch"
+        );
+        assert_eq!(
+            v3_subscriptions.lock().await.len(),
+            0,
+            "subscription should not be attached to a different branch"
+        );
+
+        assert_eq!(
+            runner
+                .branch_subscription_index()
+                .get("uniswap_v2"),
+            Some("uniswap_v2"),
+            "protocol-system keyed subscriptions should still resolve directly"
+        );
+    }
+
+    #[test]
+    fn test_family_branch_subscription_index_learns_aliases_from_extractors() {
+        let mut v2 = MockExtractor::new();
+        v2.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v2_alias".to_string(),
+            });
+        let mut v3 = MockExtractor::new();
+        v3.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v3_alias".to_string(),
+            });
+
+        let extractors = HashMap::from([
+            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
+            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
+        ]);
+        let mut index = FamilyBranchSubscriptionIndex::from_extractors(&extractors);
+
+        assert_eq!(index.get("uniswap_v2"), Some("uniswap_v2"));
+        assert_eq!(index.get("uniswap_v2_alias"), Some("uniswap_v2"));
+        assert_eq!(
+            index.resolve_or_learn(
+                &ExtractorIdentity {
+                    chain: Chain::Ethereum,
+                    name: "uniswap_v2_alias".to_string(),
+                },
+                &extractors,
+            ),
+            Some("uniswap_v2".to_string())
+        );
+        assert_eq!(index.get("uniswap_v2_alias"), Some("uniswap_v2"));
     }
 
     #[tokio::test]
-    async fn test_family_runner_routes_existing_components_after_restart_style_preseed() {
-        let follow_up_block = make_family_follow_up_block_scoped_data(43, "cursor-43");
-
+    async fn test_family_branch_runtime_wiring_uses_protocol_system_keys_and_emits_handles() {
         let mut v2 = MockExtractor::new();
-        v2.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|inp: BlockScopedData| {
-                let raw = &inp
-                    .output
-                    .as_ref()
-                    .expect("output")
-                    .map_output
-                    .as_ref()
-                    .expect("map output")
-                    .value;
-                let decoded =
-                    substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
-                assert_eq!(inp.cursor, "cursor-43");
-                assert_eq!(decoded.changes.len(), 1);
-                assert_eq!(
-                    decoded.changes[0]
-                        .component_changes
-                        .len(),
-                    0
-                );
-                assert_eq!(decoded.changes[0].entity_changes.len(), 1);
-                assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v2-pool");
-                Ok(Some(Arc::new(BlockAggregatedChanges::default())))
+        v2.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v2_alias".to_string(),
             });
 
         let mut v3 = MockExtractor::new();
-        v3.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|inp: BlockScopedData| {
-                let raw = &inp
-                    .output
-                    .as_ref()
-                    .expect("output")
-                    .map_output
-                    .as_ref()
-                    .expect("map output")
-                    .value;
-                let decoded =
-                    substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
-                assert_eq!(inp.cursor, "cursor-43");
-                assert_eq!(decoded.changes.len(), 1);
-                assert_eq!(
-                    decoded.changes[0]
-                        .component_changes
-                        .len(),
-                    0
-                );
-                assert_eq!(decoded.changes[0].entity_changes.len(), 1);
-                assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v3-pool");
-                Ok(Some(Arc::new(BlockAggregatedChanges::default())))
+        v3.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v3_alias".to_string(),
             });
 
-        let dispatcher = {
-            let mut dispatcher = FamilyBlockChangesDispatcher::new([
-                FamilyBranchSpec {
-                    protocol_system: "uniswap_v2".to_string(),
-                    protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-                },
-                FamilyBranchSpec {
-                    protocol_system: "uniswap_v3".to_string(),
-                    protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-                },
-            ])
-            .expect("dispatcher builds");
-            dispatcher.register_component_systems(HashMap::from([
-                ("v2-pool".to_string(), "uniswap_v2".to_string()),
-                ("v3-pool".to_string(), "uniswap_v3".to_string()),
-            ]));
-            dispatcher
-        };
+        let extractors = HashMap::from([
+            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
+            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
+        ]);
+        let (control_tx, _control_rx) = mpsc::channel(4);
 
-        let runner = FamilyExtractorRunner::new(
-            HashMap::from([
-                ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-                ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-            ]),
-            SubstreamsStream::from_stream(Box::pin(stream::iter(vec![
-                Ok(BlockResponse::New(follow_up_block)),
-                Ok(BlockResponse::Ended),
-            ]))),
-            HashMap::from([
-                ("uniswap_v2".to_string(), Arc::new(Mutex::new(HashMap::new()))),
-                ("uniswap_v3".to_string(), Arc::new(Mutex::new(HashMap::new()))),
-            ]),
-            mpsc::channel(4).1,
-            None,
-            false,
-            dispatcher,
+        let wiring = FamilyBranchRuntimeWiring::from_extractors(extractors, &control_tx);
+
+        let subscription_keys = wiring
+            .subscriptions
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            subscription_keys,
+            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()]),
+            "family runner wiring should key subscriptions by protocol_system"
         );
+        for subscribers in wiring.subscriptions.values() {
+            assert!(
+                subscribers.lock().await.is_empty(),
+                "family runner wiring should start with empty subscriber maps"
+            );
+        }
 
-        runner.run().await.unwrap().unwrap();
+        let handle_names = wiring
+            .handles
+            .into_iter()
+            .map(|handle| handle.get_id().name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            handle_names,
+            HashSet::from(["uniswap_v2_alias".to_string(), "uniswap_v3_alias".to_string()]),
+            "family runner wiring should emit one handle per branch extractor identity"
+        );
+    }
+
+    #[test]
+    fn test_family_runner_extractors_by_protocol_system_uses_protocol_system_keys_for_aliased_members(
+    ) {
+        let v2_config = ExtractorConfig {
+            name: "uniswap_v2_alias".to_string(),
+            protocol_system: "uniswap_v2".to_string(),
+            ..Default::default()
+        };
+        let v3_config = ExtractorConfig {
+            name: "uniswap_v3_alias".to_string(),
+            protocol_system: "uniswap_v3".to_string(),
+            ..Default::default()
+        };
+        let v2_extractor: Arc<dyn Extractor> = Arc::new(MockExtractor::new());
+        let v3_extractor: Arc<dyn Extractor> = Arc::new(MockExtractor::new());
+
+        let extractors = extractors_by_protocol_system(vec![
+            ExtractorBuilder::new(&v2_config, "http://localhost:9000", None, "token")
+                .set_extractor(Arc::clone(&v2_extractor)),
+            ExtractorBuilder::new(&v3_config, "http://localhost:9000", None, "token")
+                .set_extractor(Arc::clone(&v3_extractor)),
+        ]);
+
+        let keys = extractors
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            keys,
+            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()]),
+            "family startup should normalize built branch extractors onto protocol_system keys"
+        );
+        assert!(
+            Arc::ptr_eq(
+                extractors
+                    .get("uniswap_v2")
+                    .expect("v2 extractor is keyed by protocol_system"),
+                &v2_extractor
+            ),
+            "family startup should preserve the built extractor for the v2 protocol_system key"
+        );
+        assert!(
+            Arc::ptr_eq(
+                extractors
+                    .get("uniswap_v3")
+                    .expect("v3 extractor is keyed by protocol_system"),
+                &v3_extractor
+            ),
+            "family startup should preserve the built extractor for the v3 protocol_system key"
+        );
     }
 
     #[tokio::test]
-    async fn test_family_runner_routes_contract_and_storage_follow_ups_after_restart_style_preseed()
-    {
-        let follow_up_block =
-            make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44");
-
+    async fn test_family_runner_build_managed_from_startup_preserves_protocol_system_keyed_shape() {
         let mut v2 = MockExtractor::new();
-        v2.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|inp: BlockScopedData| {
-                let raw = &inp
-                    .output
-                    .as_ref()
-                    .expect("output")
-                    .map_output
-                    .as_ref()
-                    .expect("map output")
-                    .value;
-                let decoded =
-                    substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
-                assert_eq!(inp.cursor, "cursor-44");
-                assert_eq!(decoded.changes.len(), 1);
-                assert_eq!(
-                    decoded.changes[0]
-                        .contract_changes
-                        .len(),
-                    1
-                );
-                assert_eq!(decoded.changes[0].contract_changes[0].address, vec![0x44; 20]);
-                assert!(decoded.storage_changes.is_empty());
-                Ok(Some(Arc::new(BlockAggregatedChanges::default())))
+        v2.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v2_alias".to_string(),
             });
-
         let mut v3 = MockExtractor::new();
-        v3.expect_handle_tick_scoped_data()
-            .once()
-            .returning(|inp: BlockScopedData| {
-                let raw = &inp
-                    .output
-                    .as_ref()
-                    .expect("output")
-                    .map_output
-                    .as_ref()
-                    .expect("map output")
-                    .value;
-                let decoded =
-                    substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
-                assert_eq!(inp.cursor, "cursor-44");
-                assert!(decoded.changes.is_empty());
-                assert_eq!(decoded.storage_changes.len(), 1);
-                assert_eq!(decoded.storage_changes[0].storage_changes[0].address, vec![0x55; 20]);
-                Ok(Some(Arc::new(BlockAggregatedChanges::default())))
+        v3.expect_get_id()
+            .return_const(ExtractorIdentity {
+                chain: Chain::Ethereum,
+                name: "uniswap_v3_alias".to_string(),
             });
 
-        let dispatcher = {
-            let mut dispatcher = FamilyBlockChangesDispatcher::new([
-                FamilyBranchSpec {
-                    protocol_system: "uniswap_v2".to_string(),
-                    protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-                },
-                FamilyBranchSpec {
-                    protocol_system: "uniswap_v3".to_string(),
-                    protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-                },
-            ])
-            .expect("dispatcher builds");
-            dispatcher.register_contract_systems(HashMap::from([
-                (vec![0x44; 20], "uniswap_v2".to_string()),
-                (vec![0x55; 20], "uniswap_v3".to_string()),
-            ]));
-            dispatcher
-        };
-
-        let runner = FamilyExtractorRunner::new(
-            HashMap::from([
-                ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-                ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-            ]),
-            SubstreamsStream::from_stream(Box::pin(stream::iter(vec![
-                Ok(BlockResponse::New(follow_up_block)),
-                Ok(BlockResponse::Ended),
-            ]))),
-            HashMap::from([
-                ("uniswap_v2".to_string(), Arc::new(Mutex::new(HashMap::new()))),
-                ("uniswap_v3".to_string(), Arc::new(Mutex::new(HashMap::new()))),
-            ]),
-            mpsc::channel(4).1,
-            None,
-            false,
-            dispatcher,
-        );
-
-        runner.run().await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_build_family_dispatcher_from_cache_preseeds_component_and_contract_ownership() {
+        let configs = make_uniswap_family_bootstrap_test_configs();
+        let config_refs = configs.iter().collect::<Vec<_>>();
+        let family_execution =
+            resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
+                .expect("family execution should derive from test configs");
         let protocol_cache = ProtocolMemoryCache::new(
             Chain::Ethereum,
             chrono::Duration::seconds(60),
             Arc::new(MockGateway::new()),
         );
-        protocol_cache
-            .add_components(vec![
-                ProtocolComponent::new(
-                    "v2-pool",
-                    "uniswap_v2",
-                    "pool",
-                    Chain::Ethereum,
-                    vec![],
-                    vec![Bytes::from(vec![0x44; 20])],
-                    HashMap::new(),
-                    ChangeType::Creation,
-                    Bytes::default(),
-                    NaiveDateTime::default(),
-                ),
-                ProtocolComponent::new(
-                    "v3-pool",
-                    "uniswap_v3",
-                    "pool",
-                    Chain::Ethereum,
-                    vec![],
-                    vec![Bytes::from(vec![0x55; 20])],
-                    HashMap::new(),
-                    ChangeType::Creation,
-                    Bytes::default(),
-                    NaiveDateTime::default(),
-                ),
-            ])
-            .await
-            .expect("seed protocol cache");
-
-        let branch_specs = vec![
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v2".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-            },
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v3".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-            },
-        ];
-        let mut dispatcher = build_family_dispatcher_from_cache(&branch_specs, &protocol_cache)
-            .await
-            .expect("dispatcher builds from cache");
-
-        let dispatched = dispatcher
-            .dispatch_block_scoped_data(
-                make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44"),
-            )
-            .expect("contract/storage follow-up routes from cache preload");
-
-        let v2 = dispatched
-            .get("uniswap_v2")
-            .expect("v2 branch present");
-        let v2_changes = substreams::BlockChanges::decode(
-            v2.output
-                .as_ref()
-                .and_then(|output| output.map_output.as_ref())
-                .expect("v2 map output")
-                .value
-                .as_slice(),
-        )
-        .expect("decode v2 block changes");
-        assert_eq!(v2_changes.changes.len(), 1);
-        assert_eq!(v2_changes.storage_changes.len(), 0);
-        assert_eq!(
-            v2_changes.changes[0]
-                .contract_changes
-                .len(),
-            1
-        );
-        assert_eq!(v2_changes.changes[0].contract_changes[0].address, vec![0x44; 20]);
-
-        let v3 = dispatched
-            .get("uniswap_v3")
-            .expect("v3 branch present");
-        let v3_changes = substreams::BlockChanges::decode(
-            v3.output
-                .as_ref()
-                .and_then(|output| output.map_output.as_ref())
-                .expect("v3 map output")
-                .value
-                .as_slice(),
-        )
-        .expect("decode v3 block changes");
-        assert_eq!(v3_changes.changes.len(), 0);
-        assert_eq!(v3_changes.storage_changes.len(), 1);
-        assert_eq!(
-            v3_changes.storage_changes[0]
-                .storage_changes
-                .len(),
-            1
-        );
-        assert_eq!(v3_changes.storage_changes[0].storage_changes[0].address, vec![0x55; 20]);
-    }
-
-    #[tokio::test]
-    async fn test_build_family_dispatcher_from_populated_cache_uses_gateway_seeded_components() {
-        let chain = Chain::Ethereum;
-        let mut gateway = MockGateway::new();
-        gateway
-            .expect_get_tokens()
-            .return_once(move |_, _, _, _, _| {
-                let token = Token::new(&Bytes::from(vec![0xaa; 20]), "TKN", 18, 0, &[], chain, 100);
-                Box::pin(async move { Ok(WithTotal { entity: vec![token], total: Some(1) }) })
-            });
-        gateway
-            .expect_get_protocol_components()
-            .return_once(|_, _, _, _, _| {
-                Box::pin(async move {
-                    Ok(WithTotal {
-                        entity: vec![
-                            ProtocolComponent::new(
-                                "v2-pool",
-                                "uniswap_v2",
-                                "pool",
-                                Chain::Ethereum,
-                                vec![],
-                                vec![Bytes::from(vec![0x44; 20])],
-                                HashMap::new(),
-                                ChangeType::Creation,
-                                Bytes::default(),
-                                NaiveDateTime::default(),
-                            ),
-                            ProtocolComponent::new(
-                                "v3-pool",
-                                "uniswap_v3",
-                                "pool",
-                                Chain::Ethereum,
-                                vec![],
-                                vec![Bytes::from(vec![0x55; 20])],
-                                HashMap::new(),
-                                ChangeType::Creation,
-                                Bytes::default(),
-                                NaiveDateTime::default(),
-                            ),
-                        ],
-                        total: Some(2),
-                    })
-                })
-            });
-        gateway
-            .expect_get_token_prices()
-            .with(mockall::predicate::eq(chain))
-            .times(1)
-            .return_once(|_| Box::pin(async { Ok(HashMap::new()) }));
-
-        let protocol_cache =
-            ProtocolMemoryCache::new(chain, chrono::Duration::seconds(60), Arc::new(gateway));
-        protocol_cache
-            .populate()
-            .await
-            .expect("populate protocol cache from gateway");
-
-        let branch_specs = vec![
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v2".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-            },
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v3".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-            },
-        ];
-        let mut dispatcher = build_family_dispatcher_from_cache(&branch_specs, &protocol_cache)
-            .await
-            .expect("dispatcher builds from populated cache");
-
-        let dispatched = dispatcher
-            .dispatch_block_scoped_data(
-                make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44"),
-            )
-            .expect("dispatch follow-up block after populated-cache preseed");
-
-        assert!(dispatched.contains_key("uniswap_v2"));
-        assert!(dispatched.contains_key("uniswap_v3"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_start_uses_next_aligned_resume_block() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v2.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-100".to_string());
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v3.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-100".to_string());
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
+        let extractors = HashMap::from([
             ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
             ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
         ]);
-        let family_execution = empty_family_execution_config(42);
-
-        let start = resolve_family_stream_start(&extractors, &family_execution)
-            .await
-            .expect("aligned progress should resolve");
-
-        assert_eq!(start, 101);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_cursor_rejects_misaligned_resumed_branch_cursors() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v2.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-v2".to_string());
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v3.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-v3".to_string());
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let err = resolve_family_stream_cursor(
-            &extractors,
-            &empty_resolved_family_execution_config_for_tests(),
+        let dispatcher = FamilyBlockChangesDispatcher::from_protocol_cache(
+            &family_execution.branch_specs,
+            &protocol_cache,
         )
         .await
-        .expect_err("misaligned resumed branch cursors should fail");
-        assert!(err
-            .to_string()
-            .contains("family runner requires aligned branch cursors"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_position_returns_aligned_resume_start_and_cursor() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v2.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-100".to_string());
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v3.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-100".to_string());
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let position = resolve_family_stream_position(
-            &extractors,
-            &empty_resolved_family_execution_config_for_tests(),
-        )
-        .await
-        .expect("aligned resumed family stream position should resolve");
-
-        assert_eq!(
-            position,
-            ResolvedFamilyStreamPosition {
-                start_block: 101,
-                cursor: Some("cursor-100".to_string()),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_position_uses_shared_cursor_for_alias_named_members() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v2.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-100-shared".to_string());
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v3.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-100-shared".to_string());
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2_alias".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3_alias".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let position = resolve_family_stream_position(
-            &extractors,
-            &empty_resolved_family_execution_config_for_tests(),
-        )
-        .await
-        .expect("aligned resumed alias family stream position should resolve");
-
-        assert_eq!(
-            position,
-            ResolvedFamilyStreamPosition {
-                start_block: 101,
-                cursor: Some("cursor-100-shared".to_string()),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_position_rejects_empty_resumed_shared_cursor() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v2.expect_get_cursor()
-            .times(0..=1)
-            .returning(String::new);
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        v3.expect_get_cursor()
-            .times(0..=1)
-            .returning(String::new);
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let err = resolve_family_stream_position(
-            &extractors,
-            &empty_resolved_family_execution_config_for_tests(),
-        )
-        .await
-        .expect_err("empty resumed shared cursor should fail");
-
-        assert!(err
-            .to_string()
-            .contains("family runner requires a persisted shared cursor"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_position_rejects_resume_block_overflow() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: u64::MAX, ..Default::default() }));
-        v2.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-max".to_string());
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: u64::MAX, ..Default::default() }));
-        v3.expect_get_cursor()
-            .once()
-            .returning(|| "cursor-max".to_string());
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let err = resolve_family_stream_position(
-            &extractors,
-            &empty_resolved_family_execution_config_for_tests(),
-        )
-        .await
-        .expect_err("resume block overflow should fail");
-
-        assert!(err.to_string().contains("block number overflow"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_start_rejects_misaligned_resume_blocks() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 101, ..Default::default() }));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-        let family_execution = empty_family_execution_config(42);
-
-        let err = resolve_family_stream_start(&extractors, &family_execution)
-            .await
-            .expect_err("misaligned progress should fail");
-
-        assert!(err
-            .to_string()
-            .contains("family runner requires aligned branch progress"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_start_rejects_mixed_resumed_and_fresh_branches() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-        let family_execution = empty_family_execution_config(42);
-
-        let err = resolve_family_stream_start(&extractors, &family_execution)
-            .await
-            .expect_err("mixed branch progress should fail");
-
-        assert!(err
-            .to_string()
-            .contains("family runner requires consistent branch progress"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_start_uses_bootstrap_adjusted_aligned_fresh_start() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-        let configs = [
-            ExtractorConfig {
-                name: "uniswap_v2".to_owned(),
-                protocol_system: "uniswap_v2".to_string(),
-                start_block: 42,
-                protocol_types: vec![ProtocolTypeConfig::new(
-                    "uniswap_v2_pool".to_string(),
-                    FinancialType::Swap,
-                )],
-                bootstrap: Some(BootstrapConfig {
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    start_block: 42,
-                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                        .to_owned(),
-                }),
-                ..Default::default()
-            },
-            ExtractorConfig {
-                name: "uniswap_v3".to_owned(),
-                protocol_system: "uniswap_v3".to_string(),
-                start_block: 43,
-                protocol_types: vec![ProtocolTypeConfig::new(
-                    "uniswap_v3_pool".to_string(),
-                    FinancialType::Swap,
-                )],
-                bootstrap: Some(BootstrapConfig {
-                    strategy: BootstrapStrategy::UniswapV3Rpc,
-                    start_block: 42,
-                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
-                        .to_owned(),
-                }),
-                ..Default::default()
-            },
-        ];
-        let config_refs = configs.iter().collect::<Vec<_>>();
-        let family_execution =
-            resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-                .expect("family execution derives");
-
-        let start = resolve_family_stream_start(&extractors, &family_execution)
-            .await
-            .expect("aligned fresh bootstrap branches should resolve");
-
-        assert_eq!(start, 43);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_family_stream_start_rejects_misaligned_fresh_branch_starts() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-
-        let _extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-        let configs = [
-            ExtractorConfig {
-                name: "uniswap_v2".to_owned(),
-                protocol_system: "uniswap_v2".to_string(),
-                start_block: 42,
-                protocol_types: vec![ProtocolTypeConfig::new(
-                    "uniswap_v2_pool".to_string(),
-                    FinancialType::Swap,
-                )],
-                bootstrap: Some(BootstrapConfig {
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    start_block: 42,
-                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                        .to_owned(),
-                }),
-                ..Default::default()
-            },
-            ExtractorConfig {
-                name: "uniswap_v3".to_owned(),
-                protocol_system: "uniswap_v3".to_string(),
-                start_block: 45,
-                protocol_types: vec![ProtocolTypeConfig::new(
-                    "uniswap_v3_pool".to_string(),
-                    FinancialType::Swap,
-                )],
-                bootstrap: Some(BootstrapConfig {
-                    strategy: BootstrapStrategy::UniswapV3Rpc,
-                    start_block: 45,
-                    params: "bootstrap_block=45&pool=0x0000000000000000000000000000000000005678"
-                        .to_owned(),
-                }),
-                ..Default::default()
-            },
-        ];
-        let config_refs = configs.iter().collect::<Vec<_>>();
-        let family_execution =
-            resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-                .expect_err(
-                    "misaligned fresh family starts should fail in family execution config",
-                );
-
-        assert!(family_execution
-            .to_string()
-            .contains("family runner requires aligned branch start blocks"));
-    }
-
-    #[tokio::test]
-    async fn test_run_family_bootstrap_if_needed_rejects_mixed_progress_before_bootstrap() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| Some(Block { number: 100, ..Default::default() }));
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-        let configs = [
-            ExtractorConfig {
-                name: "uniswap_v2".to_owned(),
-                protocol_system: "uniswap_v2".to_string(),
-                start_block: 42,
-                bootstrap: Some(BootstrapConfig {
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    start_block: 42,
-                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                        .to_owned(),
-                }),
-                ..Default::default()
-            },
-            ExtractorConfig {
-                name: "uniswap_v3".to_owned(),
-                protocol_system: "uniswap_v3".to_string(),
-                start_block: 42,
-                bootstrap: Some(BootstrapConfig {
-                    strategy: BootstrapStrategy::UniswapV3Rpc,
-                    start_block: 42,
-                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
-                        .to_owned(),
-                }),
-                ..Default::default()
-            },
-        ];
-        let family_execution = ResolvedFamilyExecutionConfig {
-            configured_start_block: 43,
-            bootstrap_plan: Some(
-                SharedBootstrapPlan::for_extractor_configs(configs.iter().map(|config| {
-                    (
-                        config,
-                        config
-                            .bootstrap
-                            .as_ref()
-                            .expect("bootstrap present for test"),
-                    )
-                }))
-                .expect("bootstrap plan builds"),
-            ),
-            ..empty_family_execution_config(43)
-        };
-        let rpc_client = EthereumRpcClient::new("http://localhost:8545")
-            .expect("rpc client builds for non-networked preflight");
-
-        let err = run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
-            .await
-            .expect_err("mixed progress should fail before bootstrap materialization");
-
-        assert!(err
-            .to_string()
-            .contains("family runner requires consistent branch progress before bootstrap"));
-    }
-
-    fn fail_if_shared_bootstrap_materialized<'a>(
-        _rpc_client: &'a EthereumRpcClient,
-        _plan: &'a SharedBootstrapPlan,
-        _branches: &'a [ResolvedSharedBootstrapBranchRuntime],
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<crate::extractor::models::BlockChanges, ExtractionError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move { panic!("shared bootstrap materialization should have been skipped") })
-    }
-
-    #[tokio::test]
-    async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_completion_exists(
-    ) {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-        v3.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-        let mut family_execution = empty_family_execution_config(43);
-        family_execution.shared_bootstrap_plan_materializer = fail_if_shared_bootstrap_materialized;
-        family_execution.bootstrap_plan = Some(SharedBootstrapPlan {
-            family_name: Some("uniswap".to_string()),
-            bootstrap_block: 42,
-            branches: vec![
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v2".to_string(),
-                    protocol_system: "uniswap_v2".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v3".to_string(),
-                    protocol_system: "uniswap_v3".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV3Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-            ],
-        });
-
-        let rpc_client =
-            EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
-
-        run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
-            .await
-            .expect("completed shared bootstrap should be skipped before materialization");
-    }
-
-    #[tokio::test]
-    async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootstrap_blocks() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .once()
-            .returning(|| None);
-        v3.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(43)));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-        let mut family_execution = empty_family_execution_config(43);
-        family_execution.shared_bootstrap_plan_materializer = fail_if_shared_bootstrap_materialized;
-        family_execution.bootstrap_plan = Some(SharedBootstrapPlan {
-            family_name: Some("uniswap".to_string()),
-            bootstrap_block: 42,
-            branches: vec![
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v2".to_string(),
-                    protocol_system: "uniswap_v2".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v3".to_string(),
-                    protocol_system: "uniswap_v3".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV3Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-            ],
-        });
-
-        let rpc_client =
-            EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
-
-        let err = run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
-            .await
-            .expect_err(
-                "misaligned shared bootstrap completion should fail before materialization",
-            );
-        assert!(err
-            .to_string()
-            .contains("family runner requires aligned shared bootstrap completion blocks"));
-    }
-
-    #[tokio::test]
-    async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
-        use crate::substreams::mock::start_mock_substreams;
-
-        let (captured, addr) = start_mock_substreams().await;
-
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_last_processed_block()
-            .times(2)
-            .returning(|| None);
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_last_processed_block()
-            .times(2)
-            .returning(|| None);
-        v3.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let v2_config = ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            start_block: 42,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-        let v3_config = ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            start_block: 42,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-
-        let mut family_execution = empty_family_execution_config(43);
-        family_execution.shared_stream =
-            family_resolved_shared_stream_for_tests("uniswap", Chain::Ethereum, "test-family.spkg");
-        family_execution.shared_bootstrap_plan_materializer = fail_if_shared_bootstrap_materialized;
-        family_execution.merged_substreams_params = HashMap::from([
-            ("map_pool_events".to_string(), "factory=0x01".to_string()),
-            ("map_events".to_string(), "factory=0x02".to_string()),
-        ]);
-        family_execution.bootstrap_plan = Some(SharedBootstrapPlan {
-            family_name: Some("uniswap".to_string()),
-            bootstrap_block: 42,
-            branches: vec![
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v2".to_string(),
-                    protocol_system: "uniswap_v2".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v3".to_string(),
-                    protocol_system: "uniswap_v3".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV3Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-            ],
-        });
-
-        let resolved_family = ResolvedFamilyRuntime {
-            family: family_detected_runtime_for_tests(
-                "uniswap",
-                Chain::Ethereum,
-                "test-family.spkg",
-            ),
-            extractor_configs: vec![&v2_config, &v3_config],
-            execution: family_execution.clone(),
-        };
-
-        let rpc_client =
-            EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
-
-        run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
-            .await
-            .expect("completed shared bootstrap should skip materialization");
-
-        let stream_position = resolve_family_stream_position(&extractors, &family_execution)
-            .await
-            .expect("completed shared bootstrap should produce fresh family stream position");
-
-        let request = ResolvedRuntimeTarget::Family(resolved_family)
-            .substreams_execution_request_with_start_block(stream_position.start_block)
-            .unwrap();
-
-        let loaded_substreams = LoadedSubstreamsPackage {
-            spkg: Package::default(),
-            endpoint: Arc::new(
-                SubstreamsEndpoint::new(format!("http://{addr}"), None)
-                    .await
-                    .expect("mock substreams endpoint builds"),
+        .expect("dispatcher should seed from protocol cache");
+        let prepared_startup = PreparedFamilyRunnerStartup {
+            extractors: extractors.clone(),
+            stream: SubstreamsStream::from_stream(Box::pin(stream::empty())),
+            runtime_state: crate::extractor::family_runtime_execution::FamilyRuntimeState::new(
+                &extractors,
+                dispatcher,
+                protocol_cache.clone(),
             ),
         };
-        let mut stream = build_family_substreams_stream(
-            &request,
-            loaded_substreams,
-            stream_position.cursor,
+
+        let (runner, handles) = build_family_managed_runner_from_startup(
+            prepared_startup,
+            None,
             false,
-        );
-        let _ = stream
-            .next()
-            .await
-            .expect("mock stream should yield one terminal response")
-            .expect("mock stream response should be ok");
-
-        let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 1, "expected exactly one gRPC request");
-        assert_eq!(
-            requests[0].start_block_num, 43,
-            "completed shared bootstrap should shift the family stream to bootstrap block + 1"
-        );
-        assert!(
-            requests[0].start_cursor.is_empty(),
-            "fresh shared-family start should not send a resume cursor"
-        );
-        assert_eq!(requests[0].output_module, "map_uniswap_family_protocol_changes");
-        assert_eq!(
-            requests[0].params,
-            HashMap::from([
-                ("map_pool_events".to_string(), "factory=0x01".to_string()),
-                ("map_events".to_string(), "factory=0x02".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_resolved_family_execution_config_rejects_partial_shared_bootstrap_config() {
-        let configs = [
-            ExtractorConfig {
-                name: "uniswap_v2".to_owned(),
-                protocol_system: "uniswap_v2".to_string(),
-                start_block: 42,
-                protocol_types: vec![ProtocolTypeConfig::new(
-                    "uniswap_v2_pool".to_string(),
-                    FinancialType::Swap,
-                )],
-                bootstrap: Some(BootstrapConfig {
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    start_block: 42,
-                    params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                        .to_owned(),
-                }),
-                ..Default::default()
-            },
-            ExtractorConfig {
-                name: "uniswap_v3".to_owned(),
-                protocol_system: "uniswap_v3".to_string(),
-                start_block: 43,
-                protocol_types: vec![ProtocolTypeConfig::new(
-                    "uniswap_v3_pool".to_string(),
-                    FinancialType::Swap,
-                )],
-                bootstrap: None,
-                ..Default::default()
-            },
-        ];
-        let config_refs = configs.iter().collect::<Vec<_>>();
-        let err = resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect_err("partial shared bootstrap config should fail");
-
-        let err_text = err.to_string();
-        assert!(
-            err_text.contains("shared bootstrap configuration consistency")
-                || err_text.contains("bootstrapped branches"),
-            "unexpected partial-bootstrap error: {err_text}"
-        );
-    }
-
-    #[test]
-    fn test_resolved_family_execution_config_derives_shared_branch_and_stream_settings() {
-        let v2 = ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_pool_events".to_string(),
-                "factory=0x01".to_string(),
-            )]),
-            ..Default::default()
-        };
-        let v3 = ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_events".to_string(),
-                "factory=0x02".to_string(),
-            )]),
-            ..Default::default()
-        };
-
-        let execution =
-            resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-                .expect("family execution config derives");
-
-        assert_eq!(execution.stop_block, 120);
-        assert_eq!(execution.configured_start_block, 0);
-        assert!(execution.bootstrap_plan.is_none());
-        assert_eq!(execution.shared_stream.module, "map_uniswap_family_protocol_changes");
-        assert_eq!(execution.shared_stream.extractor_id, "ethereum:uniswap_family");
-        assert_eq!(execution.shared_stream.durability_scope, "family::uniswap");
-        assert_eq!(
-            FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
-            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
-        );
-        assert_eq!(execution.branch_specs.len(), 2);
-        assert_eq!(
-            execution.merged_substreams_params,
-            HashMap::from([
-                ("map_pool_events".to_string(), "factory=0x01".to_string()),
-                ("map_events".to_string(), "factory=0x02".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_resolved_family_execution_config_uses_protocol_systems_for_aliased_members() {
-        let v2 = ExtractorConfig {
-            name: "uniswap_v2_alias".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_pool_events".to_string(),
-                "factory=0x01".to_string(),
-            )]),
-            ..Default::default()
-        };
-        let v3 = ExtractorConfig {
-            name: "uniswap_v3_alias".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_events".to_string(),
-                "factory=0x02".to_string(),
-            )]),
-            ..Default::default()
-        };
-
-        let execution =
-            resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-                .expect("aliased family execution config derives");
-
-        assert_eq!(execution.stop_block, 120);
-        assert_eq!(execution.configured_start_block, 0);
-        assert!(execution.bootstrap_plan.is_none());
-        assert_eq!(execution.shared_stream.module, "map_uniswap_family_protocol_changes");
-        assert_eq!(execution.shared_stream.extractor_id, "ethereum:uniswap_family");
-        assert_eq!(execution.shared_stream.durability_scope, "family::uniswap");
-        assert_eq!(
-            FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
-            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
-        );
-        assert_eq!(execution.branch_specs.len(), 2);
-        assert_eq!(
-            execution.merged_substreams_params,
-            HashMap::from([
-                ("map_pool_events".to_string(), "factory=0x01".to_string()),
-                ("map_events".to_string(), "factory=0x02".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_resolved_family_execution_config_is_reused_from_resolved_family_runtime() {
-        let v2 = ExtractorConfig {
-            name: "uniswap_v2_primary".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_pool_events".to_string(),
-                "factory=0x01".to_string(),
-            )]),
-            ..Default::default()
-        };
-        let v3 = ExtractorConfig {
-            name: "uniswap_v3_primary".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_events".to_string(),
-                "factory=0x02".to_string(),
-            )]),
-            ..Default::default()
-        };
-        let family = family_detected_runtime_for_tests(
-            "uniswap",
-            tycho_common::models::Chain::Ethereum,
-            "/tmp/uniswap-family.spkg",
-        );
-        let resolved_family = ResolvedFamilyRuntime {
-            family: family.clone(),
-            extractor_configs: vec![&v2, &v3],
-            execution: crate::extractor::family_runtime::ResolvedFamilyExecutionConfig {
-                branch_specs: FamilyBranchSpec::from_extractor_configs(&[&v2, &v3])
-                    .expect("branch specs derive for resolved-family test"),
-                shared_stream: family.resolved_shared_stream(),
-                shared_bootstrap_plan_materializer:
-                    crate::extractor::family_runtime::default_shared_bootstrap_plan_materializer(),
-                shared_bootstrap_branches: Vec::new(),
-                merged_substreams_params: HashMap::from([
-                    ("map_pool_events".to_string(), "factory=0x01".to_string()),
-                    ("map_events".to_string(), "factory=0x02".to_string()),
-                ]),
-                stop_block: 120,
-                configured_start_block: 0,
-                bootstrap_plan: None,
-            },
-        };
-
-        let execution = &resolved_family.execution;
-
-        assert_eq!(execution.stop_block, 120);
-        assert_eq!(execution.configured_start_block, 0);
-        assert!(execution.bootstrap_plan.is_none());
-        assert_eq!(
-            FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
-            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
-        );
-        assert_eq!(execution.branch_specs.len(), 2);
-        assert_eq!(
-            execution.merged_substreams_params,
-            HashMap::from([
-                ("map_pool_events".to_string(), "factory=0x01".to_string()),
-                ("map_events".to_string(), "factory=0x02".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn family_runtime_config_exposes_explicit_durability_scope_only() {
-        let runtime = FamilyRuntimeConfig {
-            family: "uniswap".to_string(),
-            shared_spkg: None,
-            shared_module: None,
-            durability_scope: None,
-        };
-
-        assert_eq!(runtime.durability_scope(), None);
-    }
-
-    #[test]
-    fn family_runtime_config_exposes_explicit_shared_stream_fields_only() {
-        let runtime = FamilyRuntimeConfig {
-            family: "uniswap".to_string(),
-            shared_spkg: None,
-            shared_module: None,
-            durability_scope: None,
-        };
-
-        assert_eq!(runtime.shared_spkg(), None);
-        assert_eq!(runtime.shared_module(), None);
-    }
-
-    #[test]
-    fn extractor_config_exposes_family_durability_scope() {
-        let config = ExtractorConfig::default().with_family_runtime(Some(FamilyRuntimeConfig {
-            family: "uniswap".to_string(),
-            shared_spkg: None,
-            shared_module: None,
-            durability_scope: Some("family::custom_uniswap".to_string()),
-        }));
-
-        assert_eq!(
-            config
-                .family_durability_scope()
-                .as_deref(),
-            Some("family::custom_uniswap")
-        );
-        assert_eq!(
-            config
-                .require_family_durability_scope()
-                .expect("resolved family scope should be accepted")
-                .as_deref(),
-            Some("family::custom_uniswap")
-        );
-    }
-
-    #[test]
-    fn extractor_config_rejects_unresolved_family_durability_scope_for_runtime_build() {
-        let config = ExtractorConfig::default().with_family_runtime(Some(FamilyRuntimeConfig {
-            family: "uniswap".to_string(),
-            shared_spkg: None,
-            shared_module: None,
-            durability_scope: None,
-        }));
-
-        let err = config
-            .require_family_durability_scope()
-            .expect_err("runtime build should reject unresolved family durability scope");
-
-        assert!(err
-            .to_string()
-            .contains("uses family runtime `uniswap` without a resolved durability_scope"));
-    }
-
-    #[test]
-    fn extractor_config_exposes_resolved_family_shared_spkg() {
-        let config = ExtractorConfig::new(
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            ImplementationType::Custom,
-            1000,
-            42,
-            None,
-            vec![],
-            "/tmp/member-only.spkg".to_string(),
-            "map_pool_events".to_string(),
-            vec![],
-            0,
-            None,
-            None,
-            HashMap::new(),
-            None,
         )
-        .with_family_runtime(Some(FamilyRuntimeConfig {
-            family: "uniswap".to_string(),
-            shared_spkg: Some("/tmp/family-runtime.spkg".to_string()),
-            shared_module: None,
-            durability_scope: None,
-        }));
+        .await
+        .expect("family-owned managed build should assemble runner from prepared startup");
 
-        assert_eq!(config.family_shared_spkg(), Some("/tmp/family-runtime.spkg"));
-        assert_eq!(config.family_shared_module(), None);
-        let target = config
-            .require_family_shared_stream_target()
-            .expect_err("runtime build should reject unresolved family shared module");
-        assert!(target
-            .to_string()
-            .contains("uses family runtime `uniswap` without a resolved shared_module"));
-    }
-
-    #[test]
-    fn extractor_config_exposes_resolved_family_shared_module() {
-        let config = ExtractorConfig::new(
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            ImplementationType::Custom,
-            1000,
-            42,
-            None,
-            vec![],
-            "/tmp/member-only.spkg".to_string(),
-            "map_pool_events".to_string(),
-            vec![],
-            0,
-            None,
-            None,
-            HashMap::new(),
-            None,
-        )
-        .with_family_runtime(Some(FamilyRuntimeConfig {
-            family: "uniswap".to_string(),
-            shared_spkg: None,
-            shared_module: Some("map_uniswap_family_protocol_changes".to_string()),
-            durability_scope: None,
-        }));
-
-        assert_eq!(config.family_shared_module(), Some("map_uniswap_family_protocol_changes"));
-        assert_eq!(config.family_shared_spkg(), None);
-        let err = config
-            .require_family_shared_stream_target()
-            .expect_err("runtime build should reject unresolved family shared spkg");
-        assert!(err
-            .to_string()
-            .contains("uses family runtime `uniswap` without a resolved shared_spkg"));
-    }
-
-    #[test]
-    fn extractor_config_accepts_resolved_family_shared_stream_target_for_runtime_build() {
-        let config = ExtractorConfig::new(
-            "uniswap_v2".to_string(),
-            Chain::Ethereum,
-            ImplementationType::Custom,
-            1000,
-            42,
-            None,
-            vec![],
-            "/tmp/member-only.spkg".to_string(),
-            "map_pool_events".to_string(),
-            vec![],
-            0,
-            None,
-            None,
-            HashMap::new(),
-            None,
-        )
-        .with_family_runtime(Some(FamilyRuntimeConfig {
-            family: "uniswap".to_string(),
-            shared_spkg: Some("/tmp/family-runtime.spkg".to_string()),
-            shared_module: Some("map_uniswap_family_protocol_changes".to_string()),
-            durability_scope: Some("family::uniswap".to_string()),
-        }));
-
-        let target = config
-            .require_family_shared_stream_target()
-            .expect("resolved family target should be accepted")
-            .expect("family runtime target should be present");
-        assert_eq!(target.spkg, "/tmp/family-runtime.spkg");
-        assert_eq!(target.module, "map_uniswap_family_protocol_changes");
-    }
-
-    #[test]
-    fn test_resolved_family_execution_config_precomputes_shared_bootstrap_plan_and_start_block() {
-        let v2 = ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            start_block: 42,
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            bootstrap: Some(BootstrapConfig {
-                strategy: BootstrapStrategy::UniswapV2Rpc,
-                start_block: 42,
-                params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                    .to_owned(),
-            }),
-            ..Default::default()
-        };
-        let v3 = ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            start_block: 42,
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            bootstrap: Some(BootstrapConfig {
-                strategy: BootstrapStrategy::UniswapV3Rpc,
-                start_block: 42,
-                params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
-                    .to_owned(),
-            }),
-            ..Default::default()
-        };
-
-        let execution =
-            resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-                .expect("family execution config derives");
-
-        assert_eq!(execution.configured_start_block, 43);
-        let bootstrap_plan = execution
-            .bootstrap_plan
-            .as_ref()
-            .expect("shared bootstrap plan should be precomputed");
-        assert_eq!(bootstrap_plan.bootstrap_block, 42);
-        assert_eq!(bootstrap_plan.branches.len(), 2);
-        assert_eq!(bootstrap_plan.family_name.as_deref(), Some("uniswap"));
-    }
-
-    #[test]
-    fn test_resolved_family_execution_config_rejects_conflicting_stop_blocks() {
-        let v2 = ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            stop_block: Some(110),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-        let v3 = ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            stop_block: Some(120),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-
-        let err = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-            .expect_err("conflicting stop blocks should fail");
-
-        assert!(err
-            .to_string()
-            .contains("family runner requires one shared stop_block"));
-    }
-
-    #[test]
-    fn test_resolved_family_execution_config_rejects_conflicting_substreams_params() {
-        let v2 = ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_pool_events".to_string(),
-                "factory=0x01".to_string(),
-            )]),
-            ..Default::default()
-        };
-        let v3 = ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_pool_events".to_string(),
-                "factory=0x02".to_string(),
-            )]),
-            ..Default::default()
-        };
-
-        let err = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-            .expect_err("conflicting family params should fail");
-
-        assert!(err
-            .to_string()
-            .contains("conflicting substreams param `map_pool_events`"));
-    }
-
-    #[test]
-    fn test_validate_family_progress_consistency_allows_all_resumed_or_all_fresh() {
-        validate_family_progress_consistency(
-            &[("uniswap_v2".to_string(), 100), ("uniswap_v3".to_string(), 100)],
-            &[],
-            "before stream start",
-        )
-        .expect("all resumed should be allowed");
-
-        validate_family_progress_consistency(
-            &[],
-            &["uniswap_v2".to_string(), "uniswap_v3".to_string()],
-            "before bootstrap",
-        )
-        .expect("all fresh should be allowed");
-    }
-
-    #[test]
-    fn test_validate_family_progress_consistency_rejects_mixed_progress() {
-        let err = validate_family_progress_consistency(
-            &[("uniswap_v2".to_string(), 100)],
-            &["uniswap_v3".to_string()],
-            "before stream start",
-        )
-        .expect_err("mixed progress should fail");
-
-        assert!(err
-            .to_string()
-            .contains("family runner requires consistent branch progress before stream start"));
-    }
-
-    #[test]
-    fn test_validate_family_runner_membership_accepts_exact_member_set() {
-        let family = family_detected_runtime_for_tests(
-            "uniswap",
-            Chain::Ethereum,
-            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-        );
-        let v2 = ExtractorConfig {
-            name: "uniswap_v2".to_string(),
-            chain: Chain::Ethereum,
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-        let v3 = ExtractorConfig {
-            name: "uniswap_v3".to_string(),
-            chain: Chain::Ethereum,
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-
-        validate_family_runner_membership(&family, &[&v2, &v3])
-            .expect("exact family members should be accepted");
-    }
-
-    #[test]
-    fn test_validate_family_runner_membership_rejects_missing_or_extra_members() {
-        let family = family_detected_runtime_for_tests(
-            "uniswap",
-            Chain::Ethereum,
-            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-        );
-        let only_v2 = ExtractorConfig {
-            name: "uniswap_v2".to_string(),
-            chain: Chain::Ethereum,
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-        let curve = ExtractorConfig {
-            name: "curve".to_string(),
-            chain: Chain::Ethereum,
-            protocol_system: "curve".to_string(),
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "curve_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        };
-
-        let missing_err = validate_family_runner_membership(&family, &[&only_v2])
-            .expect_err("missing member should fail");
-        assert!(missing_err
-            .to_string()
-            .contains("requires exact member protocol systems"));
-
-        let extra_err = validate_family_runner_membership(&family, &[&only_v2, &curve])
-            .expect_err("extra non-family member should fail");
-        assert!(extra_err
-            .to_string()
-            .contains("requires exact member protocol systems"));
-    }
-
-    #[test]
-    fn test_validate_family_runner_membership_rejects_chain_mismatch() {
-        let family = family_detected_runtime_with_members_for_tests(
-            "uniswap",
-            Chain::Ethereum,
-            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-            ["uniswap_v2"],
-        );
-        let base_v2 = ExtractorConfig {
-            name: "base_v2".to_string(),
-            protocol_system: "uniswap_v2".to_string(),
-            chain: Chain::Base,
-            ..Default::default()
-        };
-
-        let err = validate_family_runner_membership(&family, &[&base_v2])
-            .expect_err("chain mismatch should fail");
-        assert!(err
-            .to_string()
-            .contains("requires chain `ethereum`, but extractor `base_v2` uses `base`"));
-    }
-
-    #[test]
-    fn test_validate_family_runner_membership_rejects_explicit_family_mismatch() {
-        let family = family_detected_runtime_with_members_for_tests(
-            "uniswap",
-            Chain::Ethereum,
-            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-            ["uniswap_v2"],
-        );
-        let wrong_family_v2 = ExtractorConfig {
-            name: "wrong_family_v2".to_string(),
-            protocol_system: "uniswap_v2".to_string(),
-            family_runtime: Some(FamilyRuntimeConfig {
-                family: "future_swap".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let err = validate_family_runner_membership(&family, &[&wrong_family_v2])
-            .expect_err("explicit family mismatch should fail");
-        assert!(err.to_string().contains(
-            "cannot include extractor `wrong_family_v2` declared for family `future_swap`"
-        ));
-    }
-
-    #[test]
-    fn test_validate_family_runner_membership_rejects_missing_protocol_types() {
-        let family = family_detected_runtime_with_members_for_tests(
-            "uniswap",
-            Chain::Ethereum,
-            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-            ["uniswap_v2"],
-        );
-        let typeless_v2 = ExtractorConfig {
-            name: "typeless_v2".to_string(),
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_types: vec![],
-            ..Default::default()
-        };
-
-        let err = validate_family_runner_membership(&family, &[&typeless_v2])
-            .expect_err("missing protocol types should fail");
-        assert!(err
-            .to_string()
-            .contains("requires extractor `typeless_v2` to declare at least one protocol type for branch routing"));
-    }
-
-    #[tokio::test]
-    async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() {
-        let plan = SharedBootstrapPlan {
-            family_name: Some("uniswap".to_string()),
-            bootstrap_block: 42,
-            branches: vec![
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v2".to_string(),
-                    protocol_system: "uniswap_v2".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV2Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-                crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                    extractor_name: "uniswap_v3".to_string(),
-                    protocol_system: "uniswap_v3".to_string(),
-                    chain: Chain::Ethereum,
-                    strategy: BootstrapStrategy::UniswapV3Rpc,
-                    params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                        bootstrap_block: 42,
-                        pools: vec![],
-                    },
-                },
-            ],
-        };
-
-        let block = Block {
-            number: 42,
-            hash: Bytes::from(vec![0x01; 32]),
-            parent_hash: Bytes::from(vec![0x02; 32]),
-            chain: Chain::Ethereum,
-            ts: chrono::NaiveDateTime::default(),
-        };
-        let tx = tycho_common::models::blockchain::Transaction {
-            hash: Bytes::from(vec![0xaa; 32]),
-            block_hash: block.hash.clone(),
-            from: Bytes::from(vec![0x11; 20]),
-            to: None,
-            index: 0,
-        };
-        let merged_changes = crate::extractor::models::BlockChanges::new(
-            "uniswap_family".to_string(),
-            Chain::Ethereum,
-            block.clone(),
-            42,
-            false,
-            vec![tycho_common::models::blockchain::TxWithChanges {
-                tx: tx.clone(),
-                protocol_components: HashMap::from([
-                    (
-                        "v2-pool".to_string(),
-                        tycho_common::models::protocol::ProtocolComponent {
-                            id: "v2-pool".to_string(),
-                            protocol_system: "uniswap_v2".to_string(),
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        "v3-pool".to_string(),
-                        tycho_common::models::protocol::ProtocolComponent {
-                            id: "v3-pool".to_string(),
-                            protocol_system: "uniswap_v3".to_string(),
-                            ..Default::default()
-                        },
-                    ),
-                ]),
-                ..Default::default()
-            }],
-            vec![],
+        let handle_names = handles
+            .into_iter()
+            .map(|handle| handle.get_id().name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            handle_names,
+            HashSet::from(["uniswap_v2_alias".to_string(), "uniswap_v3_alias".to_string()]),
+            "family-owned build surface should emit one handle per branch identity"
         );
 
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(None));
-        v2.expect_handle_block_changes()
-            .once()
-            .returning(|changes, cursor| {
-                assert_eq!(cursor, "bootstrap@42");
-                assert_eq!(changes.txs_with_update.len(), 1);
-                assert_eq!(
-                    changes.txs_with_update[0]
-                        .protocol_components
-                        .len(),
-                    1
-                );
-                assert!(changes.txs_with_update[0]
-                    .protocol_components
-                    .contains_key("v2-pool"));
-                Ok(None)
-            });
-        v2.expect_flush()
-            .once()
-            .returning(|| Ok(()));
-        v2.expect_mark_bootstrap_completed()
-            .once()
-            .returning(|bootstrap_block, block_hash| {
-                assert_eq!(bootstrap_block, 42);
-                assert_eq!(block_hash, Bytes::from(vec![0x01; 32]));
-                Ok(())
-            });
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_handle_block_changes()
-            .once()
-            .returning(|changes, cursor| {
-                assert_eq!(cursor, "bootstrap@42");
-                assert_eq!(changes.txs_with_update.len(), 1);
-                assert_eq!(
-                    changes.txs_with_update[0]
-                        .protocol_components
-                        .len(),
-                    1
-                );
-                assert!(changes.txs_with_update[0]
-                    .protocol_components
-                    .contains_key("v3-pool"));
-                Ok(None)
-            });
-        v3.expect_flush()
-            .once()
-            .returning(|| Ok(()));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        apply_family_bootstrap_plan(&extractors, &plan, merged_changes)
-            .await
-            .expect("shared family bootstrap should apply");
-    }
-
-    #[tokio::test]
-    async fn test_apply_family_bootstrap_plan_skips_completed_family() {
-        let plan = SharedBootstrapPlan {
-            family_name: Some("uniswap".to_string()),
-            bootstrap_block: 42,
-            branches: vec![crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                extractor_name: "uniswap_v2".to_string(),
-                protocol_system: "uniswap_v2".to_string(),
-                chain: Chain::Ethereum,
-                strategy: BootstrapStrategy::UniswapV2Rpc,
-                params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                    bootstrap_block: 42,
-                    pools: vec![],
-                },
-            }],
+        let ManagedRunner::Family(runner) = runner else {
+            panic!("family startup should assemble a family managed runner");
         };
-        let block = Block {
-            number: 42,
-            hash: Bytes::from(vec![0x01; 32]),
-            parent_hash: Bytes::from(vec![0x02; 32]),
-            chain: Chain::Ethereum,
-            ts: chrono::NaiveDateTime::default(),
-        };
-        let merged_changes = crate::extractor::models::BlockChanges::new(
-            "uniswap_family".to_string(),
-            Chain::Ethereum,
-            block,
-            42,
-            false,
-            vec![tycho_common::models::blockchain::TxWithChanges {
-                tx: tycho_common::models::blockchain::Transaction {
-                    hash: Bytes::from(vec![0xaa; 32]),
-                    block_hash: Bytes::from(vec![0x01; 32]),
-                    from: Bytes::from(vec![0x11; 20]),
-                    to: None,
-                    index: 0,
-                },
-                protocol_components: HashMap::from([(
-                    "v2-pool".to_string(),
-                    tycho_common::models::protocol::ProtocolComponent {
-                        id: "v2-pool".to_string(),
-                        protocol_system: "uniswap_v2".to_string(),
-                        ..Default::default()
-                    },
-                )]),
-                ..Default::default()
-            }],
-            vec![],
+        assert_eq!(
+            runner
+                .extractors
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()]),
+            "family-owned build surface should preserve protocol_system keyed extractors"
         );
-
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> =
-            HashMap::from([("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>)]);
-
-        apply_family_bootstrap_plan(&extractors, &plan, merged_changes)
-            .await
-            .expect("completed family bootstrap should be skipped cleanly");
-    }
-
-    #[tokio::test]
-    async fn test_apply_family_bootstrap_plan_rejects_missing_branch_extractor() {
-        let plan = SharedBootstrapPlan {
-            family_name: Some("uniswap".to_string()),
-            bootstrap_block: 42,
-            branches: vec![crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
-                extractor_name: "uniswap_v2_alias".to_string(),
-                protocol_system: "uniswap_v2".to_string(),
-                chain: Chain::Ethereum,
-                strategy: BootstrapStrategy::UniswapV2Rpc,
-                params: crate::extractor::shared_bootstrap::SharedBootstrapParams {
-                    bootstrap_block: 42,
-                    pools: vec![],
-                },
-            }],
-        };
-        let block = Block {
-            number: 42,
-            hash: Bytes::from(vec![0x01; 32]),
-            parent_hash: Bytes::from(vec![0x02; 32]),
-            chain: Chain::Ethereum,
-            ts: chrono::NaiveDateTime::default(),
-        };
-        let merged_changes = crate::extractor::models::BlockChanges::new(
-            "uniswap_family".to_string(),
-            Chain::Ethereum,
-            block,
-            42,
-            false,
-            vec![],
-            vec![],
+        assert_eq!(
+            runner
+                .subscriptions
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()]),
+            "family-owned build surface should preserve protocol_system keyed subscriptions"
         );
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::new();
-
-        let err = apply_family_bootstrap_plan(&extractors, &plan, merged_changes)
-            .await
-            .expect_err("missing branch extractor should fail");
-
-        assert!(err
-            .to_string()
-            .contains("missing family bootstrap extractor for uniswap_v2"));
-    }
-
-    #[tokio::test]
-    async fn test_family_bootstrap_already_completed_rejects_mixed_completion_state() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(None));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let err = family_bootstrap_already_completed(&extractors, 42)
-            .await
-            .expect_err("mixed bootstrap completion state should fail");
-
-        assert!(err.to_string().contains(
-            "family runner requires consistent shared bootstrap completion before bootstrap run"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_family_bootstrap_already_completed_rejects_misaligned_completed_blocks() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(42)));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(43)));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let err = family_bootstrap_already_completed(&extractors, 42)
-            .await
-            .expect_err("misaligned bootstrap completion blocks should fail");
-
-        assert!(err
-            .to_string()
-            .contains("family runner requires aligned shared bootstrap completion blocks"));
-    }
-
-    #[tokio::test]
-    async fn test_family_bootstrap_already_completed_rejects_configured_block_drift() {
-        let mut v2 = MockExtractor::new();
-        v2.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(43)));
-
-        let mut v3 = MockExtractor::new();
-        v3.expect_get_completed_bootstrap_block()
-            .once()
-            .returning(|| Ok(Some(43)));
-
-        let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
-            ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
-            ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
-        ]);
-
-        let err = family_bootstrap_already_completed(&extractors, 42)
-            .await
-            .expect_err("configured bootstrap block drift should fail");
-
-        assert!(err.to_string().contains(
-            "requires configured shared bootstrap block `42` to match persisted completed bootstrap block `43`"
-        ));
     }
 
     #[test]

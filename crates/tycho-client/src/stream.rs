@@ -71,9 +71,14 @@ pub struct TychoStreamBuilder {
     compression: bool,
     partial_blocks: bool,
     max_messages: Option<usize>,
+    ws_buffer_size: usize,
+    subscription_buffer_size: usize,
 }
 
 impl TychoStreamBuilder {
+    const WS_BUFFER_SIZE_ENV: &str = "TYCHO_STREAM_WS_BUFFER_SIZE";
+    const SUBSCRIPTION_BUFFER_SIZE_ENV: &str = "TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE";
+
     /// Creates a new `TychoStreamBuilder` with the given Tycho URL and blockchain network.
     /// Initializes the builder with default values for block time and timeout based on the chain.
     pub fn new(tycho_url: &str, chain: Chain) -> Self {
@@ -102,6 +107,48 @@ impl TychoStreamBuilder {
             compression: true,
             partial_blocks: false,
             max_messages: None,
+            ws_buffer_size: Self::parse_buffer_size_override(
+                env::var(Self::WS_BUFFER_SIZE_ENV)
+                    .ok()
+                    .as_deref(),
+                Self::WS_BUFFER_SIZE_ENV,
+                WsDeltasClient::DEFAULT_WS_BUFFER_SIZE,
+            ),
+            subscription_buffer_size: Self::parse_buffer_size_override(
+                env::var(Self::SUBSCRIPTION_BUFFER_SIZE_ENV)
+                    .ok()
+                    .as_deref(),
+                Self::SUBSCRIPTION_BUFFER_SIZE_ENV,
+                WsDeltasClient::DEFAULT_SUBSCRIPTION_BUFFER_SIZE,
+            ),
+        }
+    }
+
+    fn parse_buffer_size_override(raw: Option<&str>, env_name: &str, default: usize) -> usize {
+        match raw {
+            Some(value) => match value.parse::<usize>() {
+                Ok(0) => {
+                    warn!(
+                        env_name,
+                        raw = value,
+                        default,
+                        "Ignoring zero-valued Tycho stream buffer override",
+                    );
+                    default
+                }
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    warn!(
+                        env_name,
+                        raw = value,
+                        default,
+                        %error,
+                        "Ignoring invalid Tycho stream buffer override",
+                    );
+                    default
+                }
+            },
+            None => default,
         }
     }
 
@@ -186,6 +233,24 @@ impl TychoStreamBuilder {
     pub fn auth_key(mut self, auth_key: Option<String>) -> Self {
         self.auth_key = auth_key;
         self.no_tls = false;
+        self
+    }
+
+    /// Overrides the internal websocket command-channel buffer size.
+    ///
+    /// This controls how many pending websocket-side commands can be queued before senders
+    /// backpressure.
+    pub fn ws_buffer_size(mut self, ws_buffer_size: usize) -> Self {
+        self.ws_buffer_size = ws_buffer_size;
+        self
+    }
+
+    /// Overrides the per-subscription delta buffer size.
+    ///
+    /// This controls how many block updates each subscription may queue before the websocket
+    /// client force-unsubscribes that lagging consumer.
+    pub fn subscription_buffer_size(mut self, subscription_buffer_size: usize) -> Self {
+        self.subscription_buffer_size = subscription_buffer_size;
         self
     }
 
@@ -284,7 +349,10 @@ impl TychoStreamBuilder {
                 auth_key.as_deref(),
                 config.max_attempts,
                 config.cooldown,
-            ),
+            )
+            .map(|client| {
+                client.with_buffer_sizes(self.ws_buffer_size, self.subscription_buffer_size)
+            }),
         }
         .map_err(|e| StreamError::SetUpError(e.to_string()))?;
         let rpc_client = HttpRPCClient::new(
@@ -511,6 +579,39 @@ mod tests {
         let builder = TychoStreamBuilder::new("localhost:4242", Chain::Ethereum);
         assert!(builder.compression, "Compression should be enabled by default.");
         assert!(!builder.partial_blocks, "partial_blocks should be disabled by default.");
+        assert_eq!(builder.ws_buffer_size, WsDeltasClient::DEFAULT_WS_BUFFER_SIZE);
+        assert_eq!(
+            builder.subscription_buffer_size,
+            WsDeltasClient::DEFAULT_SUBSCRIPTION_BUFFER_SIZE
+        );
+    }
+
+    #[test]
+    fn test_parse_buffer_size_override_uses_default_for_invalid_values() {
+        assert_eq!(
+            TychoStreamBuilder::parse_buffer_size_override(
+                Some("invalid"),
+                "TEST_ENV",
+                WsDeltasClient::DEFAULT_WS_BUFFER_SIZE
+            ),
+            WsDeltasClient::DEFAULT_WS_BUFFER_SIZE
+        );
+        assert_eq!(
+            TychoStreamBuilder::parse_buffer_size_override(
+                Some("0"),
+                "TEST_ENV",
+                WsDeltasClient::DEFAULT_SUBSCRIPTION_BUFFER_SIZE
+            ),
+            WsDeltasClient::DEFAULT_SUBSCRIPTION_BUFFER_SIZE
+        );
+    }
+
+    #[test]
+    fn test_parse_buffer_size_override_accepts_positive_values() {
+        assert_eq!(
+            TychoStreamBuilder::parse_buffer_size_override(Some("512"), "TEST_ENV", 128),
+            512
+        );
     }
 
     #[tokio::test]

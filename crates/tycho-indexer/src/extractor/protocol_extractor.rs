@@ -46,6 +46,10 @@ use crate::{
         models::BlockChanges,
         protobuf_deserialisation::TryFromMessage,
         protocol_cache::{ProtocolDataCache, ProtocolMemoryCache},
+        protocol_message_registry::{
+            decode_auxiliary_protocol_message, decode_auxiliary_protocol_message_with_decoders,
+            AuxiliaryProtocolMessage, AuxiliaryProtocolMessageDecoder,
+        },
         reorg_buffer::ReorgBuffer,
         u256_num::bytes_to_f64,
         uniswap_v3_stream::{self, events::pool_event},
@@ -93,6 +97,7 @@ pub struct ProtocolExtractor<G, T, E> {
     protocol_cache: ProtocolMemoryCache,
     inner: Arc<Mutex<Inner>>,
     protocol_types: HashMap<String, ProtocolType>,
+    auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
     /// Allows to attach some custom logic, e.g. to fix encoding bugs without resync.
     post_processor: Option<fn(BlockChanges) -> BlockChanges>,
     reorg_buffer: Mutex<ReorgBuffer<BlockUpdateWithCursor<BlockChanges>>>,
@@ -130,7 +135,7 @@ where
     E: ExtractorExtension,
 {
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub(crate) async fn new(
         gateway: G,
         database_insert_batch_size: usize,
         name: &str,
@@ -139,6 +144,7 @@ where
         protocol_system: String,
         protocol_cache: ProtocolMemoryCache,
         protocol_types: HashMap<String, ProtocolType>,
+        auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
         token_pre_processor: T,
         post_processor: Option<fn(BlockChanges) -> BlockChanges>,
         dci_plugin: Option<E>,
@@ -170,6 +176,8 @@ where
                         first_message_processed: false,
                     })),
                     protocol_types,
+                    auxiliary_protocol_message_decoders:
+                        auxiliary_protocol_message_decoders.clone(),
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
                     in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
@@ -216,6 +224,8 @@ where
                     protocol_cache,
                     token_pre_processor,
                     protocol_types,
+                    auxiliary_protocol_message_decoders:
+                        auxiliary_protocol_message_decoders.clone(),
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
                     in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
@@ -1247,6 +1257,25 @@ where
         Ok(changes)
     }
 
+    async fn build_block_changes_from_auxiliary_protocol_message(
+        &self,
+        message: AuxiliaryProtocolMessage,
+        final_block_height: u64,
+        partial_index: Option<u32>,
+    ) -> Result<BlockChanges, ExtractionError> {
+        match message {
+            AuxiliaryProtocolMessage::UniswapV3Events(raw_events) => {
+                trace!(n_events = raw_events.pool_events.len(), "Received uniswap_v3 Events message");
+                self.build_uniswap_v3_block_changes_from_events(
+                    raw_events,
+                    final_block_height,
+                    partial_index,
+                )
+                .await
+            }
+        }
+    }
+
     async fn get_protocol_state_values_at_tip(
         &self,
         keys: &[(String, String)],
@@ -2114,20 +2143,37 @@ where
                 inp.final_block_height,
                 inp.partial_index,
             ))
-        } else if data.type_url.ends_with("Events") && self.protocol_system == "uniswap_v3" {
-            let raw_events = uniswap_v3_stream::Events::decode(data.value.as_slice())?;
-            trace!(n_events = raw_events.pool_events.len(), "Received uniswap_v3 Events message");
-            self.build_uniswap_v3_block_changes_from_events(
-                raw_events,
-                inp.final_block_height,
-                inp.partial_index,
-            )
-            .await
         } else {
-            return Err(ExtractionError::DecodeError(format!(
-                "Unknown message type: {}",
-                data.type_url
-            )));
+            match decode_auxiliary_protocol_message_with_decoders(
+                &self.auxiliary_protocol_message_decoders,
+                &self.protocol_system,
+                &data.type_url,
+                data.value.as_slice(),
+            )?
+            .or_else(|| {
+                decode_auxiliary_protocol_message(
+                    &self.protocol_system,
+                    &data.type_url,
+                    data.value.as_slice(),
+                )
+                .ok()
+                .flatten()
+            }) {
+                Some(message) => {
+                    self.build_block_changes_from_auxiliary_protocol_message(
+                        message,
+                        inp.final_block_height,
+                        inp.partial_index,
+                    )
+                    .await
+                }
+                None => {
+                    return Err(ExtractionError::DecodeError(format!(
+                        "Unknown message type: {}",
+                        data.type_url
+                    )));
+                }
+            }
         };
 
         let msg = match msg {
@@ -3403,6 +3449,15 @@ mod test {
         batch_size: usize,
     ) -> ProtocolExtractor<MockExtractorGateway, MockTokenPreProcessor, MockExtractorExtension>
     {
+        create_extractor_with_batch_size_and_protocol_system(gw, batch_size, TEST_PROTOCOL).await
+    }
+
+    async fn create_extractor_with_batch_size_and_protocol_system(
+        gw: MockExtractorGateway,
+        batch_size: usize,
+        protocol_system: &str,
+    ) -> ProtocolExtractor<MockExtractorGateway, MockTokenPreProcessor, MockExtractorExtension>
+    {
         let protocol_types = HashMap::from([("pt_1".to_string(), ProtocolType::default())]);
         let protocol_cache = ProtocolMemoryCache::new(
             Chain::Ethereum,
@@ -3413,15 +3468,21 @@ mod test {
         preprocessor
             .expect_get_tokens()
             .returning(|_, _, _| Vec::new());
+        let auxiliary_protocol_message_decoders =
+            crate::extractor::family_runtime::default_family_runtime_registry()
+                .auxiliary_protocol_message_decoders_for_protocol_system(protocol_system)
+                .map(|decoders| decoders.to_vec())
+                .unwrap_or_default();
         ProtocolExtractor::new(
             gw,
             batch_size,
             EXTRACTOR_NAME,
             Chain::Ethereum,
             ChainState::default(),
-            TEST_PROTOCOL.to_string(),
+            protocol_system.to_string(),
             protocol_cache,
             protocol_types,
+            auxiliary_protocol_message_decoders,
             preprocessor,
             None,
             None,
@@ -3437,6 +3498,14 @@ mod test {
         // Default value that flushes the buffer once a single finalized block lands in the buffer.
         // This behavior is consistent with flushing on every finalized block.
         create_extractor_with_batch_size(gw, 1).await
+    }
+
+    fn decode_future_family_events_for_tests(
+        value: &[u8],
+    ) -> Result<AuxiliaryProtocolMessage, ExtractionError> {
+        Ok(AuxiliaryProtocolMessage::UniswapV3Events(
+            uniswap_v3_stream::Events::decode(value)?,
+        ))
     }
 
     fn uniswap_v3_test_block() -> uniswap_v3_stream::Block {
@@ -3518,6 +3587,7 @@ mod test {
             TEST_PROTOCOL.to_string(),
             protocol_cache,
             HashMap::from([("pt_1".to_string(), ProtocolType::default())]),
+            vec![],
             preprocessor,
             None,
             None,
@@ -3942,9 +4012,7 @@ mod test {
         gw.expect_get_cursor()
             .times(1)
             .returning(|| Ok(("cursor".into(), Bytes::default())));
-        gw.expect_advance()
-            .times(1)
-            .returning(|_, _, _| Ok(()));
+        gw.expect_advance().times(0);
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
@@ -4256,6 +4324,263 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_handle_tick_scoped_data_routes_uniswap_v3_events_through_registry() {
+        let mut protocol_gw = MockGateway::new();
+        protocol_gw
+            .expect_get_protocol_components()
+            .times(1)
+            .return_once(|chain, protocol_system, ids, _, _| {
+                assert_eq!(*chain, Chain::Ethereum);
+                assert_eq!(protocol_system.as_deref(), Some("uniswap_v3"));
+                assert_eq!(
+                    ids,
+                    Some(&["0x9999999999999999999999999999999999999999"][..]),
+                    "registry-driven event path should query the touched pool through the protocol cache"
+                );
+                Box::pin(async {
+                    Ok(tycho_common::storage::WithTotal { entity: Vec::new(), total: None })
+                })
+            });
+        let protocol_cache = ProtocolMemoryCache::new(
+            Chain::Ethereum,
+            chrono::Duration::seconds(900),
+            Arc::new(protocol_gw),
+        );
+        let mut preprocessor = MockTokenPreProcessor::new();
+        preprocessor
+            .expect_get_tokens()
+            .returning(|_, _, _| Vec::new());
+
+        let mut gw = MockExtractorGateway::new();
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| Ok(()));
+        gw.expect_get_cursor()
+            .times(1)
+            .returning(|| Ok(("cursor".into(), Bytes::default())));
+        gw.expect_advance().times(0);
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+        gw.expect_get_components_balances()
+            .times(1)
+            .return_once(|component_ids| {
+                assert!(component_ids.is_empty(), "unknown pools should not request balances");
+                Ok(HashMap::new())
+            });
+
+        let extractor = ProtocolExtractor::<
+            MockExtractorGateway,
+            MockTokenPreProcessor,
+            MockExtractorExtension,
+        >::new(
+            gw,
+            1,
+            EXTRACTOR_NAME,
+            Chain::Ethereum,
+            ChainState::default(),
+            "uniswap_v3".to_string(),
+            protocol_cache,
+            HashMap::from([("pt_1".to_string(), ProtocolType::default())]),
+            crate::extractor::family_runtime::default_family_runtime_registry()
+                .auxiliary_protocol_message_decoders_for_protocol_system("uniswap_v3")
+                .map(|decoders| decoders.to_vec())
+                .unwrap_or_default(),
+            preprocessor,
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to create extractor");
+        let events = uniswap_v3_stream::Events {
+            block: Some(uniswap_v3_test_block()),
+            pool_events: vec![uniswap_v3_stream::events::PoolEvent {
+                log_ordinal: 1,
+                pool_address: "0x9999999999999999999999999999999999999999".to_string(),
+                token0: String::new(),
+                token1: String::new(),
+                transaction: Some(uniswap_v3_test_tx(
+                    "0x5000000000000000000000000000000000000000000000000000000000000000",
+                    0,
+                )),
+                r#type: Some(pool_event::Type::Initialize(pool_event::Initialize {
+                    sqrt_price: "1".to_string(),
+                    tick: 1,
+                })),
+            }],
+        };
+        let data = {
+            use crate::pb::sf::substreams::{rpc::v2::*, v1::Clock};
+            BlockScopedData {
+                output: Some(MapModuleOutput {
+                    name: "map_pool_events".to_owned(),
+                    map_output: Some(prost_types::Any {
+                        type_url: "type.googleapis.com/tycho.evm.uniswap.v3.Events".to_owned(),
+                        value: events.encode_to_vec(),
+                    }),
+                    debug_info: None,
+                }),
+                clock: Some(Clock {
+                    id: "0x1000000000000000000000000000000000000000000000000000000000000000"
+                        .to_owned(),
+                    number: 10,
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: 1_700_000_000,
+                        nanos: 0,
+                    }),
+                }),
+                cursor: "cursor@10".to_owned(),
+                final_block_height: 10,
+                debug_map_outputs: vec![],
+                debug_store_outputs: vec![],
+                attestation: "test".to_owned(),
+                is_partial: false,
+                partial_index: None,
+                is_last_partial: None,
+            }
+        };
+
+        let result = extractor
+            .handle_tick_scoped_data(data)
+            .await
+            .expect("registered uniswap_v3 Events payload should decode");
+
+        assert!(
+            result.is_some(),
+            "unknown-pool Events payload should still round-trip through the registry-backed extractor path"
+        );
+
+        assert_eq!(extractor.get_cursor().await, "cursor@10");
+    }
+
+    #[tokio::test]
+    async fn test_handle_tick_scoped_data_routes_custom_family_events_through_injected_decoders() {
+        let mut protocol_gw = MockGateway::new();
+        protocol_gw
+            .expect_get_protocol_components()
+            .times(1)
+            .return_once(|chain, protocol_system, ids, _, _| {
+                assert_eq!(*chain, Chain::Ethereum);
+                assert_eq!(protocol_system.as_deref(), Some("future_v1"));
+                assert_eq!(
+                    ids,
+                    Some(&["0x9999999999999999999999999999999999999999"][..]),
+                    "custom decoder path should query the touched pool through the protocol cache"
+                );
+                Box::pin(async {
+                    Ok(tycho_common::storage::WithTotal { entity: Vec::new(), total: None })
+                })
+            });
+        let protocol_cache = ProtocolMemoryCache::new(
+            Chain::Ethereum,
+            chrono::Duration::seconds(900),
+            Arc::new(protocol_gw),
+        );
+        let mut preprocessor = MockTokenPreProcessor::new();
+        preprocessor
+            .expect_get_tokens()
+            .returning(|_, _, _| Vec::new());
+
+        let mut gw = MockExtractorGateway::new();
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| Ok(()));
+        gw.expect_get_cursor()
+            .times(1)
+            .returning(|| Ok(("cursor".into(), Bytes::default())));
+        gw.expect_advance().times(0);
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+        gw.expect_get_components_balances()
+            .times(1)
+            .return_once(|component_ids| {
+                assert!(component_ids.is_empty(), "unknown pools should not request balances");
+                Ok(HashMap::new())
+            });
+
+        let extractor = ProtocolExtractor::<
+            MockExtractorGateway,
+            MockTokenPreProcessor,
+            MockExtractorExtension,
+        >::new(
+            gw,
+            1,
+            EXTRACTOR_NAME,
+            Chain::Ethereum,
+            ChainState::default(),
+            "future_v1".to_string(),
+            protocol_cache,
+            HashMap::from([("pt_1".to_string(), ProtocolType::default())]),
+            vec![AuxiliaryProtocolMessageDecoder {
+                protocol_system: "future_v1",
+                type_url_suffix: "FutureEvents",
+                decode: decode_future_family_events_for_tests,
+            }],
+            preprocessor,
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to create extractor");
+        let events = uniswap_v3_stream::Events {
+            block: Some(uniswap_v3_test_block()),
+            pool_events: vec![uniswap_v3_stream::events::PoolEvent {
+                log_ordinal: 1,
+                pool_address: "0x9999999999999999999999999999999999999999".to_string(),
+                token0: String::new(),
+                token1: String::new(),
+                transaction: Some(uniswap_v3_test_tx(
+                    "0x5000000000000000000000000000000000000000000000000000000000000000",
+                    0,
+                )),
+                r#type: Some(pool_event::Type::Initialize(pool_event::Initialize {
+                    sqrt_price: "1".to_string(),
+                    tick: 1,
+                })),
+            }],
+        };
+        let data = {
+            use crate::pb::sf::substreams::{rpc::v2::*, v1::Clock};
+            BlockScopedData {
+                output: Some(MapModuleOutput {
+                    name: "map_pool_events".to_owned(),
+                    map_output: Some(prost_types::Any {
+                        type_url: "type.googleapis.com/future.swap.FutureEvents".to_owned(),
+                        value: events.encode_to_vec(),
+                    }),
+                    debug_info: None,
+                }),
+                clock: Some(Clock {
+                    id: "0x1000000000000000000000000000000000000000000000000000000000000000"
+                        .to_owned(),
+                    number: 10,
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: 1_700_000_000,
+                        nanos: 0,
+                    }),
+                }),
+                cursor: "cursor@10".to_owned(),
+                final_block_height: 10,
+                debug_map_outputs: vec![],
+                debug_store_outputs: vec![],
+                attestation: "test".to_owned(),
+                is_partial: false,
+                partial_index: None,
+                is_last_partial: None,
+            }
+        };
+
+        let result = extractor
+            .handle_tick_scoped_data(data)
+            .await
+            .expect("custom injected auxiliary decoder should decode");
+
+        assert!(result.is_some());
+        assert_eq!(extractor.get_cursor().await, "cursor@10");
+    }
+
+    #[tokio::test]
     async fn test_handle_tick_scoped_data_skip() {
         let mut gw = MockExtractorGateway::new();
         gw.expect_ensure_protocol_types()
@@ -4557,6 +4882,7 @@ mod test {
             TEST_PROTOCOL.to_string(),
             protocol_cache,
             HashMap::from([("pt_1".to_string(), ProtocolType::default())]),
+            vec![],
             preprocessor,
             None,
             None,
@@ -4691,6 +5017,7 @@ mod test {
             "system1".to_string(),
             protocol_cache,
             HashMap::from([("pt_1".to_string(), ProtocolType::default())]),
+            vec![],
             preprocessor,
             None,
             None,
@@ -5802,6 +6129,74 @@ mod test_serial_db {
     }
 
     #[tokio::test]
+    async fn test_shared_bootstrap_state_is_visible_across_family_branch_gateways() {
+        run_against_db(|pool| async move {
+            let (legacy_gw, _) = setup_gw(pool, ImplementationType::Vm).await;
+            let writer_gw = ExtractorPgGateway::new(
+                "uniswap_v2",
+                Chain::Ethereum,
+                1000,
+                legacy_gw.state_gateway.clone(),
+                Some("family::uniswap".to_string()),
+            );
+            let reader_gw = ExtractorPgGateway::new(
+                "uniswap_v3",
+                Chain::Ethereum,
+                1000,
+                legacy_gw.state_gateway.clone(),
+                Some("family::uniswap".to_string()),
+            );
+            let block_hash =
+                Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
+                    .unwrap();
+            let block = Block {
+                number: 42,
+                chain: Chain::Ethereum,
+                hash: block_hash.clone(),
+                parent_hash: Bytes::default(),
+                ts: db_fixtures::yesterday_half_past_midnight(),
+            };
+
+            writer_gw
+                .state_gateway
+                .start_transaction(&block, None)
+                .await;
+            writer_gw
+                .state_gateway
+                .upsert_block(&[block])
+                .await
+                .expect("block insertion succeeded");
+            writer_gw
+                .state_gateway
+                .commit_transaction(0)
+                .await
+                .expect("gw transaction failed");
+
+            writer_gw
+                .save_bootstrap_state(42, block_hash)
+                .await
+                .expect("writer should persist shared bootstrap state");
+
+            let state = reader_gw
+                .get_bootstrap_state()
+                .await
+                .expect("reader bootstrap lookup should succeed")
+                .expect("reader should see shared bootstrap state written by another branch");
+
+            assert_eq!(state.name, "family::uniswap::bootstrap");
+            assert_eq!(state.cursor, b"bootstrap_completed");
+            assert_eq!(
+                state
+                    .attributes
+                    .get("bootstrap_block")
+                    .and_then(|value| value.as_u64()),
+                Some(42)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_save_cursor_uses_shared_scope_when_configured() {
         run_against_db(|pool| async move {
             let (legacy_gw, _) = setup_gw(pool, ImplementationType::Vm).await;
@@ -6235,6 +6630,7 @@ mod test_serial_db {
                 "native_protocol_system".to_string(),
                 protocol_cache,
                 protocol_types,
+                vec![],
                 get_mocked_token_pre_processor(),
                 None,
                 None,
@@ -6422,6 +6818,7 @@ mod test_serial_db {
                 "vm_protocol_system".to_string(),
                 protocol_cache,
                 protocol_types,
+                vec![],
                 preprocessor,
                 None,
                 None,
@@ -6627,6 +7024,7 @@ mod test_serial_db {
                 "vm_protocol_system".to_string(),
                 protocol_cache,
                 protocol_types,
+                vec![],
                 preprocessor,
                 None,
                 None,

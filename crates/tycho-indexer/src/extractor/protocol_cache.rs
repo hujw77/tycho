@@ -199,6 +199,50 @@ impl ProtocolMemoryCache {
             })
             .collect()
     }
+
+    pub async fn ensure_protocol_components_by_id(
+        &self,
+        component_ids: &HashSet<ComponentId>,
+    ) -> Result<HashMap<ComponentId, ProtocolComponent>, StorageError> {
+        let mut resolved = HashMap::new();
+        let mut missing = HashSet::new();
+
+        {
+            let components = self.components.read().await;
+            for component_id in component_ids {
+                let found = components
+                    .values()
+                    .find_map(|by_system| by_system.get(component_id).cloned());
+                if let Some(component) = found {
+                    resolved.insert(component_id.clone(), component);
+                } else {
+                    missing.insert(component_id.clone());
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            let requested_ids = missing
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let fetched = self
+                .gateway
+                .get_protocol_components(&self.chain, None, Some(&requested_ids), None, None)
+                .await?
+                .entity;
+
+            if !fetched.is_empty() {
+                self.add_components(fetched.clone())
+                    .await?;
+                for component in fetched {
+                    resolved.insert(component.id.clone(), component);
+                }
+            }
+        }
+
+        Ok(resolved)
+    }
 }
 
 #[async_trait]

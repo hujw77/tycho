@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use tycho_common::{
     models::{
@@ -16,7 +19,7 @@ use crate::extractor::{
     },
     models::{BlockChanges, TxWithContractChanges},
     runner::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
-    ExtractionError,
+    ExtractionError, Extractor,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +86,24 @@ pub struct SharedBootstrapPlan {
     pub branches: Vec<BootstrapBranchDescriptor>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BootstrapCompletionSnapshot {
+    pub completed_blocks: Vec<(String, u64)>,
+    pub missing_completion: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootstrapCompletionPolicy {
+    AllowRerunOnConfiguredDrift,
+    RequireConfiguredMatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootstrapCompletionDecision {
+    AlreadyCompleted,
+    NeedsBootstrap,
+}
+
 impl SharedBootstrapPlan {
     pub fn for_extractor_config(
         config: &ExtractorConfig,
@@ -113,94 +134,87 @@ impl SharedBootstrapPlan {
         configs: impl IntoIterator<Item = (&'a ExtractorConfig, &'a BootstrapConfig)>,
         registry: FamilyRuntimeRegistry<'_>,
     ) -> Result<Self, ExtractionError> {
-        let configs = configs.into_iter().collect::<Vec<_>>();
-        registry.validate()?;
-        let family_name = registry.resolve_shared_bootstrap_plan_family_name(&configs)?;
-
-        let mut branches = Vec::new();
-        let mut bootstrap_block = None;
-
-        for (config, bootstrap) in configs {
-            let params = parse_and_validate_bootstrap_params(config, bootstrap, registry)?;
-
-            if let Some(expected_block) = bootstrap_block {
-                if expected_block != params.bootstrap_block {
-                    return Err(ExtractionError::Setup(format!(
-                        "shared bootstrap plan requires one bootstrap_block, found {} and {}",
-                        expected_block, params.bootstrap_block
-                    )));
-                }
-            } else {
-                bootstrap_block = Some(params.bootstrap_block);
-            }
-
-            branches.push(BootstrapBranchDescriptor {
-                extractor_name: config.name().to_owned(),
-                protocol_system: config.protocol_system().to_owned(),
-                chain: config.chain(),
-                strategy: bootstrap.strategy.clone(),
-                params,
-            });
-        }
-
-        Ok(Self {
-            family_name,
-            bootstrap_block: bootstrap_block.ok_or_else(|| {
-                ExtractionError::Setup("shared bootstrap plan contained no extractors".to_string())
-            })?,
-            branches,
-        })
+        registry.build_shared_bootstrap_plan(configs)
     }
 }
 
-pub async fn materialize_branch_block(
-    rpc: &EthereumRpcClient,
-    branch: &BootstrapBranchDescriptor,
-) -> Result<BlockChanges, ExtractionError> {
-    materialize_branch_block_with_registry(rpc, branch, default_family_runtime_registry()).await
-}
-
-pub async fn materialize_branch_block_with_registry(
-    rpc: &EthereumRpcClient,
-    branch: &BootstrapBranchDescriptor,
-    registry: FamilyRuntimeRegistry<'_>,
-) -> Result<BlockChanges, ExtractionError> {
-    registry
-        .materialize_shared_bootstrap_branch(rpc, branch)?
-        .await
-}
-
-pub async fn materialize_plan_block(
-    rpc: &EthereumRpcClient,
-    plan: &SharedBootstrapPlan,
-) -> Result<BlockChanges, ExtractionError> {
-    materialize_plan_block_with_registry(rpc, plan, default_family_runtime_registry()).await
-}
-
-pub async fn materialize_plan_block_with_registry(
-    rpc: &EthereumRpcClient,
-    plan: &SharedBootstrapPlan,
-    registry: FamilyRuntimeRegistry<'_>,
-) -> Result<BlockChanges, ExtractionError> {
-    if let Some(family_name) = plan.family_name.as_deref() {
-        return registry
-            .materialize_shared_bootstrap_plan(family_name, rpc, plan)?
-            .await;
-    }
-
-    let mut merged = None;
-    for branch in &plan.branches {
-        let branch_changes = registry
-            .materialize_shared_bootstrap_branch(rpc, branch)?
-            .await?;
-        merged = Some(match merged {
-            Some(existing) => merge_family_block_changes(existing, branch_changes)?,
-            None => branch_changes,
-        });
-    }
-    merged.ok_or_else(|| {
-        ExtractionError::Setup("shared bootstrap plan contained no branches".to_string())
+pub(crate) fn configured_bootstrap_block(
+    start_block: i64,
+    owner_label: &str,
+) -> Result<u64, ExtractionError> {
+    u64::try_from(start_block).map_err(|_| {
+        ExtractionError::Setup(format!(
+            "bootstrap start_block must be non-negative for extractor `{owner_label}`"
+        ))
     })
+}
+
+pub(crate) fn decide_bootstrap_completion(
+    snapshot: &BootstrapCompletionSnapshot,
+    configured_block: u64,
+    owner_label: &str,
+    policy: BootstrapCompletionPolicy,
+) -> Result<BootstrapCompletionDecision, ExtractionError> {
+    if snapshot.completed_blocks.is_empty() {
+        return Ok(BootstrapCompletionDecision::NeedsBootstrap);
+    }
+
+    if !snapshot.missing_completion.is_empty() {
+        return Err(ExtractionError::Setup(format!(
+            "{owner_label} requires consistent shared bootstrap completion before bootstrap run; completed branches: {:?}, missing branches: {:?}",
+            snapshot.completed_blocks, snapshot.missing_completion
+        )));
+    }
+
+    let first_completed = snapshot.completed_blocks[0].1;
+    if snapshot
+        .completed_blocks
+        .iter()
+        .any(|(_, completed_block)| *completed_block != first_completed)
+    {
+        return Err(ExtractionError::Setup(format!(
+            "{owner_label} requires aligned shared bootstrap completion blocks, found {:?}",
+            snapshot.completed_blocks
+        )));
+    }
+
+    if first_completed == configured_block {
+        return Ok(BootstrapCompletionDecision::AlreadyCompleted);
+    }
+
+    match policy {
+        BootstrapCompletionPolicy::AllowRerunOnConfiguredDrift => {
+            Ok(BootstrapCompletionDecision::NeedsBootstrap)
+        }
+        BootstrapCompletionPolicy::RequireConfiguredMatch => Err(ExtractionError::Setup(
+            format!(
+                "{owner_label} requires configured shared bootstrap block `{configured_block}` to match persisted completed bootstrap block `{first_completed}`"
+            ),
+        )),
+    }
+}
+
+pub(crate) async fn commit_materialized_bootstrap(
+    branch_targets: Vec<(Arc<dyn Extractor>, BlockChanges)>,
+    completion_extractor: Arc<dyn Extractor>,
+    bootstrap_block: u64,
+    bootstrap_block_hash: Bytes,
+) -> Result<(), ExtractionError> {
+    if branch_targets.is_empty() {
+        return Ok(());
+    }
+
+    let cursor = format!("bootstrap@{bootstrap_block}");
+    for (extractor, changes) in branch_targets {
+        extractor
+            .handle_block_changes(changes, cursor.clone())
+            .await?;
+        extractor.flush().await?;
+    }
+
+    completion_extractor
+        .mark_bootstrap_completed(bootstrap_block, bootstrap_block_hash)
+        .await
 }
 
 pub(crate) async fn materialize_plan_by_branch_runtimes(
@@ -641,7 +655,7 @@ pub(crate) fn merge_family_block_changes(
     Ok(existing)
 }
 
-fn parse_and_validate_bootstrap_params(
+pub(crate) fn parse_and_validate_bootstrap_params(
     config: &ExtractorConfig,
     bootstrap: &BootstrapConfig,
     registry: FamilyRuntimeRegistry<'_>,
@@ -721,7 +735,9 @@ mod tests {
     };
 
     use super::{
-        merge_family_block_changes, split_plan_block_by_protocol_system, BootstrapBranchDescriptor,
+        decide_bootstrap_completion, merge_family_block_changes,
+        split_plan_block_by_protocol_system, BootstrapBranchDescriptor,
+        BootstrapCompletionDecision, BootstrapCompletionPolicy, BootstrapCompletionSnapshot,
         SharedBootstrapParams, SharedBootstrapPlan,
     };
 
@@ -917,7 +933,7 @@ mod tests {
             None,
         )
         .with_protocol_system("uniswap_v2")
-        .with_family_runtime(Some(crate::extractor::runner::FamilyRuntimeConfig {
+        .with_family_runtime(Some(crate::extractor::family_runtime::FamilyRuntimeConfig {
             family: "uniswap".to_string(),
             ..Default::default()
         }));
@@ -939,7 +955,7 @@ mod tests {
             None,
         )
         .with_protocol_system("future_v1")
-        .with_family_runtime(Some(crate::extractor::runner::FamilyRuntimeConfig {
+        .with_family_runtime(Some(crate::extractor::family_runtime::FamilyRuntimeConfig {
             family: "future_swap".to_string(),
             ..Default::default()
         }));
@@ -1045,7 +1061,7 @@ mod tests {
             None,
         )
         .with_protocol_system("uniswap_v2")
-        .with_family_runtime(Some(crate::extractor::runner::FamilyRuntimeConfig {
+        .with_family_runtime(Some(crate::extractor::family_runtime::FamilyRuntimeConfig {
             family: "uniswap".to_string(),
             ..Default::default()
         }));
@@ -1146,6 +1162,7 @@ mod tests {
             shared_stream_name: "future_swap_family",
             durability_scope: "family::future_swap",
             shared_bootstrap_runtime: None,
+            auxiliary_protocol_message_decoders: &[],
         };
         let registry = FamilyRuntimeRegistry::new(&[INVALID_FUTURE_FAMILY]);
         let future_config = ExtractorConfig::new(
@@ -1698,5 +1715,42 @@ mod tests {
             vec![v3_contract.clone()]
         );
         assert_eq!(split["uniswap_v2"].trace_results[0].entry_point_id(), v2_entrypoint_id);
+    }
+
+    #[test]
+    fn bootstrap_completion_decision_allows_single_extractor_rerun_on_configured_drift() {
+        let decision = decide_bootstrap_completion(
+            &BootstrapCompletionSnapshot {
+                completed_blocks: vec![("uniswap_v3".to_string(), 41)],
+                missing_completion: Vec::new(),
+            },
+            42,
+            "extractor",
+            BootstrapCompletionPolicy::AllowRerunOnConfiguredDrift,
+        )
+        .expect("single-extractor drift should rerun instead of failing");
+
+        assert_eq!(decision, BootstrapCompletionDecision::NeedsBootstrap);
+    }
+
+    #[test]
+    fn bootstrap_completion_decision_requires_exact_match_for_shared_family() {
+        let err = decide_bootstrap_completion(
+            &BootstrapCompletionSnapshot {
+                completed_blocks: vec![
+                    ("uniswap_v2".to_string(), 43),
+                    ("uniswap_v3".to_string(), 43),
+                ],
+                missing_completion: Vec::new(),
+            },
+            42,
+            "family runner",
+            BootstrapCompletionPolicy::RequireConfiguredMatch,
+        )
+        .expect_err("shared-family drift should fail instead of silently rerunning");
+
+        assert!(err.to_string().contains(
+            "family runner requires configured shared bootstrap block `42` to match persisted completed bootstrap block `43`"
+        ));
     }
 }

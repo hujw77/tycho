@@ -1,0 +1,35 @@
+
+family_runtimes:
+  uniswap:
+    shared_spkg: "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+    shared_module: "map_uniswap_family_protocol_changes"
+    members:
+      uniswap_v2:
+        substreams_params:
+          v2_map_pool_events: "@config/uniswap_v2_substreams.yaml"
+extractors:
+  alias_v2:
+    name: "alias_v2"
+    protocol_system: "uniswap_v2"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    protocol_types:
+      - name: "sample_pool"
+        financial_type: "Swap"
+    module_name: "map_sample"
+    family_runtime:
+      family: "uniswap"
+  alias_v3:
+    name: "alias_v3"
+    protocol_system: "uniswap_v3"
+    chain: "ethereum"
+    implementation_type: "Custom"
+    sync_batch_size: 1000
+    start_block: 42
+    protocol_types:
+      - name: "sample_pool_v3"
+        financial_type: "Swap"
+    module_name: "map_sample_v3"
+    family_runtime:
+      family: "uniswap"

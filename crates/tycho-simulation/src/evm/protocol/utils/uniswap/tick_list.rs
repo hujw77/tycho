@@ -144,22 +144,34 @@ impl TickList {
     }
 
     fn is_below_smallest(&self, tick: i32) -> bool {
+        if self.ticks.is_empty() {
+            return true;
+        }
         tick < self.ticks[0].index
     }
 
     fn is_below_safe_tick(&self, tick: i32) -> bool {
+        if self.ticks.is_empty() {
+            return true;
+        }
         let smallest = self.ticks[0].index;
-        let minimum = smallest - self.tick_spacing as i32;
+        let minimum = smallest.saturating_sub(self.tick_spacing as i32);
         tick < minimum || tick < MIN_TICK
     }
 
     fn is_at_or_above_largest(&self, tick: i32) -> bool {
+        if self.ticks.is_empty() {
+            return true;
+        }
         tick >= self.ticks[self.ticks.len() - 1].index
     }
 
     fn is_at_or_above_safe_tick(&self, tick: i32) -> bool {
+        if self.ticks.is_empty() {
+            return true;
+        }
         let largest = self.ticks[self.ticks.len() - 1].index;
-        let maximum = largest + self.tick_spacing as i32;
+        let maximum = largest.saturating_add(self.tick_spacing as i32);
         tick >= maximum || tick >= MAX_TICK
     }
 
@@ -191,6 +203,9 @@ impl TickList {
     }
 
     fn next_initialized_tick(&self, index: i32, lte: bool) -> Result<&TickInfo, TickListError> {
+        if self.ticks.is_empty() {
+            return Err(TickListError { kind: TickListErrorKind::NotFound });
+        }
         if lte {
             if self.is_below_smallest(index) {
                 return Err(TickListError { kind: TickListErrorKind::BelowSmallest });
@@ -229,6 +244,9 @@ impl TickList {
         tick: i32,
         lte: bool,
     ) -> Result<(i32, bool), TickListError> {
+        if self.ticks.is_empty() {
+            return Err(TickListError { kind: TickListErrorKind::TicksExeeded });
+        }
         let spacing = self.tick_spacing as i32;
         let compressed = div_floor(tick, spacing);
 
@@ -318,6 +336,26 @@ mod tests {
         let tick_list = create_tick_list();
         assert!(!tick_list.is_at_or_above_largest(10));
         assert!(tick_list.is_at_or_above_largest(200));
+    }
+
+    #[test]
+    fn test_safe_tick_checks_do_not_overflow_at_i32_bounds() {
+        let upper = TickInfo::new(i32::MAX, 1).unwrap_err();
+        assert!(
+            matches!(upper, SimulationError::FatalError(_) | SimulationError::InvalidInput(_, _)),
+            "tick construction at i32::MAX should stay fallible instead of panicking"
+        );
+
+        let tick_list = TickList {
+            tick_spacing: 10,
+            ticks: vec![
+                TickInfo { index: i32::MIN, net_liquidity: 1, sqrt_price: U256::ZERO },
+                TickInfo { index: i32::MAX, net_liquidity: 1, sqrt_price: U256::ZERO },
+            ],
+        };
+
+        assert!(tick_list.is_below_safe_tick(i32::MIN));
+        assert!(tick_list.is_at_or_above_safe_tick(i32::MAX));
     }
 
     #[test]
@@ -642,6 +680,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_empty_tick_list_returns_errors_instead_of_panicking() {
+        let tick_list = TickList::from(10, vec![]).unwrap();
+
+        assert_eq!(
+            tick_list
+                .next_initialized_tick(0, true)
+                .unwrap_err()
+                .kind,
+            TickListErrorKind::NotFound
+        );
+        assert_eq!(
+            tick_list
+                .next_initialized_tick_within_one_word(0, true)
+                .unwrap_err()
+                .kind,
+            TickListErrorKind::TicksExeeded
+        );
+        assert_eq!(
+            tick_list
+                .next_initialized_tick_within_one_word(0, false)
+                .unwrap_err()
+                .kind,
+            TickListErrorKind::TicksExeeded
+        );
     }
 
     #[rstest]
