@@ -1,2 +1,2 @@
 includes:
-  - "shared_uniswap_bootstrap.yaml"
+  - "shared_uniswap_substreams.yaml"

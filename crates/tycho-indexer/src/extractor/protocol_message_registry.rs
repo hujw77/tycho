@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use tycho_ethereum::rpc::EthereumRpcClient;
 use tycho_common::{
     models::{
         protocol::{ComponentBalance, ProtocolComponent},
@@ -22,6 +23,22 @@ use crate::extractor::family_registry::FamilyRuntimeRegistry;
 pub(crate) type AuxiliaryProtocolMessageBuildFuture<'a> =
     Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>>;
 
+pub(crate) type AuxiliaryProtocolStateHydrationFuture<'a> =
+    Pin<
+        Box<
+            dyn Future<
+                    Output = Result<HashMap<ComponentId, ChainHydratedComponentState>, ExtractionError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChainHydratedComponentState {
+    pub attributes: HashMap<String, Bytes>,
+    pub balances: HashMap<Address, Bytes>,
+}
+
 #[async_trait]
 pub(crate) trait AuxiliaryProtocolMessageContext: Send + Sync {
     fn extractor_name(&self) -> &str;
@@ -35,10 +52,18 @@ pub(crate) trait AuxiliaryProtocolMessageContext: Send + Sync {
         component_ids: &[ComponentId],
     ) -> Result<HashMap<ComponentId, ProtocolComponent>, ExtractionError>;
 
-    async fn get_protocol_state_values_at_tip(
+    async fn get_protocol_states_at_tip(
         &self,
-        keys: &[(String, String)],
-    ) -> Result<HashMap<String, HashMap<String, Bytes>>, ExtractionError>;
+        component_ids: &[ComponentId],
+    ) -> Result<HashMap<ComponentId, HashMap<String, Bytes>>, ExtractionError>;
+
+    fn rpc_client(&self) -> Option<EthereumRpcClient>;
+
+    async fn hydrate_protocol_components_from_chain(
+        &self,
+        protocol_components: &[ProtocolComponent],
+        block_number: u64,
+    ) -> Result<HashMap<ComponentId, ChainHydratedComponentState>, ExtractionError>;
 
     async fn get_component_balances_at_tip(
         &self,
@@ -58,6 +83,16 @@ pub(crate) struct AuxiliaryProtocolMessageDecoder {
     ) -> AuxiliaryProtocolMessageBuildFuture<'a>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuxiliaryProtocolStateHydrator {
+    pub protocol_system: &'static str,
+    pub hydrate_components_from_chain: for<'a> fn(
+        &'a dyn AuxiliaryProtocolMessageContext,
+        &'a [ProtocolComponent],
+        u64,
+    ) -> AuxiliaryProtocolStateHydrationFuture<'a>,
+}
+
 pub(crate) fn auxiliary_protocol_message_decoder_for(
     decoders: &[AuxiliaryProtocolMessageDecoder],
     protocol_system: &str,
@@ -75,6 +110,16 @@ pub(crate) fn default_auxiliary_protocol_message_decoders_for_protocol_system(
     registry
         .registered_protocol_system_defaults(protocol_system)
         .map(|defaults| defaults.auxiliary_protocol_message_decoders().to_vec())
+        .unwrap_or_default()
+}
+
+pub(crate) fn default_auxiliary_protocol_state_hydrators_for_protocol_system(
+    protocol_system: &str,
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Vec<AuxiliaryProtocolStateHydrator> {
+    registry
+        .registered_protocol_system_defaults(protocol_system)
+        .map(|defaults| defaults.auxiliary_protocol_state_hydrators().to_vec())
         .unwrap_or_default()
 }
 

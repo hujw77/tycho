@@ -1,14 +1,15 @@
 use crate::extractor::{
     extractor_config::BootstrapStrategy,
     family_registry::{
-        canonical_pool_list_shared_family_member_spec, shared_family_bootstrap_runtime,
-        shared_family_runtime_spec_with_auxiliary_decoders, FamilyMemberSpec,
-        FamilyRuntimeRegistry, FamilyRuntimeSpec,
+        canonical_pool_list_shared_family_member_spec,
+        canonical_pool_list_shared_family_member_with_auxiliary_runtime_hooks,
+        canonical_shared_family_runtime_spec, FamilyMemberSpec, FamilyRuntimeRegistry,
+        FamilyRuntimeSpec,
     },
     family_uniswap::{
-        materialize_uniswap_family_plan, materialize_uniswap_v2_branch,
-        materialize_uniswap_v3_branch,
-        AUXILIARY_PROTOCOL_MESSAGE_DECODERS as UNISWAP_AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
+        materialize_uniswap_v2_branch, materialize_uniswap_v3_branch,
+        AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
+        AUXILIARY_PROTOCOL_STATE_HYDRATORS,
     },
 };
 
@@ -18,22 +19,22 @@ const UNISWAP_V2_MEMBER: FamilyMemberSpec = canonical_pool_list_shared_family_me
     materialize_uniswap_v2_branch,
 );
 
-const UNISWAP_V3_MEMBER: FamilyMemberSpec = canonical_pool_list_shared_family_member_spec(
+const UNISWAP_V3_MEMBER_WITH_AUXILIARY_RUNTIME_HOOKS: FamilyMemberSpec =
+    canonical_pool_list_shared_family_member_with_auxiliary_runtime_hooks(
     "uniswap_v3",
     BootstrapStrategy::UniswapV3Rpc,
     materialize_uniswap_v3_branch,
+    AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
+    AUXILIARY_PROTOCOL_STATE_HYDRATORS,
 );
 
-const UNISWAP_V2_V3_MEMBERS: &[FamilyMemberSpec] = &[UNISWAP_V2_MEMBER, UNISWAP_V3_MEMBER];
+const UNISWAP_V2_V3_MEMBERS: &[FamilyMemberSpec] =
+    &[UNISWAP_V2_MEMBER, UNISWAP_V3_MEMBER_WITH_AUXILIARY_RUNTIME_HOOKS];
 
-const UNISWAP_V2_V3_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec_with_auxiliary_decoders(
+const UNISWAP_V2_V3_FAMILY: FamilyRuntimeSpec = canonical_shared_family_runtime_spec!(
     "uniswap",
     UNISWAP_V2_V3_MEMBERS,
-    "map_uniswap_family_protocol_changes",
-    "uniswap_family",
-    "family::uniswap",
-    Some(shared_family_bootstrap_runtime(materialize_uniswap_family_plan)),
-    UNISWAP_AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
+    None,
 );
 
 const DEFAULT_FAMILY_RUNTIME_SPECS: &[FamilyRuntimeSpec] = &[UNISWAP_V2_V3_FAMILY];
@@ -49,25 +50,49 @@ pub const fn default_family_runtime_registry() -> FamilyRuntimeRegistry<'static>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extractor::family_bootstrap_registry::default_shared_bootstrap_plan_materializer;
 
     #[test]
     fn default_auxiliary_decoder_groups_are_sourced_from_default_family_registry() {
         let families = default_family_runtime_specs();
         assert_eq!(families.len(), 1);
-        assert_eq!(
-            families[0].auxiliary_protocol_message_decoders().len(),
-            1
-        );
-        assert_eq!(
-            families[0].auxiliary_protocol_message_decoders()[0].protocol_system,
-            "uniswap_v3"
-        );
-        assert_eq!(
-            families[0].auxiliary_protocol_message_decoders()[0].type_url_suffix,
-            "Events"
-        );
         assert_eq!(families[0].output_module(), "map_uniswap_family_protocol_changes");
         assert_eq!(families[0].shared_stream_name(), "uniswap_family");
         assert_eq!(families[0].durability_scope(), "family::uniswap");
+
+        let decoders = default_family_runtime_registry()
+            .auxiliary_protocol_message_decoders_for_protocol_system("uniswap_v3")
+            .expect("uniswap_v3 decoders should be registered");
+        assert_eq!(decoders.len(), 1);
+        assert_eq!(decoders[0].protocol_system, "uniswap_v3");
+        assert_eq!(decoders[0].type_url_suffix, "Events");
+    }
+
+    #[test]
+    fn default_auxiliary_hydrator_groups_are_sourced_from_default_family_registry() {
+        let families = default_family_runtime_specs();
+        assert_eq!(families.len(), 1);
+
+        let hydrators = default_family_runtime_registry()
+            .auxiliary_protocol_state_hydrators_for_protocol_system("uniswap_v3")
+            .expect("uniswap_v3 hydrators should be registered");
+        assert_eq!(hydrators.len(), 1);
+        assert_eq!(hydrators[0].protocol_system, "uniswap_v3");
+    }
+
+    #[test]
+    fn default_uniswap_family_uses_generic_shared_bootstrap_plan_materializer() {
+        let families = default_family_runtime_specs();
+        assert_eq!(families.len(), 1);
+        assert!(families[0].shared_bootstrap_runtime().is_none());
+
+        let materializer = default_family_runtime_registry()
+            .resolve_shared_bootstrap_plan_materializer("uniswap")
+            .expect("resolve uniswap bootstrap materializer");
+
+        assert_eq!(
+            materializer as usize,
+            default_shared_bootstrap_plan_materializer() as usize
+        );
     }
 }

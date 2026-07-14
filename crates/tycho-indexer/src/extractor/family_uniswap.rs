@@ -18,18 +18,16 @@ use tycho_common::{
     Bytes,
     storage::StorageError,
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::extractor::{
-    family_bootstrap_registry::ResolvedSharedBootstrapBranchRuntime,
     models::BlockChanges,
     protocol_message_registry::{
         AuxiliaryProtocolMessageBuildFuture, AuxiliaryProtocolMessageContext,
-        AuxiliaryProtocolMessageDecoder,
+        AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrationFuture,
+        AuxiliaryProtocolStateHydrator, ChainHydratedComponentState,
     },
-    shared_bootstrap::{
-        materialize_plan_by_branch_runtimes, BootstrapBranchDescriptor, SharedBootstrapPlan,
-    },
+    shared_bootstrap::BootstrapBranchDescriptor,
     u256_num::bytes_to_f64,
     uniswap_v2_bootstrap, uniswap_v3_bootstrap, uniswap_v3_stream, ExtractionError,
 };
@@ -85,6 +83,31 @@ pub(crate) const AUXILIARY_PROTOCOL_MESSAGE_DECODERS: &[AuxiliaryProtocolMessage
         build_block_changes: build_uniswap_v3_auxiliary_block_changes,
     }];
 
+fn hydrate_uniswap_v3_components_from_chain<'a>(
+    context: &'a dyn AuxiliaryProtocolMessageContext,
+    protocol_components: &'a [ProtocolComponent],
+    block_number: u64,
+) -> AuxiliaryProtocolStateHydrationFuture<'a> {
+    Box::pin(async move {
+        let Some(rpc_client) = context.rpc_client() else {
+            return Ok(HashMap::new());
+        };
+
+        uniswap_v3_bootstrap::hydrate_uniswap_v3_components_from_chain(
+            &rpc_client,
+            protocol_components,
+            block_number,
+        )
+        .await
+    })
+}
+
+pub(crate) const AUXILIARY_PROTOCOL_STATE_HYDRATORS: &[AuxiliaryProtocolStateHydrator] =
+    &[AuxiliaryProtocolStateHydrator {
+        protocol_system: "uniswap_v3",
+        hydrate_components_from_chain: hydrate_uniswap_v3_components_from_chain,
+    }];
+
 pub(crate) async fn build_uniswap_v3_block_changes_from_events(
     context: &dyn AuxiliaryProtocolMessageContext,
     raw_events: uniswap_v3_stream::Events,
@@ -118,7 +141,6 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
         .collect::<Result<HashSet<_>, _>>()?;
 
     let mut existing_component_ids = HashSet::new();
-    let mut touched_tick_keys: HashMap<String, HashSet<i32>> = HashMap::new();
 
     for event in &pool_events {
         let component_id = normalize_hex_address(&event.pool_address)?;
@@ -127,29 +149,6 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
         }
 
         existing_component_ids.insert(component_id.clone());
-        match &event.r#type {
-            Some(uniswap_v3_stream::events::pool_event::Type::Mint(mint)) => {
-                touched_tick_keys
-                    .entry(component_id.clone())
-                    .or_default()
-                    .insert(mint.tick_lower);
-                touched_tick_keys
-                    .entry(component_id)
-                    .or_default()
-                    .insert(mint.tick_upper);
-            }
-            Some(uniswap_v3_stream::events::pool_event::Type::Burn(burn)) => {
-                touched_tick_keys
-                    .entry(component_id.clone())
-                    .or_default()
-                    .insert(burn.tick_lower);
-                touched_tick_keys
-                    .entry(component_id)
-                    .or_default()
-                    .insert(burn.tick_upper);
-            }
-            _ => {}
-        }
     }
 
     let existing_component_ids_vec = existing_component_ids.iter().cloned().collect::<Vec<_>>();
@@ -157,28 +156,10 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
         .get_protocol_components(&existing_component_ids_vec)
         .await?;
     let tracked_existing_component_ids = existing_components.keys().cloned().collect::<HashSet<_>>();
-
-    let mut state_lookup_keys = HashSet::new();
-    for component_id in &tracked_existing_component_ids {
-        for attr in [
-            "liquidity",
-            "tick",
-            "sqrt_price_x96",
-            "protocol_fees/token0",
-            "protocol_fees/token1",
-        ] {
-            state_lookup_keys.insert((component_id.clone(), attr.to_string()));
-        }
-
-        if let Some(ticks) = touched_tick_keys.get(component_id) {
-            for tick in ticks {
-                state_lookup_keys.insert((component_id.clone(), format!("ticks/{tick}/net-liquidity")));
-            }
-        }
-    }
-
     let protocol_state_values = context
-        .get_protocol_state_values_at_tip(&state_lookup_keys.into_iter().collect::<Vec<_>>())
+        .get_protocol_states_at_tip(
+            &tracked_existing_component_ids.iter().cloned().collect::<Vec<_>>(),
+        )
         .await?;
 
     let balance_lookup_keys = existing_components
@@ -234,6 +215,14 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
             .is_some_and(|(current_tx, _)| current_tx.index != transaction.index)
         {
             let (completed_tx, completed_acc) = active_tx.take().expect("active tx exists");
+            hydrate_uniswap_v3_pool_states_if_needed(
+                context,
+                &mut current_states,
+                &completed_acc,
+                &existing_components,
+                block.number,
+            )
+            .await?;
             if let Some(tx_update) =
                 finalize_uniswap_v3_tx(completed_tx, completed_acc, &current_states)
             {
@@ -387,6 +376,14 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
     }
 
     if let Some((completed_tx, completed_acc)) = active_tx.take() {
+        hydrate_uniswap_v3_pool_states_if_needed(
+            context,
+            &mut current_states,
+            &completed_acc,
+            &existing_components,
+            block.number,
+        )
+        .await?;
         if let Some(tx_update) = finalize_uniswap_v3_tx(completed_tx, completed_acc, &current_states)
         {
             txs_with_update.push(tx_update);
@@ -575,6 +572,55 @@ fn created_state_delta_from_runtime(state: &UniswapV3PoolRuntimeState) -> Protoc
     }
 }
 
+async fn hydrate_uniswap_v3_pool_states_if_needed(
+    context: &dyn AuxiliaryProtocolMessageContext,
+    current_states: &mut HashMap<String, UniswapV3PoolRuntimeState>,
+    acc: &UniswapV3TxAccumulator,
+    existing_components: &HashMap<ComponentId, ProtocolComponent>,
+    block_number: u64,
+) -> Result<(), ExtractionError> {
+    let mut touched_component_ids = acc
+        .created_components
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    touched_component_ids.extend(acc.touched_attributes.keys().cloned());
+    touched_component_ids.extend(acc.touched_balances.keys().cloned());
+
+    let components_to_hydrate = touched_component_ids
+        .iter()
+        .filter_map(|component_id| {
+            let state = current_states.get(component_id)?;
+            (state.liquidity != BigInt::default() && state.tick_liquidity_net.is_empty()).then(|| {
+                acc.protocol_components
+                    .get(component_id)
+                    .or_else(|| existing_components.get(component_id))
+                    .cloned()
+            })?
+        })
+        .collect::<Vec<_>>();
+
+    if components_to_hydrate.is_empty() {
+        return Ok(());
+    }
+
+    let hydrated = context
+        .hydrate_protocol_components_from_chain(&components_to_hydrate, block_number)
+        .await?;
+
+    for component in &components_to_hydrate {
+        let Some(state) = current_states.get_mut(&component.id) else {
+            continue;
+        };
+        let Some(hydrated_state) = hydrated.get(&component.id) else {
+            continue;
+        };
+        apply_hydrated_chain_state(state, hydrated_state)?;
+    }
+
+    Ok(())
+}
+
 fn finalize_uniswap_v3_tx(
     tx: Transaction,
     acc: UniswapV3TxAccumulator,
@@ -592,6 +638,14 @@ fn finalize_uniswap_v3_tx(
         };
 
         if acc.created_components.contains(&component_id) {
+            if state.liquidity != BigInt::default() && state.tick_liquidity_net.is_empty() {
+                warn!(
+                    component_id = %state.component_id,
+                    liquidity = %state.liquidity,
+                    tick = state.tick,
+                    "created uniswap_v3 pool state has non-zero liquidity but no tick net-liquidity map"
+                );
+            }
             state_updates.insert(component_id.clone(), created_state_delta_from_runtime(state));
             balance_changes.insert(
                 component_id.clone(),
@@ -720,6 +774,48 @@ fn runtime_dynamic_attributes(state: &UniswapV3PoolRuntimeState) -> HashMap<Stri
     attrs
 }
 
+fn apply_hydrated_chain_state(
+    state: &mut UniswapV3PoolRuntimeState,
+    hydrated: &ChainHydratedComponentState,
+) -> Result<(), ExtractionError> {
+    state.liquidity = hydrated
+        .attributes
+        .get("liquidity")
+        .map(parse_big_int_bytes)
+        .unwrap_or_default();
+    state.tick = hydrated
+        .attributes
+        .get("tick")
+        .map(parse_i32_bytes)
+        .transpose()?
+        .unwrap_or_default();
+    state.sqrt_price_x96 = hydrated
+        .attributes
+        .get("sqrt_price_x96")
+        .map(parse_big_int_bytes)
+        .unwrap_or_default();
+    state.protocol_fee_token0 = hydrated
+        .attributes
+        .get("protocol_fees/token0")
+        .map(parse_big_int_bytes)
+        .unwrap_or_default();
+    state.protocol_fee_token1 = hydrated
+        .attributes
+        .get("protocol_fees/token1")
+        .map(parse_big_int_bytes)
+        .unwrap_or_default();
+    state.tick_liquidity_net = parse_tick_liquidity_net(&state.component_id, &hydrated.attributes)?;
+
+    if let Some(balance) = hydrated.balances.get(&state.token0) {
+        state.balances.insert(state.token0.clone(), parse_big_int_bytes(balance));
+    }
+    if let Some(balance) = hydrated.balances.get(&state.token1) {
+        state.balances.insert(state.token1.clone(), parse_big_int_bytes(balance));
+    }
+
+    Ok(())
+}
+
 fn runtime_attr_value(state: &UniswapV3PoolRuntimeState, attr: &str) -> Option<Bytes> {
     match attr {
         "liquidity" => Some(encode_big_int(&state.liquidity)),
@@ -735,6 +831,27 @@ fn runtime_attr_value(state: &UniswapV3PoolRuntimeState, attr: &str) -> Option<B
             .filter(|value| **value != BigInt::default())
             .map(encode_big_int),
     }
+}
+
+fn parse_tick_liquidity_net(
+    component_id: &str,
+    values: &HashMap<String, Bytes>,
+) -> Result<HashMap<i32, BigInt>, ExtractionError> {
+    values
+        .iter()
+        .filter_map(|(attr, value)| {
+            attr.strip_prefix("ticks/")
+                .and_then(|suffix| suffix.strip_suffix("/net-liquidity"))
+                .map(|tick| {
+                    let tick_index = tick.parse::<i32>().map_err(|err| {
+                        ExtractionError::DecodeError(format!(
+                            "failed to parse tick index `{tick}` for component `{component_id}`: {err}",
+                        ))
+                    })?;
+                    Ok((tick_index, parse_big_int_bytes(value)))
+                })
+        })
+        .collect::<Result<HashMap<_, _>, ExtractionError>>()
 }
 
 fn runtime_balance_value(state: &UniswapV3PoolRuntimeState, token: &Address) -> Bytes {
@@ -861,12 +978,4 @@ pub(crate) fn materialize_uniswap_v3_branch<'a>(
         )
         .await
     })
-}
-
-pub(crate) fn materialize_uniswap_family_plan<'a>(
-    rpc: &'a EthereumRpcClient,
-    plan: &'a SharedBootstrapPlan,
-    branch_runtimes: &'a [ResolvedSharedBootstrapBranchRuntime],
-) -> Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>> {
-    Box::pin(async move { materialize_plan_by_branch_runtimes(rpc, plan, branch_runtimes).await })
 }

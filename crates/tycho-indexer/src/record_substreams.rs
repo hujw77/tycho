@@ -6,8 +6,7 @@ use tycho_indexer::{
     extractor::{
         family_registry::{default_family_runtime_registry, FamilyRuntimeRegistry},
         runtime_target_planning::{
-            ResolvedRuntimeTarget, ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets,
-            ResolvedSubstreamsExecutionRequest,
+            ResolvedRuntimeTargetSelector, ResolvedSubstreamsExecutionRequest,
         },
         substreams_package_loader::load_substreams_package,
         ExtractionError,
@@ -20,7 +19,7 @@ use tycho_indexer::{
     },
 };
 
-use crate::config::ExtractorConfigs;
+use crate::config::LoadedIndexerRuntimePlan;
 
 fn parse_substreams_params(params: &[String]) -> Result<HashMap<String, String>, ExtractionError> {
     let mut parsed = HashMap::new();
@@ -58,19 +57,6 @@ pub(crate) fn derived_record_target_selector_from_args(
     }
 }
 
-fn infer_derived_record_target<'a>(
-    targets: &'a ResolvedRuntimeTargets<'a>,
-    extractors_config_path: &str,
-) -> Result<&'a ResolvedRuntimeTarget<'a>, ExtractionError> {
-    targets.resolve_target(
-        None,
-        &format!(
-            "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
-        ),
-        extractors_config_path,
-    )
-}
-
 pub(crate) fn render_record_substreams_request_json(
     request: &ResolvedSubstreamsExecutionRequest,
 ) -> Result<String, ExtractionError> {
@@ -78,52 +64,91 @@ pub(crate) fn render_record_substreams_request_json(
         .map_err(|err| ExtractionError::Setup(format!("Failed to serialize request: {err}")))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_loaded_record_substreams_request(
+    extractors_config_path: &str,
+    record_args: &RecordSubstreamsArgs,
+    override_params: &HashMap<String, String>,
+    resolve_request: impl FnOnce(
+        Option<ResolvedRuntimeTargetSelector<'_>>,
+        &str,
+        &str,
+        Option<i64>,
+        Option<i64>,
+        &HashMap<String, String>,
+    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError>,
+) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
+    let selector = match (record_args.family.as_deref(), record_args.protocol_system.as_deref()) {
+        (None, None) => None,
+        _ => Some(derived_record_target_selector_from_args(record_args)?),
+    };
+    let unique_context = format!(
+        "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
+    );
+    let mut resolved = resolve_request(
+        selector,
+        &unique_context,
+        extractors_config_path,
+        record_args.start_block,
+        None,
+        override_params,
+    )?;
+    if let Some(stop_block) = record_args.stop_block(resolved.start_block) {
+        resolved.stop_block = stop_block as u64;
+    }
+    Ok(resolved)
+}
+
 pub(crate) fn resolve_record_substreams_request(
     record_args: &RecordSubstreamsArgs,
 ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
+    let override_params = parse_substreams_params(&record_args.params)?;
+
+    if let Some(extractors_config_path) = &record_args.extractors_config {
+        let loaded_runtime_plan = LoadedIndexerRuntimePlan::from_yaml(extractors_config_path)?;
+        return resolve_loaded_record_substreams_request(
+            extractors_config_path,
+            record_args,
+            &override_params,
+            |selector, unique_context, selector_context, start_block, stop_block, params| {
+                loaded_runtime_plan.resolve_substreams_execution_request(
+                    selector,
+                    unique_context,
+                    selector_context,
+                    start_block,
+                    stop_block,
+                    params,
+                )
+            },
+        );
+    }
+
     resolve_record_substreams_request_with_registry(record_args, default_family_runtime_registry())
 }
 
 pub(crate) fn resolve_record_substreams_request_with_registry(
     record_args: &RecordSubstreamsArgs,
-    registry: FamilyRuntimeRegistry<'_>,
+    registry: FamilyRuntimeRegistry<'static>,
 ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
     let override_params = parse_substreams_params(&record_args.params)?;
 
     if let Some(extractors_config_path) = &record_args.extractors_config {
-        let extractors_config =
-            ExtractorConfigs::from_yaml_with_registry(extractors_config_path, registry).map_err(
-                |err| ExtractionError::Setup(format!("Failed to load extractors config. {err}")),
-            )?;
-        let targets = extractors_config.resolved_runtime_targets_with_registry(registry)?;
-        let selector = match (record_args.family.as_deref(), record_args.protocol_system.as_deref())
-        {
-            (None, None) => None,
-            _ => Some(derived_record_target_selector_from_args(record_args)?),
-        };
-        let target = match selector {
-            Some(selector) => targets.resolve_target(
-                Some(selector),
-                &format!(
-                    "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
-                ),
-                extractors_config_path,
-            )?,
-            None => infer_derived_record_target(&targets, extractors_config_path)?,
-        };
-        let default_resolved = target.substreams_execution_request()?;
-        let effective_start_block =
-            target.effective_substreams_start_block(record_args.start_block)?;
-        let effective_stop_block = record_args
-            .stop_block(effective_start_block)
-            .unwrap_or(default_resolved.stop_block as i64);
-        let resolved = target.substreams_execution_request_with_overrides(
-            Some(effective_start_block),
-            Some(effective_stop_block),
+        let loaded_runtime_plan =
+            LoadedIndexerRuntimePlan::from_yaml_with_registry(extractors_config_path, registry)?;
+        return resolve_loaded_record_substreams_request(
+            extractors_config_path,
+            record_args,
             &override_params,
-        )?;
-        return Ok(resolved);
+            |selector, unique_context, selector_context, start_block, stop_block, params| {
+                loaded_runtime_plan.resolve_substreams_execution_request(
+                    selector,
+                    unique_context,
+                    selector_context,
+                    start_block,
+                    stop_block,
+                    params,
+                )
+            },
+        );
     }
 
     let spkg = record_args
@@ -231,18 +256,39 @@ pub(crate) async fn record_substreams_fixture(
     global_args: &GlobalArgs,
     record_args: &RecordSubstreamsArgs,
 ) -> Result<(), ExtractionError> {
-    record_substreams_fixture_with_registry(
-        global_args,
+    let resolved_request = resolve_record_substreams_request(record_args)?;
+    if record_args.print_request {
+        println!("{}", render_record_substreams_request_json(&resolved_request)?);
+        return Ok(());
+    }
+
+    let loaded = load_substreams_package(
+        global_args.s3_bucket.as_deref(),
+        &resolved_request.spkg,
+        &global_args.endpoint_url,
+        Some(
+            record_args
+                .substreams_args
+                .substreams_api_token
+                .clone(),
+        ),
+    )
+    .await?;
+
+    record_substreams_fixture_from_package_and_recorder(
+        loaded.spkg,
+        loaded.endpoint,
+        resolved_request,
         record_args,
-        default_family_runtime_registry(),
     )
     .await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn record_substreams_fixture_with_registry(
     global_args: &GlobalArgs,
     record_args: &RecordSubstreamsArgs,
-    registry: FamilyRuntimeRegistry<'_>,
+    registry: FamilyRuntimeRegistry<'static>,
 ) -> Result<(), ExtractionError> {
     let resolved_request = resolve_record_substreams_request_with_registry(record_args, registry)?;
     if record_args.print_request {

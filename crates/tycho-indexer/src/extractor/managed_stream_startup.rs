@@ -8,7 +8,6 @@ use tokio::{
 use crate::{
     extractor::{
         control::{ExtractorHandle, SubscriptionsMap},
-        managed_extractor_initialization::ManagedExtractorBuildContext,
         managed_substreams_request::PreparedSubstreamsRequest,
         runner::ManagedRunner,
         single_runtime_execution::ExtractorRunner,
@@ -32,18 +31,6 @@ pub(crate) struct PreparedSingleRunnerStartup {
 }
 
 impl PreparedSingleRunnerStartup {
-    pub(crate) async fn from_prepared_request(
-        extractor_build: &ManagedExtractorBuildContext<'_>,
-        extractor: Arc<dyn Extractor>,
-        extractor_id: tycho_common::models::ExtractorIdentity,
-        prepared_request: PreparedSubstreamsRequest,
-    ) -> Result<Self, ExtractionError> {
-        let stream = extractor_build
-            .load_stream_for_prepared_request(&prepared_request)
-            .await?;
-        Ok(Self { extractor, extractor_id, stream })
-    }
-
     pub(crate) fn into_managed_runner(
         self,
         runtime_handle: Option<Handle>,
@@ -112,23 +99,6 @@ pub(crate) async fn load_stream_for_prepared_request(
         final_block_only,
         partial_blocks,
     ))
-}
-
-impl ManagedExtractorBuildContext<'_> {
-    pub(crate) async fn load_stream_for_prepared_request(
-        &self,
-        prepared_request: &PreparedSubstreamsRequest,
-    ) -> Result<SubstreamsStream, ExtractionError> {
-        load_stream_for_prepared_request(
-            prepared_request,
-            self.s3_bucket,
-            self.endpoint_url,
-            self.substreams_api_token,
-            self.final_block_only,
-            self.partial_blocks,
-        )
-        .await
-    }
 }
 
 #[cfg(test)]

@@ -38,6 +38,24 @@ Current Phase 3 operator entrypoint:
     Tycho RPC to return queryable `uniswap_v2` and `uniswap_v3` protocol components before
     reporting live readiness, so managed and manual live runs do not race ahead on a merely
     healthy-but-not-yet-queryable combined-family instance
+  - inherited empty `TYCHO_STREAM_WS_BUFFER_SIZE` and
+    `TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE` values are now scrubbed with `env -u` before the
+    live Fynd test command is launched, so shell-exported empty overrides cannot silently poison
+    the managed or manual combined-family live gate
+- combined-family V3 auxiliary decoding now reloads full tip state for existing pools instead of
+  only the current block's touched keys:
+  `ProtocolExtractor::get_protocol_states_at_tip(...)` merges DB state with reorg/in-flight
+  overlays, and
+  `test_get_protocol_states_at_tip_preserves_full_tick_map_across_swap_only_updates`
+  proves swap-only V3 updates no longer discard previously known `ticks/*/net-liquidity`
+  attributes from the in-memory runtime state
+- combined-family auxiliary runtime hooks now include an extensible chain-state hydrator
+  registry:
+  family defaults expose protocol-scoped `AuxiliaryProtocolStateHydrator` entries alongside
+  auxiliary message decoders, managed and standalone startup paths thread those hydrators into
+  `ProtocolExtractor::new_with_runtime_support(...)`, and the first concrete Uniswap V3 hydrator
+  reuses the existing bootstrap snapshot helpers to backfill created pools that would otherwise
+  land with non-zero liquidity but no tick map
 - `scripts/check-combined-family.sh` now also exposes optional managed live/full modes:
   `run-live-managed` and `run-full-managed` can start the canonical combined-family indexer
   entrypoint, wait for live combined-family query readiness, run the live Fynd E2E contract, and
@@ -46,6 +64,35 @@ Current Phase 3 operator entrypoint:
     `operator_ready`: they now require the live Fynd prerequisites too, so the aggregate doctor
     output no longer reports the managed path ready when the indexer could boot but the sibling
     Fynd repo, its `e2e_quote` test, or basic local curl-based health probing are unavailable
+  - the top-level doctor now also forwards the live-gate source-anchoring fields
+    (`live_fynd_repo_exists`, `live_fynd_test_exists`, `live_test_mapping_ready`,
+    `live_curl_available`) so managed-path readiness failures can be attributed directly to the
+    manifest-backed Fynd test mapping contract instead of looking like an opaque aggregate false
+- the checked-in bootstrap asset now converges on the same ownership model too:
+  `crates/tycho-indexer/config/shared_uniswap_bootstrap.yaml` is now a materialized
+  route-format shared bootstrap file rather than a thin include wrapper, while
+  `uniswap_v2_bootstrap.yaml` and `uniswap_v3_bootstrap.yaml` remain only compatibility wrappers
+  that include the shared file and rely on protocol-system filtering at parse time; this keeps
+  legacy paths working without preserving duplicated bootstrap seed lists
+- the checked-in shared-stream param assets now follow that same ownership split:
+  `crates/tycho-indexer/config/shared_uniswap_substreams.yaml` is now the canonical
+  materialized route-format source for family-wide pool filters, while
+  `uniswap_v2_substreams.yaml` and `uniswap_v3_substreams.yaml` remain compatibility/member
+  wrappers on top of it; only the V3-specific `factory` filter remains member-local, so
+  family-wide route ownership no longer lives in per-protocol substreams files
+- family registration now also exposes a first canonical identity constructor for default
+  registry authors:
+  `family_registry::canonical_shared_family_runtime_spec!` derives the canonical shared output
+  module, shared stream name, and durability scope directly from a family name literal, and the
+  built-in Uniswap default registry now uses that macro instead of hand-writing those three
+  identity fields; this narrows the amount of registry-local boilerplate future family additions
+  need to repeat before they can reuse the shared bootstrap and single-stream runtime path
+- protocol-scoped auxiliary runtime hooks can now live on the member declaration itself:
+  `FamilyMemberSpec` owns optional auxiliary message decoders and chain-state hydrators,
+  runtime-default resolution prefers those member-scoped hooks and only falls back to filtered
+  family-level hooks when a member does not override them, and the built-in Uniswap defaults now
+  source the V3-specific auxiliary decoder/hydrator wiring directly from the V3 member
+  registration; this removes another family-local special case from the extensibility surface
 
 ## Goal Lock
 
@@ -191,6 +238,18 @@ Current implementation status:
   dispatcher can be built from a `ProtocolMemoryCache` that was populated through the gateway,
   proving the cache/DB seed path and the manual in-memory seed path behave the same for resumed
   family follow-up routing
+- config-path startup coverage now also owns the aliased family-defaults resume paths directly:
+  the `main.rs` high-level alias-family regressions for shared family cursor resume and completed
+  shared-bootstrap fresh start now build through the config-path runtime owner rather than loading
+  `ExtractorConfigs` and bypassing that owner surface; those DB-backed tests also pin an explicit
+  family `durability_scope` per test fixture so persisted shared-family state cannot leak across
+  repeated local test invocations while still exercising the shared-state contract end-to-end
+- the last remaining outer-layer config-introspection path now also goes through that owner:
+  `main.rs` no longer directly calls `ExtractorConfigs::from_yaml(...)` outside `config.rs` just
+  to inspect inherited family defaults, and instead reads those assertions back through
+  `LoadedIndexerRuntimePlan`, so the high-level config-path contract now consistently treats the
+  loaded runtime-plan owner as the authoritative entrypoint for config loading, inherited shared
+  bootstrap defaults, and managed runner startup
 - dispatcher preload ownership now also lives with the family-dispatch layer itself: family
   runners only provide branch specs plus a protocol cache, while component/contract ownership
   seeding is derived and applied through `family_dispatch.rs`, which keeps future family runtimes
@@ -258,6 +317,27 @@ Current implementation status:
   the default Uniswap family registration lives in a dedicated registry module instead of being
   hard-coded inline with the family-planning logic, which narrows the core runtime surface that
   needs to change when a new built-in family or member protocol is introduced
+- path-level runtime-plan loading now has one owner surface too:
+  `LoadedIndexerRuntimePlan::from_yaml[_with_registry](...)` now owns the
+  `extractors config path -> validated config` transition, and its
+  `resolved_runtime_plan()` method owns the final borrow-scoped planning step, so production
+  startup and config-path test helpers no longer each re-implement their own load-then-resolve
+  sequence
+- the record-substreams tooling path now uses that same config-owning surface too:
+  config-driven request derivation no longer loads extractor YAML and resolves a shared-family
+  Substreams request as two caller-owned steps inside `record_substreams.rs`; it now goes through
+  `LoadedIndexerRuntimePlan::{from_yaml,resolve_substreams_execution_request}`, which keeps the
+  live CLI/tooling path on the same path-level owner model as production startup and config-path
+  runtime tests
+- startup-oriented mixed-target tests now enter one layer higher too:
+  they resolve `ResolvedIndexerRuntimePlan` first and only project down to
+  `ResolvedRuntimeTargets` at the final library-internal startup-preparation step, so the test
+  seam no longer bypasses runtime-plan resolution when validating mixed family/standalone startup
+- config-path startup coverage is narrower now too:
+  a default-registry config-path startup helper now owns the common
+  `config path -> runtime owner -> runtime plan -> managed runner build` chain for repo Uniswap
+  restart-style tests, so those high-level shared-family regressions no longer repeat
+  `ExtractorConfigs::from_yaml(...)` before entering the managed-runner startup surface
 - Uniswap-specific bootstrap materialization has been pushed another step out too:
   the V2/V3 branch materializers and the Uniswap family-level merged bootstrap materializer now
   live in a family-specific module instead of the generic family planner, so the core runtime no
@@ -358,6 +438,41 @@ Current implementation status:
   resolved runtime targets can apply `start/stop/params` overrides through one shared
   Substreams-request override entrypoint, so the recorder path no longer open-codes a second
   copy of "default request plus CLI overrides" assembly outside the runtime-target layer
+- that recorder ownership split is tighter now too:
+  the default CLI path in `record_substreams.rs` resolves derived shared-family requests through
+  `ExtractorConfigs::{from_yaml,resolve_substreams_execution_request}` directly, while the
+  registry-parameterized path is left for explicit custom-family tests and tooling; this keeps
+  the default operator facade on the same config/runtime-target owner surface as production
+  indexing instead of routing even the built-in family through the custom-registry test seam
+- shared runtime planning now reaches the startup test surface through that same owner too:
+  `build_all_extractors_for_tests(...)` no longer bypasses `ResolvedIndexerRuntimePlan` and jump
+  straight from `ExtractorConfigs` into `ResolvedRuntimeTargets`; it now resolves the
+  registry-aware runtime plan first and asks that plan to build managed runners, which keeps the
+  shared-family startup tests on the same planning facade used by production indexing
+- config-path shared-bootstrap tooling now uses that same owner surface too:
+  `shared_bootstrap_seed_universe_spec_from_config_path_with_registry_for_tests(...)` now
+  resolves a `ResolvedIndexerRuntimePlan` and consumes its unique runtime target instead of
+  reopening `resolved_runtime_targets_with_registry(...)` directly; the helper also now makes the
+  existing `'static` custom-registry requirement explicit at its signature, matching the current
+  runtime-plan ownership model instead of hiding that lifetime constraint behind a looser helper
+  boundary
+- runtime-plan metadata checks now stay on the runtime-plan facade too:
+  `ResolvedIndexerRuntimePlan` now exposes direct `protocol_systems()` and
+  `dci_protocol_systems()` accessors, and the surviving runtime-plan tests read protocol metadata
+  through that facade instead of unpacking `runtime_targets` just to project the same family-aware
+  protocol list back out of a lower layer
+- config-path custom-registry startup tests now converge one step further too:
+  the future-family managed-runner startup tests in `main.rs` no longer open-code
+  `from_yaml_with_registry(...)` before calling the shared test startup surface; they now enter
+  through one `build_all_extractors_from_config_path_with_registry_for_tests(...)` helper that
+  keeps the “config path -> config load -> runtime plan -> managed runner build” chain under one
+  owner surface for custom-family startup coverage
+- the production task-launch seam is narrower now too:
+  `run_indexer(...)` and `run_spkg(...)` now resolve `ResolvedIndexerRuntimePlan` before entering
+  `create_indexing_tasks(...)`, and that helper now accepts the runtime plan directly instead of
+  taking raw `ExtractorConfigs` and silently re-deriving the shared-family plan internally; this
+  keeps the binary entrypoint aligned with the same explicit “config -> runtime plan -> launch”
+  ownership model used elsewhere in phase 3
 - runtime-target resolution is now starting to converge at the config boundary too:
   `ExtractorConfigs` can now project directly into resolved runtime targets, so the indexer
   entrypoint and `record-substreams` no longer rebuild family planning by hand from raw
@@ -476,6 +591,11 @@ Current implementation status:
   a family-level wrapper at all; `custom_registry_defaults_shared_bootstrap_plan_materializer_from_branch_runtimes`
   proves a custom family can rely on member branch materializers alone and still execute through
   the shared bootstrap planning surface
+- the built-in Uniswap family now follows that generic path directly too: its default registry no
+  longer installs a no-op family-level bootstrap materializer wrapper, and
+  `default_uniswap_family_uses_generic_shared_bootstrap_plan_materializer` locks in that the
+  shared bootstrap plan materializer owner for Uniswap is the registry/generic fallback rather
+  than a family-specific pass-through hook
 - that bootstrap execution surface is narrower internally now too: resolved family execution
   carries one `shared_bootstrap_execution` object rather than parallel
   `shared_bootstrap_plan_materializer` / `shared_bootstrap_branches` fields, so family bootstrap
@@ -1826,6 +1946,14 @@ partially evidenced or still missing a dedicated regression.
   `ticks/*/net-liquidity` attributes, so the V3 snapshot decoder is being relaxed for that
   empty-pool shape while still treating missing tick maps on non-zero-liquidity pools as an
   actual bad-state signal
+- the previously isolated non-zero-liquidity V3 created-pool admission gap is now covered by the
+  shared runtime architecture:
+  `test_uniswap_v3_created_pool_can_currently_emit_non_zero_liquidity_without_ticks` is kept as
+  the baseline proof of the bad raw event shape, while
+  `test_uniswap_v3_created_pool_uses_auxiliary_chain_hydrator_when_available` proves the
+  combined-family path can now repair that shape before finalizing the created transaction by
+  invoking the protocol-scoped auxiliary hydrator registry and merging hydrated
+  `ticks/*/net-liquidity` plus balances back into the runtime state
 - combined-stream reorg behavior is only partially evidenced:
   reconnect and revert plumbing are covered in unit/integration tests, subscriber-level and
   persistence-level branch-failure isolation are directly covered, and there is now a DB-backed
@@ -1840,6 +1968,12 @@ partially evidenced or still missing a dedicated regression.
   and `combined_family_runner_restart_replays_fixture_backed_real_history_slice_from_persisted_cursor`
   prove dynamically discovered V2/V3 pools join the indexed universe and keep receiving follow-up
   state under the shared family stream using that committed live-style replay input
+- that fixture-backed proof is stricter now too:
+  the shared bootstrap test seeding path materializes a minimal persisted V3 state shape, and the
+  DB-backed replay/restart assertions now fail if a persisted non-zero-liquidity V3 state loses
+  all `ticks/*/net-liquidity` attributes; this keeps the repo-local history-slice gate aligned
+  with the same "non-zero liquidity requires a tick map" runtime invariant enforced by the live
+  auxiliary hydrator path
 
 ### Not Yet Proven Enough To Close The Goal
 
@@ -1855,6 +1989,20 @@ partially evidenced or still missing a dedicated regression.
   combined-family gate now waits for Tycho/Fynd quote-path readiness and lets the existing quote
   retry loop absorb first-block derived-data warmup instead of blocking the settlement gate on a
   full derived-data pass across the entire seeded universe
+- the live gate no longer inherits one known shell-level footgun either:
+  empty exported `TYCHO_STREAM_WS_BUFFER_SIZE` or `TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE` values
+  are stripped before invoking `cargo test`, so operator shells that previously exported those
+  names blank no longer cause spurious live-gate startup drift
+- the managed live wrapper is tighter now too:
+  if the managed combined-family indexer exits before readiness, immediately after readiness, or
+  during downstream live validation, `scripts/check-combined-family.sh run-live-managed` now fails
+  fast and tails the managed indexer log instead of degrading into a long health-timeout wait or a
+  misleading downstream Fynd connection error
+  - that wrapper now also recognizes the current known external blocker directly:
+    if the managed indexer log contains `invalid JWT token`, it emits an explicit
+    `StreamingFast rejected SUBSTREAMS_API_TOKEN` hint before tailing the log, so the remaining
+    live-path failure is classified as an external credential problem rather than a shared-runtime
+    correctness issue
 - the combined-family Tycho startup path is now standardized too:
   `scripts/run-combined-family-indexer.sh` provides `doctor`, `command`, and `run` modes for the
   canonical `extractors.uniswap_v2_v3.combined.yaml` entrypoint, including the local
@@ -2113,6 +2261,12 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   into the family-aware collection API one frame later
 - `ResolvedIndexerRuntime` is narrower for the same reason: it now carries just
   `ResolvedRuntimeTargets`, while callers derive protocol-system and DCI-protocol views directly
+- the test-side startup boundary is narrower too: `main.rs` no longer owns a local
+  `build_all_extractors(...)` wrapper just to inject the default family registry for serial DB
+  runtime tests, and instead aliases one helper from `testing.rs`, so both production startup and
+  the long-lived runtime/family regression harness now route managed-runner assembly through the
+  same config/runtime/test support surfaces rather than letting the CLI entrypoint keep a parallel
+  startup helper
   from that wrapper instead of caching a second copy of metadata that can drift away from the
   resolved runtime-target set
 - family-runtime metadata on `ExtractorConfig` is narrower too: production callsites now resolve

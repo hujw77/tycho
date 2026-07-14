@@ -345,6 +345,14 @@ where
             .get_filtered_protocol_state_update(keys)
     }
 
+    fn get_protocol_state_update_for_components(
+        &self,
+        component_ids: Vec<&ProtocolStateIdType>,
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue> {
+        self.block_update
+            .get_protocol_state_update_for_components(component_ids)
+    }
+
     fn get_filtered_account_state_update(
         &self,
         keys: Vec<(&AccountStateIdType, &AccountStateKeyType)>,

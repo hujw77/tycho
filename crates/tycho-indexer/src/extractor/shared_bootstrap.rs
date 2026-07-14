@@ -725,8 +725,7 @@ mod tests {
         family_bootstrap_registry::SharedBootstrapParamsParser,
         family_registry::{shared_family_member_with_bootstrap, shared_family_runtime_spec},
         family_registry::{
-            default_family_runtime_registry, FamilyMemberSpec, FamilyRuntimeRegistry,
-            FamilyRuntimeSpec,
+            default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec,
         },
         family_runtime_metadata::FamilyRuntimeConfig,
         models::{BlockChanges, TxWithContractChanges},
@@ -1148,18 +1147,17 @@ mod tests {
 
     #[test]
     fn rejects_shared_bootstrap_plan_with_invalid_custom_registry() {
-        const INVALID_FUTURE_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec::new(
+        const INVALID_FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
             "future_swap",
-            &[FamilyMemberSpec {
-                protocol_system: "future_v1",
-                shared_route_protocols: &["futurev1"],
-                shared_bootstrap: None,
-            }],
+            &[crate::extractor::family_registry::shared_family_member_spec(
+                "future_v1",
+                &["futurev1"],
+                None,
+            )],
             "map_future_swap_family_protocol_changes",
             "future_swap_family",
             "family::future_swap",
             None,
-            &[],
         );
         let registry = FamilyRuntimeRegistry::new(&[INVALID_FUTURE_FAMILY]);
         let future_config = ExtractorConfig::new(

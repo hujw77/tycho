@@ -4,7 +4,9 @@ use crate::extractor::{
         MaterializeBootstrapBranchFn, MaterializeBootstrapPlanFn, SharedBootstrapMemberRuntime,
         SharedBootstrapParamsParser, SharedFamilyBootstrapRuntime,
     },
-    protocol_message_registry::AuxiliaryProtocolMessageDecoder,
+    protocol_message_registry::{
+        AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator,
+    },
 };
 
 pub use crate::extractor::family_default_registry::{
@@ -16,6 +18,8 @@ pub struct FamilyMemberSpec {
     pub protocol_system: &'static str,
     pub shared_route_protocols: &'static [&'static str],
     pub shared_bootstrap: Option<SharedBootstrapMemberRuntime>,
+    pub(crate) auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    pub(crate) auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +31,7 @@ pub struct FamilyRuntimeSpec {
     durability_scope: &'static str,
     shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
     auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -34,8 +39,22 @@ pub struct FamilyRuntimeRegistry<'a> {
     specs: &'a [FamilyRuntimeSpec],
 }
 
+impl FamilyMemberSpec {
+    pub(crate) const fn auxiliary_protocol_message_decoders(
+        &self,
+    ) -> &'static [AuxiliaryProtocolMessageDecoder] {
+        self.auxiliary_protocol_message_decoders
+    }
+
+    pub(crate) const fn auxiliary_protocol_state_hydrators(
+        &self,
+    ) -> &'static [AuxiliaryProtocolStateHydrator] {
+        self.auxiliary_protocol_state_hydrators
+    }
+}
+
 impl FamilyRuntimeSpec {
-    pub(crate) const fn new(
+    pub(crate) const fn new_with_auxiliary_runtime_hooks(
         family_name: &'static str,
         members: &'static [FamilyMemberSpec],
         output_module: &'static str,
@@ -43,6 +62,7 @@ impl FamilyRuntimeSpec {
         durability_scope: &'static str,
         shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
         auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+        auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
     ) -> Self {
         Self {
             family_name,
@@ -52,6 +72,7 @@ impl FamilyRuntimeSpec {
             durability_scope,
             shared_bootstrap_runtime,
             auxiliary_protocol_message_decoders,
+            auxiliary_protocol_state_hydrators,
         }
     }
 
@@ -84,6 +105,12 @@ impl FamilyRuntimeSpec {
     ) -> &'static [AuxiliaryProtocolMessageDecoder] {
         self.auxiliary_protocol_message_decoders
     }
+
+    pub(crate) const fn auxiliary_protocol_state_hydrators(
+        &self,
+    ) -> &'static [AuxiliaryProtocolStateHydrator] {
+        self.auxiliary_protocol_state_hydrators
+    }
 }
 
 impl<'a> FamilyRuntimeRegistry<'a> {
@@ -95,43 +122,6 @@ impl<'a> FamilyRuntimeRegistry<'a> {
         self.specs
     }
 }
-
-#[cfg(test)]
-macro_rules! canonical_shared_family_runtime_spec {
-    (
-        $family_name:literal,
-        $members:expr,
-        $shared_bootstrap_runtime:expr $(,)?
-    ) => {
-        shared_family_runtime_spec(
-            $family_name,
-            $members,
-            concat!("map_", $family_name, "_family_protocol_changes"),
-            concat!($family_name, "_family"),
-            concat!("family::", $family_name),
-            $shared_bootstrap_runtime,
-        )
-    };
-    (
-        $family_name:literal,
-        $members:expr,
-        $shared_bootstrap_runtime:expr,
-        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr $(,)?
-    ) => {
-        shared_family_runtime_spec_with_auxiliary_decoders(
-            $family_name,
-            $members,
-            concat!("map_", $family_name, "_family_protocol_changes"),
-            concat!($family_name, "_family"),
-            concat!("family::", $family_name),
-            $shared_bootstrap_runtime,
-            $auxiliary_protocol_message_decoders,
-        )
-    };
-}
-
-#[cfg(test)]
-pub(crate) use canonical_shared_family_runtime_spec;
 
 pub const fn pool_list_bootstrap_member_runtime(
     strategy: BootstrapStrategy,
@@ -157,7 +147,29 @@ pub const fn shared_family_member_spec(
     shared_route_protocols: &'static [&'static str],
     shared_bootstrap: Option<SharedBootstrapMemberRuntime>,
 ) -> FamilyMemberSpec {
-    FamilyMemberSpec { protocol_system, shared_route_protocols, shared_bootstrap }
+    shared_family_member_spec_with_auxiliary_runtime_hooks(
+        protocol_system,
+        shared_route_protocols,
+        shared_bootstrap,
+        &[],
+        &[],
+    )
+}
+
+pub(crate) const fn shared_family_member_spec_with_auxiliary_runtime_hooks(
+    protocol_system: &'static str,
+    shared_route_protocols: &'static [&'static str],
+    shared_bootstrap: Option<SharedBootstrapMemberRuntime>,
+    auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
+) -> FamilyMemberSpec {
+    FamilyMemberSpec {
+        protocol_system,
+        shared_route_protocols,
+        shared_bootstrap,
+        auxiliary_protocol_message_decoders,
+        auxiliary_protocol_state_hydrators,
+    }
 }
 
 pub const fn canonical_shared_family_member_spec(
@@ -181,6 +193,24 @@ pub const fn shared_family_member_with_bootstrap(
     )
 }
 
+pub(crate) const fn shared_family_member_with_bootstrap_and_auxiliary_runtime_hooks(
+    protocol_system: &'static str,
+    shared_route_protocols: &'static [&'static str],
+    strategy: BootstrapStrategy,
+    params_parser: SharedBootstrapParamsParser,
+    materialize_branch: MaterializeBootstrapBranchFn,
+    auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
+) -> FamilyMemberSpec {
+    shared_family_member_spec_with_auxiliary_runtime_hooks(
+        protocol_system,
+        shared_route_protocols,
+        Some(shared_bootstrap_member_runtime(strategy, params_parser, materialize_branch)),
+        auxiliary_protocol_message_decoders,
+        auxiliary_protocol_state_hydrators,
+    )
+}
+
 pub const fn canonical_shared_family_member_with_bootstrap(
     protocol_system: &'static str,
     strategy: BootstrapStrategy,
@@ -196,6 +226,25 @@ pub const fn canonical_shared_family_member_with_bootstrap(
     )
 }
 
+pub(crate) const fn canonical_shared_family_member_with_bootstrap_and_auxiliary_runtime_hooks(
+    protocol_system: &'static str,
+    strategy: BootstrapStrategy,
+    params_parser: SharedBootstrapParamsParser,
+    materialize_branch: MaterializeBootstrapBranchFn,
+    auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
+) -> FamilyMemberSpec {
+    shared_family_member_with_bootstrap_and_auxiliary_runtime_hooks(
+        protocol_system,
+        &[],
+        strategy,
+        params_parser,
+        materialize_branch,
+        auxiliary_protocol_message_decoders,
+        auxiliary_protocol_state_hydrators,
+    )
+}
+
 pub const fn canonical_pool_list_shared_family_member_spec(
     protocol_system: &'static str,
     strategy: BootstrapStrategy,
@@ -206,6 +255,23 @@ pub const fn canonical_pool_list_shared_family_member_spec(
         strategy,
         SharedBootstrapParamsParser::PoolList,
         materialize_branch,
+    )
+}
+
+pub(crate) const fn canonical_pool_list_shared_family_member_with_auxiliary_runtime_hooks(
+    protocol_system: &'static str,
+    strategy: BootstrapStrategy,
+    materialize_branch: MaterializeBootstrapBranchFn,
+    auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
+) -> FamilyMemberSpec {
+    canonical_shared_family_member_with_bootstrap_and_auxiliary_runtime_hooks(
+        protocol_system,
+        strategy,
+        SharedBootstrapParamsParser::PoolList,
+        materialize_branch,
+        auxiliary_protocol_message_decoders,
+        auxiliary_protocol_state_hydrators,
     )
 }
 
@@ -243,7 +309,7 @@ pub(crate) const fn shared_family_runtime_spec_with_auxiliary_decoders(
     shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
     auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
 ) -> FamilyRuntimeSpec {
-    FamilyRuntimeSpec::new(
+    shared_family_runtime_spec_with_auxiliary_runtime_hooks(
         family_name,
         members,
         output_module,
@@ -251,8 +317,84 @@ pub(crate) const fn shared_family_runtime_spec_with_auxiliary_decoders(
         durability_scope,
         shared_bootstrap_runtime,
         auxiliary_protocol_message_decoders,
+        &[],
     )
 }
+
+pub(crate) const fn shared_family_runtime_spec_with_auxiliary_runtime_hooks(
+    family_name: &'static str,
+    members: &'static [FamilyMemberSpec],
+    output_module: &'static str,
+    shared_stream_name: &'static str,
+    durability_scope: &'static str,
+    shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
+    auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
+) -> FamilyRuntimeSpec {
+    FamilyRuntimeSpec::new_with_auxiliary_runtime_hooks(
+        family_name,
+        members,
+        output_module,
+        shared_stream_name,
+        durability_scope,
+        shared_bootstrap_runtime,
+        auxiliary_protocol_message_decoders,
+        auxiliary_protocol_state_hydrators,
+    )
+}
+
+macro_rules! canonical_shared_family_runtime_spec {
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec(
+            $family_name,
+            $members,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_decoders(
+            $family_name,
+            $members,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr,
+        auxiliary_protocol_state_hydrators: $auxiliary_protocol_state_hydrators:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_runtime_hooks(
+            $family_name,
+            $members,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            $auxiliary_protocol_state_hydrators,
+        )
+    };
+}
+
+pub(crate) use canonical_shared_family_runtime_spec;
 
 #[cfg(test)]
 mod tests {

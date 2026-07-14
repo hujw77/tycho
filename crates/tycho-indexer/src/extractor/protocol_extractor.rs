@@ -35,6 +35,7 @@ use tycho_common::{
     traits::TokenPreProcessor,
     Bytes,
 };
+use tycho_ethereum::rpc::EthereumRpcClient;
 use tycho_storage::postgres::cache::CachedGateway;
 use tycho_substreams::pb::tycho::evm::v1 as tycho_substreams;
 
@@ -46,7 +47,8 @@ use crate::{
         protocol_cache::{ProtocolDataCache, ProtocolMemoryCache},
         protocol_message_registry::{
             auxiliary_protocol_message_decoder_for, AuxiliaryProtocolMessageContext,
-            AuxiliaryProtocolMessageDecoder,
+            AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator,
+            ChainHydratedComponentState,
         },
         reorg_buffer::ReorgBuffer,
         BlockUpdateWithCursor, ExtractionError, Extractor, ExtractorExtension, ExtractorMsg,
@@ -95,12 +97,14 @@ pub struct ProtocolExtractor<G, T, E> {
     inner: Arc<Mutex<Inner>>,
     protocol_types: HashMap<String, ProtocolType>,
     auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
+    auxiliary_protocol_state_hydrators: Vec<AuxiliaryProtocolStateHydrator>,
     /// Allows to attach some custom logic, e.g. to fix encoding bugs without resync.
     post_processor: Option<fn(BlockChanges) -> BlockChanges>,
     reorg_buffer: Mutex<ReorgBuffer<BlockUpdateWithCursor<BlockChanges>>>,
     in_flight_commit_buffer: Arc<Mutex<ReorgBuffer<BlockUpdateWithCursor<BlockChanges>>>>,
     partial_block_buffer: Mutex<PartialBlockBuffer>,
     dci_plugin: Option<Arc<Mutex<E>>>,
+    rpc_client: Option<EthereumRpcClient>,
 }
 
 #[async_trait]
@@ -132,11 +136,32 @@ where
             .map_err(ExtractionError::Storage)
     }
 
-    async fn get_protocol_state_values_at_tip(
+    async fn get_protocol_states_at_tip(
         &self,
-        keys: &[(String, String)],
-    ) -> Result<HashMap<String, HashMap<String, Bytes>>, ExtractionError> {
-        ProtocolExtractor::get_protocol_state_values_at_tip(self, keys).await
+        component_ids: &[ComponentId],
+    ) -> Result<HashMap<ComponentId, HashMap<String, Bytes>>, ExtractionError> {
+        ProtocolExtractor::get_protocol_states_at_tip(self, component_ids).await
+    }
+
+    fn rpc_client(&self) -> Option<EthereumRpcClient> {
+        self.rpc_client.clone()
+    }
+
+    async fn hydrate_protocol_components_from_chain(
+        &self,
+        protocol_components: &[ProtocolComponent],
+        block_number: u64,
+    ) -> Result<HashMap<ComponentId, ChainHydratedComponentState>, ExtractionError> {
+        let Some(hydrator) = self
+            .auxiliary_protocol_state_hydrators
+            .iter()
+            .find(|hydrator| hydrator.protocol_system == self.protocol_system)
+            .copied()
+        else {
+            return Ok(HashMap::new());
+        };
+
+        (hydrator.hydrate_components_from_chain)(self, protocol_components, block_number).await
     }
 
     async fn get_component_balances_at_tip(
@@ -168,6 +193,42 @@ where
         post_processor: Option<fn(BlockChanges) -> BlockChanges>,
         dci_plugin: Option<E>,
     ) -> Result<Self, ExtractionError> {
+        Self::new_with_runtime_support(
+            gateway,
+            database_insert_batch_size,
+            name,
+            chain,
+            chain_state,
+            protocol_system,
+            protocol_cache,
+            protocol_types,
+            auxiliary_protocol_message_decoders,
+            Vec::new(),
+            token_pre_processor,
+            post_processor,
+            dci_plugin,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new_with_runtime_support(
+        gateway: G,
+        database_insert_batch_size: usize,
+        name: &str,
+        chain: Chain,
+        chain_state: ChainState,
+        protocol_system: String,
+        protocol_cache: ProtocolMemoryCache,
+        protocol_types: HashMap<String, ProtocolType>,
+        auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
+        auxiliary_protocol_state_hydrators: Vec<AuxiliaryProtocolStateHydrator>,
+        token_pre_processor: T,
+        post_processor: Option<fn(BlockChanges) -> BlockChanges>,
+        dci_plugin: Option<E>,
+        rpc_client: Option<EthereumRpcClient>,
+    ) -> Result<Self, ExtractionError> {
         let dci_plugin = dci_plugin.map(|plugin| Arc::new(Mutex::new(plugin)));
 
         // check if this extractor has state
@@ -197,11 +258,14 @@ where
                     protocol_types,
                     auxiliary_protocol_message_decoders: auxiliary_protocol_message_decoders
                         .clone(),
+                    auxiliary_protocol_state_hydrators: auxiliary_protocol_state_hydrators
+                        .clone(),
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
                     in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
                     partial_block_buffer: Mutex::new(None),
                     dci_plugin,
+                    rpc_client: rpc_client.clone(),
                 }
             }
             Ok((cursor, block_hash, _cursor_scope)) => {
@@ -245,11 +309,14 @@ where
                     protocol_types,
                     auxiliary_protocol_message_decoders: auxiliary_protocol_message_decoders
                         .clone(),
+                    auxiliary_protocol_state_hydrators: auxiliary_protocol_state_hydrators
+                        .clone(),
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
                     in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
                     partial_block_buffer: Mutex::new(None),
                     dci_plugin,
+                    rpc_client: rpc_client.clone(),
                 }
             }
             Err(err) => return Err(ExtractionError::Setup(err.to_string())),
@@ -919,54 +986,57 @@ where
         Ok(new_tokens)
     }
 
-    async fn get_protocol_state_values_at_tip(
+    async fn get_protocol_states_at_tip(
         &self,
-        keys: &[(String, String)],
-    ) -> Result<HashMap<String, HashMap<String, Bytes>>, ExtractionError> {
-        if keys.is_empty() {
+        component_ids: &[ComponentId],
+    ) -> Result<HashMap<ComponentId, HashMap<String, Bytes>>, ExtractionError> {
+        if component_ids.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let (buffered_values, missing_keys) = {
+        let component_refs = component_ids.iter().collect::<Vec<_>>();
+        let buffered_state = {
             let reorg_buffer = self.reorg_buffer.lock().await;
             let in_flight_commit_buffer = self
                 .in_flight_commit_buffer
                 .lock()
                 .await;
 
-            let key_refs = keys
-                .iter()
-                .map(|(c, a)| (c, a))
-                .collect::<Vec<_>>();
-            let (mut buffered_values, missing_keys) = reorg_buffer.lookup_protocol_state(&key_refs);
-            let in_flight_keys = missing_keys
-                .iter()
-                .map(|(component_id, attr)| (component_id, attr))
-                .collect::<Vec<_>>();
-            let (in_flight_values, still_missing_keys) =
-                in_flight_commit_buffer.lookup_protocol_state(&in_flight_keys);
-            buffered_values.extend(in_flight_values);
-            (buffered_values, still_missing_keys)
+            let mut buffered_state =
+                in_flight_commit_buffer.lookup_protocol_state_for_components(&component_refs);
+            buffered_state.extend(reorg_buffer.lookup_protocol_state_for_components(&component_refs));
+            buffered_state
         };
-        let missing_refs = missing_keys
-            .iter()
-            .map(|(component_id, attr)| (component_id.as_str(), attr.as_str()))
-            .collect::<Vec<_>>();
 
-        let db_values = self
+        let db_states = self
             .gateway
             .inner
-            .get_protocol_state_values(&missing_refs)
+            .get_protocol_states(
+                &component_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
             .await
             .map_err(ExtractionError::Storage)?;
 
-        let mut combined = db_values;
-        for ((component_id, attr), value) in buffered_values {
-            combined
-                .entry(component_id)
-                .or_default()
-                .insert(attr, value);
+        let mut combined = db_states
+            .into_iter()
+            .map(|state| (state.component_id, state.attributes))
+            .collect::<HashMap<_, _>>();
+
+        for ((component_id, attr), value) in buffered_state {
+            let attrs = combined.entry(component_id).or_default();
+            match value {
+                Some(value) => {
+                    attrs.insert(attr, value);
+                }
+                None => {
+                    attrs.remove(&attr);
+                }
+            }
         }
+
         Ok(combined)
     }
 
@@ -2788,6 +2858,37 @@ mod test {
         .await
     }
 
+    fn build_test_hydrated_created_pool_state<'a>(
+        _: &'a dyn AuxiliaryProtocolMessageContext,
+        protocol_components: &'a [ProtocolComponent],
+        _: u64,
+    ) -> crate::extractor::protocol_message_registry::AuxiliaryProtocolStateHydrationFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(protocol_components.len(), 1);
+            let component = &protocol_components[0];
+            assert_eq!(component.protocol_system, "uniswap_v3");
+
+            let token0 = component.tokens[0].clone();
+            let token1 = component.tokens[1].clone();
+
+            Ok(HashMap::from([(
+                component.id.clone(),
+                ChainHydratedComponentState {
+                    attributes: HashMap::from([
+                        ("liquidity".to_string(), encode_i(120)),
+                        ("tick".to_string(), encode_i(4)),
+                        ("sqrt_price_x96".to_string(), encode_i(9)),
+                        ("protocol_fees/token0".to_string(), encode_i(0)),
+                        ("protocol_fees/token1".to_string(), encode_i(0)),
+                        ("ticks/-10/net-liquidity".to_string(), encode_i(100)),
+                        ("ticks/10/net-liquidity".to_string(), encode_i(-100)),
+                    ]),
+                    balances: HashMap::from([(token0, encode_i(7)), (token1, encode_i(11))]),
+                },
+            )]))
+        })
+    }
+
     fn uniswap_v3_test_block() -> uniswap_v3_stream::Block {
         uniswap_v3_stream::Block {
             hash: Bytes::from("0x1000000000000000000000000000000000000000000000000000000000000000")
@@ -2841,9 +2942,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::Unknown,
+                ))
+            });
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
@@ -2915,32 +3022,33 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::Unknown,
+                ))
+            });
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
-        gw.expect_get_protocol_state_values()
+        gw.expect_get_protocol_states()
             .times(1)
-            .return_once(|keys| {
-                let requested = keys
-                    .iter()
-                    .map(|(_, attr)| (*attr).to_string())
-                    .collect::<HashSet<_>>();
-                assert!(requested.contains("liquidity"));
-                assert!(requested.contains("tick"));
-                assert!(requested.contains("sqrt_price_x96"));
-                Ok(HashMap::from([(
-                    "0x1111111111111111111111111111111111111111".to_string(),
-                    HashMap::from([
+            .return_once(|component_ids| {
+                assert_eq!(component_ids, ["0x1111111111111111111111111111111111111111"]);
+                Ok(vec![tycho_common::models::protocol::ProtocolComponentState {
+                    component_id: "0x1111111111111111111111111111111111111111".to_string(),
+                    attributes: HashMap::from([
                         ("liquidity".to_string(), encode_i(0)),
                         ("tick".to_string(), encode_i(0)),
                         ("sqrt_price_x96".to_string(), encode_i(1)),
                         ("protocol_fees/token0".to_string(), encode_i(0)),
                         ("protocol_fees/token1".to_string(), encode_i(0)),
                     ]),
-                )]))
+                    balances: HashMap::new(),
+                }])
             });
         gw.expect_get_components_balances()
             .times(1)
@@ -3079,25 +3187,33 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::Unknown,
+                ))
+            });
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
-        gw.expect_get_protocol_state_values()
+        gw.expect_get_protocol_states()
             .times(2)
-            .returning(|_| {
-                Ok(HashMap::from([(
-                    "0x1111111111111111111111111111111111111111".to_string(),
-                    HashMap::from([
+            .returning(|component_ids| {
+                assert_eq!(component_ids, ["0x1111111111111111111111111111111111111111"]);
+                Ok(vec![tycho_common::models::protocol::ProtocolComponentState {
+                    component_id: "0x1111111111111111111111111111111111111111".to_string(),
+                    attributes: HashMap::from([
                         ("liquidity".to_string(), encode_i(0)),
                         ("tick".to_string(), encode_i(0)),
                         ("sqrt_price_x96".to_string(), encode_i(1)),
                         ("protocol_fees/token0".to_string(), encode_i(0)),
                         ("protocol_fees/token1".to_string(), encode_i(0)),
                     ]),
-                )]))
+                    balances: HashMap::new(),
+                }])
             });
 
         let token0_for_first_balance_lookup = token0.clone();
@@ -3262,6 +3378,375 @@ mod test {
             encode_i(20),
             "token1 balance should continue from the in-flight block",
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_protocol_states_at_tip_preserves_full_tick_map_across_swap_only_updates() {
+        let pool = "0x1111111111111111111111111111111111111111".to_string();
+
+        let mut gw = MockExtractorGateway::new();
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| Ok(()));
+        gw.expect_get_cursor_with_scope()
+            .times(1)
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::Unknown,
+                ))
+            });
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+        let pool_for_db = pool.clone();
+        gw.expect_get_protocol_states()
+            .times(1)
+            .return_once(move |component_ids| {
+                assert_eq!(component_ids, ["0x1111111111111111111111111111111111111111"]);
+                Ok(vec![tycho_common::models::protocol::ProtocolComponentState {
+                    component_id: pool_for_db.clone(),
+                    attributes: HashMap::from([
+                        ("liquidity".to_string(), encode_i(100)),
+                        ("tick".to_string(), encode_i(0)),
+                        ("sqrt_price_x96".to_string(), encode_i(1)),
+                        ("protocol_fees/token0".to_string(), encode_i(0)),
+                        ("protocol_fees/token1".to_string(), encode_i(0)),
+                        ("ticks/-10/net-liquidity".to_string(), encode_i(100)),
+                        ("ticks/10/net-liquidity".to_string(), encode_i(-100)),
+                    ]),
+                    balances: HashMap::new(),
+                }])
+            });
+
+        let extractor = create_extractor(gw).await;
+        let in_flight_changes = BlockChanges::new(
+            EXTRACTOR_NAME.to_string(),
+            Chain::Ethereum,
+            Block::default(),
+            10,
+            false,
+            vec![TxWithChanges {
+                tx: tycho_common::models::blockchain::Transaction::default(),
+                state_updates: HashMap::from([(
+                    pool.clone(),
+                    ProtocolComponentStateDelta {
+                        component_id: pool.clone(),
+                        updated_attributes: HashMap::from([
+                            ("liquidity".to_string(), encode_i(120)),
+                            ("tick".to_string(), encode_i(4)),
+                            ("sqrt_price_x96".to_string(), encode_i(9)),
+                        ]),
+                        deleted_attributes: HashSet::new(),
+                        created_attributes: HashSet::new(),
+                    },
+                )]),
+                ..Default::default()
+            }],
+            vec![],
+        );
+
+        extractor
+            .replace_in_flight_commit_blocks(&[BlockUpdateWithCursor::new(
+                in_flight_changes,
+                "cursor@10".to_string(),
+            )])
+            .await
+            .expect("stage swap-only in-flight block");
+
+        let state = extractor
+            .get_protocol_states_at_tip(std::slice::from_ref(&pool))
+            .await
+            .expect("get protocol states at tip");
+
+        let attrs = &state[&pool];
+        assert_eq!(attrs["liquidity"], encode_i(120));
+        assert_eq!(attrs["tick"], encode_i(4));
+        assert_eq!(attrs["sqrt_price_x96"], encode_i(9));
+        assert_eq!(attrs["ticks/-10/net-liquidity"], encode_i(100));
+        assert_eq!(attrs["ticks/10/net-liquidity"], encode_i(-100));
+    }
+
+    #[tokio::test]
+    async fn test_uniswap_v3_created_pool_can_currently_emit_non_zero_liquidity_without_ticks() {
+        let pool = "0x1111111111111111111111111111111111111111".to_string();
+        let token0 = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let token1 = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+
+        let protocol_cache = ProtocolMemoryCache::new(
+            Chain::Ethereum,
+            chrono::Duration::seconds(900),
+            Arc::new(MockGateway::new()),
+        );
+        let mut preprocessor = MockTokenPreProcessor::new();
+        preprocessor
+            .expect_get_tokens()
+            .returning(|_, _, _| Vec::new());
+
+        let mut gw = MockExtractorGateway::new();
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| Ok(()));
+        gw.expect_get_cursor_with_scope()
+            .times(1)
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::Unknown,
+                ))
+            });
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+        gw.expect_get_components_balances()
+            .times(1)
+            .return_once(|component_ids| {
+                assert!(component_ids.is_empty(), "created pool should not load historical balances");
+                Ok(HashMap::new())
+            });
+
+        let extractor = ProtocolExtractor::<
+            MockExtractorGateway,
+            MockTokenPreProcessor,
+            MockExtractorExtension,
+        >::new(
+            gw,
+            1,
+            EXTRACTOR_NAME,
+            Chain::Ethereum,
+            ChainState::default(),
+            "uniswap_v3".to_string(),
+            protocol_cache,
+            HashMap::from([("pt_1".to_string(), ProtocolType::default())]),
+            crate::extractor::family_registry::default_family_runtime_registry()
+                .auxiliary_protocol_message_decoders_for_protocol_system("uniswap_v3")
+                .map(|decoders| decoders.to_vec())
+                .unwrap_or_default(),
+            preprocessor,
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to create extractor");
+
+        let changes = build_uniswap_v3_changes(
+            &extractor,
+            uniswap_v3_stream::Events {
+                block: Some(uniswap_v3_test_block()),
+                pool_events: vec![
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 1,
+                        pool_address: pool.clone(),
+                        token0: token0.clone(),
+                        token1: token1.clone(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x9000000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::PoolCreated(pool_event::PoolCreated {
+                            fee: 3000,
+                            tick_spacing: 60,
+                        })),
+                    },
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 2,
+                        pool_address: pool.clone(),
+                        token0: token0.clone(),
+                        token1: token1.clone(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x9000000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::Initialize(pool_event::Initialize {
+                            sqrt_price: "9".to_string(),
+                            tick: 4,
+                        })),
+                    },
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 3,
+                        pool_address: pool.clone(),
+                        token0: token0.clone(),
+                        token1: token1.clone(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x9000000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::Swap(pool_event::Swap {
+                            sender: "0x3".to_string(),
+                            recipient: "0x4".to_string(),
+                            amount_0: "2".to_string(),
+                            amount_1: "-3".to_string(),
+                            sqrt_price: "9".to_string(),
+                            liquidity: "120".to_string(),
+                            tick: 4,
+                        })),
+                    },
+                ],
+            },
+            10,
+            None,
+        )
+        .await
+        .expect("build changes");
+
+        assert_eq!(changes.txs_with_update.len(), 1);
+        let tx = &changes.txs_with_update[0];
+        let delta = &tx.state_updates[&pool];
+        assert_eq!(delta.updated_attributes["liquidity"], encode_i(120));
+        assert_eq!(delta.updated_attributes["tick"], encode_i(4));
+        assert_eq!(delta.updated_attributes["sqrt_price_x96"], encode_i(9));
+        assert!(
+            !delta
+                .updated_attributes
+                .keys()
+                .any(|attr| attr.starts_with("ticks/")),
+            "created pool currently persists no tick net-liquidity attributes in this shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_uniswap_v3_created_pool_uses_auxiliary_chain_hydrator_when_available() {
+        let pool = "0x1111111111111111111111111111111111111111".to_string();
+        let token0 = Bytes::from("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let token1 = Bytes::from("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let protocol_cache = ProtocolMemoryCache::new(
+            Chain::Ethereum,
+            chrono::Duration::seconds(900),
+            Arc::new(MockGateway::new()),
+        );
+        let mut preprocessor = MockTokenPreProcessor::new();
+        preprocessor
+            .expect_get_tokens()
+            .returning(|_, _, _| Vec::new());
+
+        let mut gw = MockExtractorGateway::new();
+        gw.expect_ensure_protocol_types()
+            .times(1)
+            .returning(|_| Ok(()));
+        gw.expect_get_cursor_with_scope()
+            .times(1)
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::Unknown,
+                ))
+            });
+        gw.expect_get_block()
+            .times(1)
+            .returning(|_| Ok(Block::default()));
+        gw.expect_get_components_balances()
+            .times(1)
+            .return_once(|component_ids| {
+                assert!(
+                    component_ids.is_empty(),
+                    "created pool should not load historical balances"
+                );
+                Ok(HashMap::new())
+            });
+
+        let extractor = ProtocolExtractor::<
+            MockExtractorGateway,
+            MockTokenPreProcessor,
+            MockExtractorExtension,
+        >::new_with_runtime_support(
+            gw,
+            1,
+            EXTRACTOR_NAME,
+            Chain::Ethereum,
+            ChainState::default(),
+            "uniswap_v3".to_string(),
+            protocol_cache,
+            HashMap::from([("pt_1".to_string(), ProtocolType::default())]),
+            crate::extractor::family_registry::default_family_runtime_registry()
+                .auxiliary_protocol_message_decoders_for_protocol_system("uniswap_v3")
+                .map(|decoders| decoders.to_vec())
+                .unwrap_or_default(),
+            vec![AuxiliaryProtocolStateHydrator {
+                protocol_system: "uniswap_v3",
+                hydrate_components_from_chain: build_test_hydrated_created_pool_state,
+            }],
+            preprocessor,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to create extractor");
+
+        let changes = build_uniswap_v3_changes(
+            &extractor,
+            uniswap_v3_stream::Events {
+                block: Some(uniswap_v3_test_block()),
+                pool_events: vec![
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 1,
+                        pool_address: pool.clone(),
+                        token0: token0.to_string(),
+                        token1: token1.to_string(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x9100000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::PoolCreated(pool_event::PoolCreated {
+                            fee: 3000,
+                            tick_spacing: 60,
+                        })),
+                    },
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 2,
+                        pool_address: pool.clone(),
+                        token0: token0.to_string(),
+                        token1: token1.to_string(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x9100000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::Initialize(pool_event::Initialize {
+                            sqrt_price: "9".to_string(),
+                            tick: 4,
+                        })),
+                    },
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 3,
+                        pool_address: pool.clone(),
+                        token0: token0.to_string(),
+                        token1: token1.to_string(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x9100000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::Swap(pool_event::Swap {
+                            sender: "0x3".to_string(),
+                            recipient: "0x4".to_string(),
+                            amount_0: "2".to_string(),
+                            amount_1: "-3".to_string(),
+                            sqrt_price: "9".to_string(),
+                            liquidity: "120".to_string(),
+                            tick: 4,
+                        })),
+                    },
+                ],
+            },
+            10,
+            None,
+        )
+        .await
+        .expect("build changes");
+
+        assert_eq!(changes.txs_with_update.len(), 1);
+        let tx = &changes.txs_with_update[0];
+        let delta = &tx.state_updates[&pool];
+        assert_eq!(delta.updated_attributes["liquidity"], encode_i(120));
+        assert_eq!(delta.updated_attributes["tick"], encode_i(4));
+        assert_eq!(delta.updated_attributes["sqrt_price_x96"], encode_i(9));
+        assert_eq!(delta.updated_attributes["ticks/-10/net-liquidity"], encode_i(100));
+        assert_eq!(delta.updated_attributes["ticks/10/net-liquidity"], encode_i(-100));
+        assert_eq!(tx.balance_changes[&pool][&token0].balance, encode_i(7));
+        assert_eq!(tx.balance_changes[&pool][&token1].balance, encode_i(11));
     }
 
     #[tokio::test]

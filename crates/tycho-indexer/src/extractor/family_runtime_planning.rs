@@ -78,6 +78,8 @@ pub struct ResolvedFamilyExecutionConfig {
     pub shared_bootstrap_execution: ResolvedSharedBootstrapExecution,
     pub(crate) auxiliary_protocol_message_decoders_by_protocol_system:
         HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>>,
+    pub(crate) auxiliary_protocol_state_hydrators_by_protocol_system:
+        HashMap<String, Vec<crate::extractor::protocol_message_registry::AuxiliaryProtocolStateHydrator>>,
     pub merged_substreams_params: HashMap<String, String>,
     pub stop_block: u64,
     pub configured_start_block: i64,
@@ -528,7 +530,19 @@ pub(crate) fn resolve_resolved_family_execution_config(
                     .auxiliary_protocol_message_decoders_for_protocol_system(
                         config.protocol_system(),
                     )
-                    .map(|decoders: &[AuxiliaryProtocolMessageDecoder]| decoders.to_vec())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let auxiliary_protocol_state_hydrators_by_protocol_system = extractor_configs
+        .iter()
+        .map(|config| {
+            (
+                config.protocol_system().to_string(),
+                registry
+                    .auxiliary_protocol_state_hydrators_for_protocol_system(
+                        config.protocol_system(),
+                    )
                     .unwrap_or_default(),
             )
         })
@@ -539,6 +553,7 @@ pub(crate) fn resolve_resolved_family_execution_config(
         shared_stream: family.resolved_shared_stream(),
         shared_bootstrap_execution,
         auxiliary_protocol_message_decoders_by_protocol_system,
+        auxiliary_protocol_state_hydrators_by_protocol_system,
         merged_substreams_params,
         stop_block,
         configured_start_block,
@@ -808,7 +823,9 @@ mod tests {
         extractor_config::{
             BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig,
         },
-        family_registry::{default_family_runtime_registry, FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec},
+        family_registry::{
+            default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec,
+        },
         family_runtime_metadata::{FamilyRuntimeConfig, ResolvedSharedFamilyStream},
         protocol_message_registry::{
             AuxiliaryProtocolMessageBuildFuture, AuxiliaryProtocolMessageContext,
@@ -909,26 +926,27 @@ mod tests {
                 type_url_suffix: "FutureEvents",
                 build_block_changes: build_future_family_events,
             }];
-        const FUTURE_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec::new(
-            "future_swap",
-            &[
-                FamilyMemberSpec {
-                    protocol_system: "future_v1",
-                    shared_route_protocols: &["futurev1"],
-                    shared_bootstrap: None,
-                },
-                FamilyMemberSpec {
-                    protocol_system: "future_v2",
-                    shared_route_protocols: &["futurev2"],
-                    shared_bootstrap: None,
-                },
-            ],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
-            "family::future_swap_runtime",
-            None,
-            FUTURE_AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
-        );
+        const FUTURE_FAMILY: FamilyRuntimeSpec =
+            crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_decoders(
+                "future_swap",
+                &[
+                    crate::extractor::family_registry::shared_family_member_spec(
+                        "future_v1",
+                        &["futurev1"],
+                        None,
+                    ),
+                    crate::extractor::family_registry::shared_family_member_spec(
+                        "future_v2",
+                        &["futurev2"],
+                        None,
+                    ),
+                ],
+                "map_future_swap_family_protocol_changes",
+                "future_swap_family",
+                "family::future_swap_runtime",
+                None,
+                FUTURE_AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
+            );
         const SPECS: &[FamilyRuntimeSpec] = &[FUTURE_FAMILY];
         let registry = FamilyRuntimeRegistry::new(SPECS);
         let extractors = HashMap::from([

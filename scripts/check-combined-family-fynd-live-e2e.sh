@@ -153,21 +153,53 @@ load_live_tests
 
 fynd_repo_exists="true"
 fynd_test_exists="true"
+route_test_exists="unknown"
+settlement_test_exists="unknown"
+live_test_mapping_ready="unknown"
 tycho_health="unknown"
 tycho_protocols_ready="unknown"
 protocol_v2_ready="unknown"
 protocol_v3_ready="unknown"
 curl_available="true"
 ready="true"
+fynd_e2e_test_path="${FYND_REPO_ROOT}/tests/e2e_quote.rs"
 
 if [[ ! -d "${FYND_REPO_ROOT}" || ! -f "${FYND_REPO_ROOT}/Cargo.toml" ]]; then
   fynd_repo_exists="false"
   ready="false"
 fi
 
-if [[ ! -f "${FYND_REPO_ROOT}/tests/e2e_quote.rs" ]]; then
+if [[ ! -f "${fynd_e2e_test_path}" ]]; then
   fynd_test_exists="false"
   ready="false"
+fi
+
+fynd_declares_ignored_test() {
+  local test_name="$1"
+  local test_file="$2"
+  grep -Eq "fn[[:space:]]+${test_name}[[:space:]]*\\(" "${test_file}"
+}
+
+if [[ "${fynd_test_exists}" == "true" ]]; then
+  if fynd_declares_ignored_test "${ROUTE_TEST}" "${fynd_e2e_test_path}"; then
+    route_test_exists="true"
+  else
+    route_test_exists="false"
+    ready="false"
+  fi
+
+  if fynd_declares_ignored_test "${SETTLEMENT_TEST}" "${fynd_e2e_test_path}"; then
+    settlement_test_exists="true"
+  else
+    settlement_test_exists="false"
+    ready="false"
+  fi
+
+  if [[ "${route_test_exists}" == "true" && "${settlement_test_exists}" == "true" ]]; then
+    live_test_mapping_ready="true"
+  else
+    live_test_mapping_ready="false"
+  fi
 fi
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -229,6 +261,9 @@ ready=${ready}
 fynd_repo_root=${FYND_REPO_ROOT}
 fynd_repo_exists=${fynd_repo_exists}
 fynd_test_exists=${fynd_test_exists}
+route_test_exists=${route_test_exists}
+settlement_test_exists=${settlement_test_exists}
+live_test_mapping_ready=${live_test_mapping_ready}
 tycho_url=${FYND_E2E_TYCHO_URL}
 tycho_health=${tycho_health}
 tycho_protocols_ready=${tycho_protocols_ready}
@@ -310,7 +345,7 @@ effective_health_mode_for_selection() {
       printf '%s' "quote_ready"
       ;;
     settlement)
-      printf '%s' "strict"
+      printf '%s' "quote_ready"
       ;;
     *)
       echo "unknown health-mode selection: ${selection}" >&2
@@ -365,6 +400,7 @@ run_one() {
   local effective_health_mode
   effective_health_mode="$(effective_health_mode_for_selection "${selection}")"
   cd "${FYND_REPO_ROOT}"
+  local -a env_cmd=(env)
   local -a env_args=(
     "RUST_LOG=${FYND_E2E_RUST_LOG}"
     "FYND_E2E_TYCHO_URL=${FYND_E2E_TYCHO_URL}"
@@ -382,12 +418,16 @@ run_one() {
   fi
   if [[ -n "${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE}" ]]; then
     env_args+=("TYCHO_STREAM_WS_BUFFER_SIZE=${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE}")
+  else
+    env_cmd+=(-u "TYCHO_STREAM_WS_BUFFER_SIZE")
   fi
   if [[ -n "${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE}" ]]; then
     env_args+=("TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE=${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE}")
+  else
+    env_cmd+=(-u "TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE")
   fi
 
-  env "${env_args[@]}" cargo test --test e2e_quote "${test_name}" -- --ignored --nocapture
+  "${env_cmd[@]}" "${env_args[@]}" cargo test --test e2e_quote "${test_name}" -- --ignored --nocapture
 }
 
 case "${mode}" in

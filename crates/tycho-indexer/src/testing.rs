@@ -1051,6 +1051,7 @@ pub fn write_family_defaults_config_with_shared_bootstrap_for_tests(
     family_name: &str,
     shared_spkg_path: &str,
     bootstrap_path: Option<&str>,
+    durability_scope: Option<&str>,
     stop_block: Option<i64>,
     members: &[FamilyDefaultsFixtureMemberSpec<'_>],
 ) -> std::path::PathBuf {
@@ -1059,6 +1060,9 @@ pub fn write_family_defaults_config_with_shared_bootstrap_for_tests(
         .unwrap_or_default();
     let bootstrap_yaml = bootstrap_path
         .map(|path| format!("    bootstrap:\n      params: \"@{path}\"\n"))
+        .unwrap_or_default();
+    let durability_scope_yaml = durability_scope
+        .map(|scope| format!("    durability_scope: \"{scope}\"\n"))
         .unwrap_or_default();
     let member_defaults_yaml = render_family_defaults_fixture_member_defaults_yaml(members);
     let extractor_configs_yaml =
@@ -1073,11 +1077,12 @@ family_runtimes:
   {family_name}:
     shared_spkg: "{shared_spkg_path}"
     shared_module: "{shared_module}"
-{stop_block_yaml}{bootstrap_yaml}{member_defaults_yaml}extractors:
+{durability_scope_yaml}{stop_block_yaml}{bootstrap_yaml}{member_defaults_yaml}extractors:
 {extractor_configs_yaml}
 "#,
             family_name = family_name,
             shared_module = family_output_module_for_tests(family_name),
+            durability_scope_yaml = durability_scope_yaml,
             stop_block_yaml = stop_block_yaml,
             bootstrap_yaml = bootstrap_yaml,
             member_defaults_yaml = member_defaults_yaml,
@@ -1105,6 +1110,50 @@ pub fn write_uniswap_family_defaults_config_with_member_names(
         "uniswap",
         shared_spkg_path,
         None,
+        None,
+        stop_block,
+        &[
+            FamilyDefaultsFixtureMemberSpec {
+                extractor_name: v2_name,
+                protocol_system: "uniswap_v2",
+                protocol_type_name: "uniswap_v2_pool",
+                module_name: "v2_map_pool_events",
+                start_block,
+                substreams_module_name: None,
+                substreams_params: None,
+            },
+            FamilyDefaultsFixtureMemberSpec {
+                extractor_name: v3_name,
+                protocol_system: "uniswap_v3",
+                protocol_type_name: "uniswap_v3_pool",
+                module_name: "v3_map_protocol_changes",
+                start_block,
+                substreams_module_name: None,
+                substreams_params: None,
+            },
+        ],
+    )
+}
+
+#[cfg(test)]
+pub fn write_uniswap_family_defaults_config_with_member_names_and_runtime_overrides(
+    file_prefix: &str,
+    unique: &str,
+    shared_spkg_path: &str,
+    bootstrap_path: Option<&str>,
+    durability_scope: Option<&str>,
+    start_block: i64,
+    stop_block: Option<i64>,
+    v2_name: &str,
+    v3_name: &str,
+) -> std::path::PathBuf {
+    write_family_defaults_config_with_shared_bootstrap_for_tests(
+        file_prefix,
+        unique,
+        "uniswap",
+        shared_spkg_path,
+        bootstrap_path,
+        durability_scope,
         stop_block,
         &[
             FamilyDefaultsFixtureMemberSpec {
@@ -1146,6 +1195,7 @@ pub fn write_uniswap_family_defaults_config_with_shared_bootstrap(
         "uniswap",
         shared_spkg_path,
         Some(bootstrap_path),
+        None,
         stop_block,
         &[
             FamilyDefaultsFixtureMemberSpec {
@@ -1324,12 +1374,98 @@ pub(crate) async fn build_all_extractors_for_tests(
     config: &ExtractorConfigs,
     context: BuildExtractorsTestContext<'_>,
 ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
-    let runtime_targets =
-        config.resolved_runtime_targets_with_registry(context.family_runtime_registry)?;
-
-    runtime_targets
+    config
+        .resolved_indexer_runtime_plan_with_registry(context.family_runtime_registry)?
         .build_managed_runners(context.runtime_targets_build_context())
         .await
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn build_all_extractors_from_config_path_with_registry_for_tests(
+    config_path: &std::path::Path,
+    context: BuildExtractorsTestContext<'_>,
+) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
+    let loaded_runtime_plan = crate::config::LoadedIndexerRuntimePlan::from_yaml_with_registry(
+        config_path
+            .to_str()
+            .expect("config path should be utf8"),
+        context.family_runtime_registry,
+    )?;
+    loaded_runtime_plan
+        .resolved_runtime_plan()?
+    .build_managed_runners(context.runtime_targets_build_context())
+    .await
+}
+
+#[cfg(test)]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn build_all_extractors_from_config_path_with_default_family_registry_for_tests(
+    config_path: &std::path::Path,
+    chain_state: ChainState,
+    _chains: &[Chain],
+    endpoint_url: &str,
+    s3_bucket: Option<&str>,
+    substreams_api_token: &str,
+    cached_gw: &CachedGateway,
+    database_insert_batch_size: usize,
+    token_pre_processor: &EthereumTokenPreProcessor,
+    rpc_client: &EthereumRpcClient,
+    runtime: Option<&tokio::runtime::Handle>,
+    partial_blocks: bool,
+) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
+    build_all_extractors_from_config_path_with_registry_for_tests(
+        config_path,
+        BuildExtractorsTestContext {
+            chain_state,
+            endpoint_url,
+            s3_bucket,
+            substreams_api_token,
+            cached_gw,
+            database_insert_batch_size,
+            token_pre_processor,
+            rpc_client,
+            runtime,
+            partial_blocks,
+            family_runtime_registry: default_family_runtime_registry(),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_all_extractors_with_default_family_registry_for_tests(
+    config: &ExtractorConfigs,
+    chain_state: ChainState,
+    _chains: &[Chain],
+    endpoint_url: &str,
+    s3_bucket: Option<&str>,
+    substreams_api_token: &str,
+    cached_gw: &CachedGateway,
+    database_insert_batch_size: usize,
+    token_pre_processor: &EthereumTokenPreProcessor,
+    rpc_client: &EthereumRpcClient,
+    runtime: Option<&tokio::runtime::Handle>,
+    partial_blocks: bool,
+) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
+    build_all_extractors_for_tests(
+        config,
+        BuildExtractorsTestContext {
+            chain_state,
+            endpoint_url,
+            s3_bucket,
+            substreams_api_token,
+            cached_gw,
+            database_insert_batch_size,
+            token_pre_processor,
+            rpc_client,
+            runtime,
+            partial_blocks,
+            family_runtime_registry: default_family_runtime_registry(),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1926,27 +2062,26 @@ fn parse_bootstrap_query_value_for_tests<'a>(params: &'a str, key: &str) -> Opti
 #[cfg(test)]
 pub fn shared_bootstrap_seed_universe_spec_from_config_path_with_registry_for_tests(
     config_path: &std::path::Path,
-    registry: FamilyRuntimeRegistry<'_>,
+    registry: FamilyRuntimeRegistry<'static>,
 ) -> SharedBootstrapSeedUniverseSpec {
-    let config = ExtractorConfigs::from_yaml_with_registry(
+    let loaded_runtime_plan = crate::config::LoadedIndexerRuntimePlan::from_yaml_with_registry(
         config_path
             .to_str()
             .expect("shared bootstrap seed config path should be utf8"),
         registry,
     )
-    .expect("load shared bootstrap seed config");
-    let runtime_targets = config
-        .resolved_runtime_targets_with_registry(registry)
-        .expect("resolve runtime targets for shared bootstrap seed extraction");
-    let runtime_target = runtime_targets
-        .require_unique(&format!(
+    .expect("load shared bootstrap seed runtime owner");
+    let runtime_target = loaded_runtime_plan
+        .resolved_runtime_plan()
+        .expect("resolve runtime plan for shared bootstrap seed extraction")
+        .into_unique_runtime_target(&format!(
             "shared bootstrap seed extraction from `{}` requires exactly one runtime target",
             config_path.display()
         ))
         .expect("shared bootstrap seed config should resolve one runtime target");
 
     shared_bootstrap_seed_universe_spec_from_runtime_target_for_tests(
-        runtime_target,
+        &runtime_target,
         &config_path.display().to_string(),
     )
 }
@@ -2114,6 +2249,7 @@ pub async fn seed_repo_runtime_target_shared_bootstrap_universe_for_tests(
     use tycho_common::models::{
         blockchain::{Block, Transaction},
         contract::{Account, AccountDelta},
+        protocol::ProtocolComponentStateDelta,
         token::Token,
         ChangeType,
     };
@@ -2156,6 +2292,7 @@ pub async fn seed_repo_runtime_target_shared_bootstrap_universe_for_tests(
     let mut protocol_components = Vec::with_capacity(seed_spec.pools.len());
     let mut contract_accounts = Vec::with_capacity(seed_spec.pools.len());
     let mut contract_deltas = Vec::with_capacity(seed_spec.pools.len());
+    let mut state_deltas = Vec::new();
     let mut component_ids_by_system: HashMap<String, std::collections::HashSet<String>> =
         HashMap::new();
 
@@ -2211,6 +2348,40 @@ pub async fn seed_repo_runtime_target_shared_bootstrap_universe_for_tests(
             seed_tx.hash.clone(),
             seed_timestamp,
         ));
+
+        if seed.protocol_system == "uniswap_v3" {
+            state_deltas.push((
+                seed_tx.hash.clone(),
+                ProtocolComponentStateDelta {
+                    component_id: seed.component_id.clone(),
+                    updated_attributes: HashMap::from([
+                        ("liquidity".to_string(), Bytes::from([0_u8; 16].to_vec())),
+                        ("tick".to_string(), Bytes::from([0_u8; 4].to_vec())),
+                        ("sqrt_price_x96".to_string(), Bytes::from(vec![1_u8])),
+                        ("protocol_fees/token0".to_string(), Bytes::from([0_u8; 16].to_vec())),
+                        ("protocol_fees/token1".to_string(), Bytes::from([0_u8; 16].to_vec())),
+                        (
+                            "ticks/-60/net-liquidity".to_string(),
+                            Bytes::from(1_i128.to_be_bytes().to_vec()),
+                        ),
+                        (
+                            "ticks/60/net-liquidity".to_string(),
+                            Bytes::from((-1_i128).to_be_bytes().to_vec()),
+                        ),
+                    ]),
+                    deleted_attributes: std::collections::HashSet::new(),
+                    created_attributes: std::collections::HashSet::from([
+                        "liquidity".to_string(),
+                        "tick".to_string(),
+                        "sqrt_price_x96".to_string(),
+                        "protocol_fees/token0".to_string(),
+                        "protocol_fees/token1".to_string(),
+                        "ticks/-60/net-liquidity".to_string(),
+                        "ticks/60/net-liquidity".to_string(),
+                    ]),
+                },
+            ));
+        }
     }
 
     let tokens = tokens_by_address
@@ -2234,6 +2405,12 @@ pub async fn seed_repo_runtime_target_shared_bootstrap_universe_for_tests(
         .add_protocol_components(&protocol_components)
         .await
         .expect("seed shared bootstrap universe components");
+    if !state_deltas.is_empty() {
+        direct_gw
+            .update_protocol_states(&state_deltas)
+            .await
+            .expect("seed shared bootstrap universe protocol states");
+    }
 
     component_ids_by_system
 }

@@ -447,6 +447,33 @@ impl StateUpdateBufferEntry for BlockChanges {
         res
     }
 
+    fn get_protocol_state_update_for_components(
+        &self,
+        component_ids: Vec<&ProtocolStateIdType>,
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue> {
+        let component_ids: HashSet<_> = component_ids.into_iter().collect();
+        let mut res = HashMap::new();
+
+        for update in self.txs_with_update.iter().rev() {
+            for (component_id, protocol_update) in update
+                .state_updates
+                .iter()
+                .filter(|(component_id, _)| component_ids.contains(component_id))
+            {
+                for attr in &protocol_update.deleted_attributes {
+                    res.entry((component_id.clone(), attr.clone()))
+                        .or_insert(None);
+                }
+                for (attr, val) in &protocol_update.updated_attributes {
+                    res.entry((component_id.clone(), attr.clone()))
+                        .or_insert(Some(val.clone()));
+                }
+            }
+        }
+
+        res
+    }
+
     #[allow(clippy::mutable_key_type)]
     fn get_filtered_account_state_update(
         &self,

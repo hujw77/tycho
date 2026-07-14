@@ -7,13 +7,16 @@ use tycho_storage::postgres::cache::CachedGateway;
 use crate::extractor::{
     chain_state::ChainState,
     control::ExtractorHandle,
+    family_managed_startup::PreparedFamilyRunnerDraft,
     family_managed_startup::PreparedFamilyRunnerStartup,
     family_registry::FamilyRuntimeRegistry,
     managed_extractor_initialization::ManagedExtractorBuildContext,
+    managed_stream_startup::load_stream_for_prepared_request,
     managed_stream_startup::PreparedSingleRunnerStartup,
     protocol_cache::ProtocolMemoryCache,
     runner::ManagedRunner,
     runtime_target_planning::ResolvedRuntimeTarget,
+    standalone_managed_startup::PreparedSingleRunnerDraft,
     ExtractionError,
 };
 
@@ -199,7 +202,6 @@ impl ResolvedRuntimeTargetsBuildContext<'_> {
             token_pre_processor: self.token_pre_processor,
             protocol_cache,
             rpc_client: self.rpc_client,
-            final_block_only: self.final_block_only,
             partial_blocks: self.partial_blocks,
             family_runtime_registry: self.family_runtime_registry,
         }
@@ -214,10 +216,48 @@ impl<'a> ResolvedRuntimeTarget<'a> {
     ) -> Result<PreparedRuntimeTargetStartup, ExtractionError> {
         let extractor_build = context.extractor_build_context(protocol_cache);
         match self {
-            Self::Family(family) => Ok(family.prepare_managed_startup(extractor_build).await?.into()),
+            Self::Family(family) => {
+                let draft = family.prepare_managed_startup_draft(extractor_build).await?;
+                prepare_family_startup_from_draft(draft, context).await
+            }
             Self::Standalone(standalone) => {
-                Ok(standalone.prepare_managed_startup(extractor_build).await?.into())
+                let draft = standalone
+                    .prepare_managed_startup_draft(extractor_build)
+                    .await?;
+                prepare_single_startup_from_draft(draft, context).await
             }
         }
     }
+}
+
+async fn prepare_family_startup_from_draft(
+    draft: PreparedFamilyRunnerDraft,
+    context: &ResolvedRuntimeTargetsBuildContext<'_>,
+) -> Result<PreparedRuntimeTargetStartup, ExtractionError> {
+    let stream = load_stream_for_prepared_request(
+        &draft.prepared_request,
+        context.s3_bucket,
+        context.endpoint_url,
+        context.substreams_api_token,
+        context.final_block_only,
+        context.partial_blocks,
+    )
+    .await?;
+    Ok(draft.into_prepared_startup(stream).into())
+}
+
+async fn prepare_single_startup_from_draft(
+    draft: PreparedSingleRunnerDraft,
+    context: &ResolvedRuntimeTargetsBuildContext<'_>,
+) -> Result<PreparedRuntimeTargetStartup, ExtractionError> {
+    let stream = load_stream_for_prepared_request(
+        &draft.prepared_request,
+        context.s3_bucket,
+        context.endpoint_url,
+        context.substreams_api_token,
+        context.final_block_only,
+        context.partial_blocks,
+    )
+    .await?;
+    Ok(draft.into_prepared_startup(stream).into())
 }

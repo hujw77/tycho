@@ -22,7 +22,12 @@ use tycho_common::{
 };
 use tycho_ethereum::{rpc::EthereumRpcClient, BytesCodec};
 
-use crate::extractor::{models::BlockChanges, u256_num::bytes_to_f64, ExtractionError};
+use crate::extractor::{
+    models::BlockChanges,
+    protocol_message_registry::ChainHydratedComponentState,
+    u256_num::bytes_to_f64,
+    ExtractionError,
+};
 
 sol! {
     struct Multicall3Call {
@@ -234,6 +239,47 @@ pub async fn build_uniswap_v3_bootstrap_block(
         )],
         vec![],
     ))
+}
+
+pub(crate) async fn hydrate_uniswap_v3_components_from_chain(
+    rpc: &EthereumRpcClient,
+    protocol_components: &[ProtocolComponent],
+    block_number: u64,
+) -> Result<HashMap<String, ChainHydratedComponentState>, ExtractionError> {
+    if protocol_components.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let block_tag = BlockNumberOrTag::Number(block_number);
+    let pool_addresses = protocol_components
+        .iter()
+        .map(|component| parse_address(&component.id).and_then(|address| to_alloy_address(&address)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let seeds = fetch_pool_snapshot_seeds(rpc, block_tag, &pool_addresses).await?;
+    let balances = fetch_pool_balances_batched(rpc, block_tag, &seeds).await?;
+    let tick_attributes = fetch_tick_attributes_batched(rpc, block_tag, &seeds).await?;
+
+    let mut hydrated = HashMap::with_capacity(seeds.len());
+    for ((seed, (balance0, balance1)), tick_attributes) in seeds
+        .into_iter()
+        .zip(balances)
+        .zip(tick_attributes)
+    {
+        hydrated.insert(
+            seed.component_id.clone(),
+            ChainHydratedComponentState {
+                attributes: build_state_update(&seed.component_id, &seed, tick_attributes)
+                    .updated_attributes,
+                balances: HashMap::from([
+                    (seed.token0.clone(), balance0),
+                    (seed.token1.clone(), balance1),
+                ]),
+            },
+        );
+    }
+
+    Ok(hydrated)
 }
 
 async fn fetch_block(

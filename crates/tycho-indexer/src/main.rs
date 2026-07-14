@@ -44,9 +44,7 @@ use tycho_ethereum::{
 #[cfg(test)]
 use tycho_indexer::extractor::family_runtime_metadata::FamilyRuntimeConfig;
 #[cfg(test)]
-use tycho_indexer::extractor::{
-    chain_state::ChainState, control::ExtractorHandle, runner::ManagedRunner,
-};
+use tycho_indexer::extractor::chain_state::ChainState;
 #[cfg(test)]
 use tycho_indexer::services::ServicesBuilder;
 use tycho_indexer::{
@@ -235,8 +233,17 @@ fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), Ext
 
         info!("Starting Tycho");
         debug!("{} CPUs detected", num_cpus::get());
-        let extractors_config = ExtractorConfigs::from_yaml(&index_args.extractors_config)
-            .map_err(|e| ExtractionError::Setup(format!("Failed to load extractors.yaml. {e}")))?;
+        let loaded_runtime_plan = config::LoadedIndexerRuntimePlan::from_yaml(
+            &index_args.extractors_config,
+        )
+        .map_err(|e| {
+            ExtractionError::Setup(format!(
+                "Failed to load extractors runtime owner: {e}"
+            ))
+        })?;
+        let runtime_plan = loaded_runtime_plan
+            .resolved_runtime_plan()
+            .map_err(|e| ExtractionError::Setup(format!("Failed to resolve runtime targets: {e}")))?;
 
         let retention_horizon: NaiveDateTime = index_args
             .retention_horizon
@@ -255,7 +262,7 @@ fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), Ext
                 })
                 .collect::<Vec<_>>(),
             retention_horizon,
-            extractors_config,
+            runtime_plan,
             Some(extraction_runtime.handle()),
             index_args.settlement_contract,
         )
@@ -333,13 +340,16 @@ async fn run_spkg(global_args: GlobalArgs, run_args: RunSpkgArgs) -> Result<(), 
             None,
         ),
     )]));
+    let runtime_plan = config
+        .resolved_indexer_runtime_plan()
+        .map_err(|e| ExtractionError::Setup(format!("Failed to resolve runtime targets: {e}")))?;
 
     let (extraction_tasks, mut other_tasks) = create_indexing_tasks(
         &global_args,
         &run_args.substreams_args,
         &[Chain::from_str(&run_args.chain).unwrap()],
         Utc::now().naive_utc(),
-        config,
+        runtime_plan,
         None,
         run_args.settlement_contract,
     )
@@ -405,7 +415,7 @@ async fn create_indexing_tasks(
     substreams_args: &SubstreamsArgs,
     chains: &[Chain],
     retention_horizon: NaiveDateTime,
-    extractors_config: ExtractorConfigs,
+    runtime_plan: config::ResolvedIndexerRuntimePlan<'_>,
     extraction_runtime: Option<&Handle>,
     settlement_contract: alloy::primitives::Address,
 ) -> Result<(ExtractionTasks, ServerTasks), ExtractionError> {
@@ -416,9 +426,6 @@ async fn create_indexing_tasks(
         global_args.server_port,
     )?;
 
-    let runtime_plan = extractors_config
-        .resolved_indexer_runtime_plan()
-        .map_err(|e| ExtractionError::Setup(format!("Failed to resolve runtime targets: {e}")))?;
     let family_runtime_registry = runtime_plan.family_runtime_registry();
 
     let managed_indexer = launch_config
@@ -475,7 +482,10 @@ mod test_serial_db {
     use std::collections::HashMap;
 
     use crate::testing::{
-        build_all_extractors_for_tests, family_block_response,
+        build_all_extractors_from_config_path_with_default_family_registry_for_tests as build_all_extractors_from_config_path,
+        build_all_extractors_from_config_path_with_registry_for_tests,
+        build_all_extractors_with_default_family_registry_for_tests as build_all_extractors,
+        family_block_response,
         family_block_response_from_block_changes,
         future_family_runtime_registry_for_record_substreams_tests,
         future_family_runtime_registry_for_record_substreams_tests_with_durability_scope,
@@ -492,13 +502,13 @@ mod test_serial_db {
         write_temp_substreams_package_for_tests as test_family_shared_spkg_path,
         write_uniswap_family_defaults_config_for_tests as test_family_defaults_config,
         write_uniswap_family_defaults_config_with_member_names_for_tests as test_family_defaults_config_with_member_names,
+        write_uniswap_family_defaults_config_with_member_names_and_runtime_overrides,
         write_uniswap_family_defaults_config_with_shared_bootstrap,
     };
     use alloy::primitives::Address as AlloyAddress;
     use once_cell::sync::Lazy;
     use prost::Message;
     use substreams::store::StoreGet;
-    use tycho_storage::postgres::cache::CachedGateway;
     use tycho_storage::postgres::testing::run_against_db;
 
     use super::*;
@@ -507,44 +517,29 @@ mod test_serial_db {
         EthereumRpcClient::new(&rpc_url).expect("Failed to create RPC client")
     });
 
-    #[allow(clippy::too_many_arguments)]
-    async fn build_all_extractors(
-        config: &ExtractorConfigs,
-        chain_state: ChainState,
-        _chains: &[Chain],
-        endpoint_url: &str,
-        s3_bucket: Option<&str>,
-        substreams_api_token: &str,
-        cached_gw: &CachedGateway,
-        database_insert_batch_size: usize,
-        token_pre_processor: &EthereumTokenPreProcessor,
-        rpc_client: &EthereumRpcClient,
-        runtime: Option<&tokio::runtime::Handle>,
-        partial_blocks: bool,
-    ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
-        build_all_extractors_for_tests(
-            config,
-            crate::testing::BuildExtractorsTestContext {
-                chain_state,
-                endpoint_url,
-                s3_bucket,
-                substreams_api_token,
-                cached_gw,
-                database_insert_batch_size,
-                token_pre_processor,
-                rpc_client,
-                runtime,
-                partial_blocks,
-                family_runtime_registry:
-                    tycho_indexer::extractor::family_registry::default_family_runtime_registry(),
-            },
-        )
-        .await
-    }
-
     #[derive(Clone, Debug, Default)]
     struct MockProtoStore<T> {
         values: HashMap<String, T>,
+    }
+
+    fn assert_uniswap_v3_state_keeps_tick_map_when_liquidity_is_non_zero(
+        attributes: &HashMap<String, Bytes>,
+        context: &str,
+    ) {
+        let has_tick_map = attributes
+            .keys()
+            .any(|key| key.starts_with("ticks/") && key.ends_with("/net-liquidity"));
+        let liquidity_is_non_zero = attributes
+            .get("liquidity")
+            .map(|value| value.iter().any(|byte| *byte != 0))
+            .unwrap_or(false);
+
+        if liquidity_is_non_zero {
+            assert!(
+                has_tick_map,
+                "{context} should keep at least one persisted V3 tick net-liquidity attribute when liquidity is non-zero"
+            );
+        }
     }
 
     impl<T> MockProtoStore<T> {
@@ -958,15 +953,8 @@ mod test_serial_db {
                 Some(123),
             );
 
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 config path"),
-            )
-            .expect("load family-default config");
-
-            let (runners, handles) = build_all_extractors(
-                &config,
+            let (runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 "https://mainnet.eth.streamingfast.io",
@@ -1034,24 +1022,14 @@ mod test_serial_db {
                 .expect("persist block");
             cached_gw
                 .save_state(&ExtractionState::new(
-                    "uniswap_v2".to_string(),
+                    test_family_durability_scope(),
                     chain,
                     None,
                     b"cursor@123-shared",
                     persisted_block.hash.clone(),
                 ))
                 .await
-                .expect("persist v2 extraction state");
-            cached_gw
-                .save_state(&ExtractionState::new(
-                    "uniswap_v3".to_string(),
-                    chain,
-                    None,
-                    b"cursor@123-shared",
-                    persisted_block.hash.clone(),
-                ))
-                .await
-                .expect("persist v3 extraction state");
+                .expect("persist shared family extraction state");
             cached_gw
                 .commit_transaction(0)
                 .await
@@ -1101,12 +1079,13 @@ params:
                 Some("factory=0x1F98431c8aD98523631AE4a59f267346ea31F984"),
             );
 
-            let config = ExtractorConfigs::from_yaml(
+            let loaded_runtime_plan = config::LoadedIndexerRuntimePlan::from_yaml(
                 config_path
                     .to_str()
                     .expect("utf8 config path"),
             )
             .expect("load family-default bootstrap config");
+            let config = loaded_runtime_plan.extractors_config();
 
             let v2 = config
                 .extractors
@@ -1141,8 +1120,8 @@ params:
                 Some(&"factory=0x1F98431c8aD98523631AE4a59f267346ea31F984".to_string())
             );
 
-            let (runners, handles) = build_all_extractors(
-                &config,
+            let (runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 "https://mainnet.eth.streamingfast.io",
@@ -1211,38 +1190,23 @@ params:
                 .expect("persist block");
             cached_gw
                 .save_state(&ExtractionState::new(
-                    "uniswap_v2".to_string(),
+                    test_family_durability_scope(),
                     chain,
                     None,
                     b"cursor@123-shared",
                     persisted_block.hash.clone(),
                 ))
                 .await
-                .expect("persist v2 extraction state");
-            cached_gw
-                .save_state(&ExtractionState::new(
-                    "uniswap_v3".to_string(),
-                    chain,
-                    None,
-                    b"cursor@123-shared",
-                    persisted_block.hash.clone(),
-                ))
-                .await
-                .expect("persist v3 extraction state");
+                .expect("persist shared family extraction state");
             cached_gw
                 .commit_transaction(0)
                 .await
                 .expect("commit seeded extraction state");
-            let saved_v2 = cached_gw
-                .get_state("uniswap_v2", &chain)
+            let shared_state = cached_gw
+                .get_state(&test_family_durability_scope(), &chain)
                 .await
-                .expect("read back v2 extraction state");
-            let saved_v3 = cached_gw
-                .get_state("uniswap_v3", &chain)
-                .await
-                .expect("read back v3 extraction state");
-            assert_eq!(saved_v2.block_hash, persisted_block.hash);
-            assert_eq!(saved_v3.block_hash, persisted_block.hash);
+                .expect("read back shared family extraction state");
+            assert_eq!(shared_state.block_hash, persisted_block.hash);
 
             let shared_spkg_path = test_family_shared_spkg_path("combined-family-resume");
 
@@ -1377,9 +1341,11 @@ params:
                 .upsert_block(std::slice::from_ref(&persisted_block))
                 .await
                 .expect("persist block");
+            let unique = test_unique_suffix();
+            let family_scope = format!("{}::{unique}", test_family_durability_scope());
             cached_gw
                 .save_state(&ExtractionState::new(
-                    test_family_durability_scope(),
+                    family_scope.clone(),
                     chain,
                     None,
                     b"cursor@123-family-shared",
@@ -1392,31 +1358,25 @@ params:
                 .await
                 .expect("commit seeded shared family extraction state");
             let shared_state = cached_gw
-                .get_state(&test_family_durability_scope(), &chain)
+                .get_state(&family_scope, &chain)
                 .await
                 .expect("read back shared family extraction state");
             assert_eq!(shared_state.block_hash, persisted_block.hash);
 
             let shared_spkg_path = test_family_shared_spkg_path("combined-family-alias-resume");
-            let unique = test_unique_suffix();
-            let config_path = test_family_defaults_config_with_member_names(
+            let config_path = write_uniswap_family_defaults_config_with_member_names_and_runtime_overrides(
                 "tycho-indexer-family-defaults-aliased-resume",
                 &unique,
                 &shared_spkg_path,
+                None,
+                Some(&family_scope),
                 42,
                 None,
                 "uniswap_v2_alias",
                 "uniswap_v3_alias",
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 aliased family-default config path"),
-            )
-            .expect("load aliased family-default config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr}"),
@@ -1490,9 +1450,35 @@ params:
                 .upsert_block(std::slice::from_ref(&persisted_block))
                 .await
                 .expect("persist bootstrap marker block");
+            let shared_spkg_path =
+                test_family_shared_spkg_path("combined-family-alias-bootstrap-complete");
+            let unique = test_unique_suffix();
+            let family_scope = format!("{}::{unique}", test_family_durability_scope());
+            let temp_root = std::env::temp_dir()
+                .join(format!("tycho-indexer-family-alias-bootstrap-complete-{unique}"));
+            let _ = std::fs::remove_dir_all(&temp_root);
+            std::fs::create_dir_all(&temp_root).expect("create alias bootstrap temp config dir");
+            let bootstrap_path = temp_root.join("shared_bootstrap.yaml");
+            std::fs::write(
+                &bootstrap_path,
+                r#"
+start_block: 42
+params:
+  routes:
+    - token0: "0x00000000000000000000000000000000000000a1"
+      token1: "0x00000000000000000000000000000000000000b1"
+      routers:
+        - pool: "0x0000000000000000000000000000000000000011"
+          protocol: uniswap_v2
+        - pool: "0x0000000000000000000000000000000000000022"
+          protocol: uniswap_v3
+"#,
+            )
+            .expect("write aliased shared bootstrap defaults");
+
             cached_gw
                 .save_state(&ExtractionState::new(
-                    test_family_durability_scope(),
+                    family_scope.clone(),
                     chain,
                     None,
                     b"bootstrap@42",
@@ -1510,7 +1496,7 @@ params:
                 .await;
             cached_gw
                 .save_state(&ExtractionState::new(
-                    format!("{}::bootstrap", test_family_durability_scope()),
+                    format!("{family_scope}::bootstrap"),
                     chain,
                     Some(json!({
                         "bootstrap_block": 42,
@@ -1527,32 +1513,28 @@ params:
                 .expect("commit shared family bootstrap completion state");
 
             let bootstrap_state = cached_gw
-                .get_state(&format!("{}::bootstrap", test_family_durability_scope()), &chain)
+                .get_state(&format!("{family_scope}::bootstrap"), &chain)
                 .await
                 .expect("read back shared family bootstrap completion state");
             assert_eq!(bootstrap_state.block_hash, persisted_block.hash);
 
-            let shared_spkg_path =
-                test_family_shared_spkg_path("combined-family-alias-bootstrap-complete");
-            let unique = test_unique_suffix();
-            let config_path = test_family_defaults_config_with_member_names(
+            let config_path = write_uniswap_family_defaults_config_with_member_names_and_runtime_overrides(
                 "tycho-indexer-family-defaults-aliased-bootstrap-complete",
                 &unique,
                 &shared_spkg_path,
+                Some(
+                    bootstrap_path
+                        .to_str()
+                        .expect("utf8 aliased shared bootstrap path"),
+                ),
+                Some(&family_scope),
                 42,
                 None,
                 "uniswap_v2_alias",
                 "uniswap_v3_alias",
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 aliased family-default bootstrap config path"),
-            )
-            .expect("load aliased family-default bootstrap config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr}"),
@@ -1587,6 +1569,7 @@ params:
 
             let _ = std::fs::remove_file(&shared_spkg_path);
             let _ = std::fs::remove_file(&config_path);
+            let _ = std::fs::remove_dir_all(&temp_root);
         })
         .await;
     }
@@ -1658,15 +1641,8 @@ params:
                 "uniswap_v2_alias",
                 "uniswap_v3_alias",
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 aliased family-default config path"),
-            )
-            .expect("load aliased family-default config");
-
-            let err = match build_all_extractors(
-                &config,
+            let err = match build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr}"),
@@ -4623,14 +4599,6 @@ params:
             let config_path = write_record_substreams_future_family_fixture_inputs_with_registry(
                 &spkg_path, registry,
             );
-            let config = ExtractorConfigs::from_yaml_with_registry(
-                config_path
-                    .to_str()
-                    .expect("utf8 config path"),
-                registry,
-            )
-            .expect("load future family config through custom registry");
-
             let (cached_gw, _) = GatewayBuilder::new(db_url.as_str())
                 .set_chains(&[chain])
                 .set_protocol_systems(&["future_v1".to_string(), "future_v2".to_string()])
@@ -4683,8 +4651,8 @@ params:
                 .await
                 .expect("persist future family bootstrap completion state");
 
-            let (mut runners, handles) = build_all_extractors_for_tests(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path_with_registry_for_tests(
+                &config_path,
                 crate::testing::BuildExtractorsTestContext {
                     chain_state: ChainState::default(),
                     endpoint_url: &format!("http://{addr}"),
@@ -4757,14 +4725,6 @@ params:
             let config_path = write_record_substreams_future_family_fixture_inputs_with_registry(
                 &spkg_path, registry,
             );
-            let config = ExtractorConfigs::from_yaml_with_registry(
-                config_path
-                    .to_str()
-                    .expect("utf8 config path"),
-                registry,
-            )
-            .expect("load future family config through custom registry");
-
             let (cached_gw, _) = GatewayBuilder::new(db_url.as_str())
                 .set_chains(&[chain])
                 .set_protocol_systems(&["future_v1".to_string(), "future_v2".to_string()])
@@ -4805,8 +4765,8 @@ params:
                 .await
                 .expect("commit future family resumed extraction state");
 
-            let (mut runners, handles) = build_all_extractors_for_tests(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path_with_registry_for_tests(
+                &config_path,
                 crate::testing::BuildExtractorsTestContext {
                     chain_state: ChainState::default(),
                     endpoint_url: &format!("http://{addr}"),
@@ -5596,6 +5556,10 @@ params:
                     .get("tick"),
                 Some(&expected_v3_tick)
             );
+            assert_uniswap_v3_state_keeps_tick_map_when_liquidity_is_non_zero(
+                &v3_state.entity[0].attributes,
+                "fixture-backed combined-family replay",
+            );
 
             let rpc_port = {
                 let listener =
@@ -5980,15 +5944,8 @@ params:
                 63,
                 None,
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 restart history-slice config path"),
-            )
-            .expect("load restart history-slice family-default config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_first}"),
@@ -6064,14 +6021,8 @@ params:
                 63,
                 None,
             );
-            let resumed_config = ExtractorConfigs::from_yaml(
-                resumed_config_path
-                    .to_str()
-                    .expect("utf8 resumed restart history-slice config path"),
-            )
-            .expect("load resumed restart history-slice family-default config");
-            let (mut resumed_runners, resumed_handles) = build_all_extractors(
-                &resumed_config,
+            let (mut resumed_runners, resumed_handles) = build_all_extractors_from_config_path(
+                &resumed_config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_second}"),
@@ -6137,6 +6088,10 @@ params:
             assert_eq!(
                 after_restart_v3_state.entity[0].attributes.get("tick"),
                 Some(&expected_v3_tick)
+            );
+            assert_uniswap_v3_state_keeps_tick_map_when_liquidity_is_non_zero(
+                &after_restart_v3_state.entity[0].attributes,
+                "fixture-backed combined-family restart replay",
             );
 
             let rpc_port = {
@@ -6478,15 +6433,8 @@ params:
                 63,
                 None,
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 v3 restart family-default config path"),
-            )
-            .expect("load first v3 restart family-default config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_first}"),
@@ -6584,14 +6532,8 @@ params:
                 63,
                 None,
             );
-            let resumed_config = ExtractorConfigs::from_yaml(
-                resumed_config_path
-                    .to_str()
-                    .expect("utf8 resumed v3 restart family-default config path"),
-            )
-            .expect("load resumed v3 restart family-default config");
-            let (mut resumed_runners, resumed_handles) = build_all_extractors(
-                &resumed_config,
+            let (mut resumed_runners, resumed_handles) = build_all_extractors_from_config_path(
+                &resumed_config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_second}"),
@@ -7070,15 +7012,8 @@ params:
                 73,
                 None,
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 reconnect family-default config path"),
-            )
-            .expect("load reconnect family-default config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr}"),
@@ -7477,15 +7412,8 @@ params:
                 83,
                 None,
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 v2 reconnect family-default config path"),
-            )
-            .expect("load reconnect family-default config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr}"),
@@ -7836,15 +7764,8 @@ params:
                 43,
                 None,
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 family-default config path"),
-            )
-            .expect("load first family-default config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_first}"),
@@ -7948,14 +7869,8 @@ params:
                 43,
                 None,
             );
-            let resumed_config = ExtractorConfigs::from_yaml(
-                resumed_config_path
-                    .to_str()
-                    .expect("utf8 resumed family-default config path"),
-            )
-            .expect("load resumed family-default config");
-            let (mut resumed_runners, resumed_handles) = build_all_extractors(
-                &resumed_config,
+            let (mut resumed_runners, resumed_handles) = build_all_extractors_from_config_path(
+                &resumed_config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_second}"),
@@ -8132,15 +8047,8 @@ params:
                 43,
                 None,
             );
-            let config = ExtractorConfigs::from_yaml(
-                config_path
-                    .to_str()
-                    .expect("utf8 family-default config path"),
-            )
-            .expect("load first family-default config");
-
-            let (mut runners, handles) = build_all_extractors(
-                &config,
+            let (mut runners, handles) = build_all_extractors_from_config_path(
+                &config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_first}"),
@@ -8255,14 +8163,8 @@ params:
                 43,
                 None,
             );
-            let resumed_config = ExtractorConfigs::from_yaml(
-                resumed_config_path
-                    .to_str()
-                    .expect("utf8 resumed family-default config path"),
-            )
-            .expect("load resumed family-default config");
-            let (mut resumed_runners, resumed_handles) = build_all_extractors(
-                &resumed_config,
+            let (mut resumed_runners, resumed_handles) = build_all_extractors_from_config_path(
+                &resumed_config_path,
                 ChainState::default(),
                 &[chain],
                 &format!("http://{addr_second}"),
@@ -8509,6 +8411,17 @@ mod recorder_tests {
             .parent()
             .expect("repo root should have sibling workspace directory")
             .join("fynd")
+    }
+
+    fn shell_escape_for_rust_script_path(path: &std::path::Path) -> String {
+        let rendered = path.to_string_lossy();
+        if rendered
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '+' | '=' | ',' | '-'))
+        {
+            return rendered.into_owned();
+        }
+        format!("'{}'", rendered.replace('\'', "'\"'\"'"))
     }
 
     fn read_nonempty_manifest_lines(path: &std::path::Path) -> Vec<String> {
@@ -10091,7 +10004,7 @@ mod recorder_tests {
         let rendered = String::from_utf8(output.stdout)
             .expect("Fynd live E2E script doctor mode should emit utf8 diagnostics");
         let expected = format!(
-            "ready=false\nfynd_repo_root={}\nfynd_repo_exists=true\nfynd_test_exists=true\ntycho_url={}\ntycho_health=unreachable\ntycho_protocols_ready=unreachable\nprotocol_v2_ready=unknown\nprotocol_v3_ready=unknown\nchain=ethereum\nrpc_url={}\nrust_log={}\nhealth_timeout_secs=300\ntraded_n_days_ago=3\nclient_timeout_secs=5\nclient_retry_max_attempts=1\nmin_token_quality=100\nhealth_mode_override=default\nroute_health_mode=quote_ready\nsettlement_health_mode=strict\nquote_timeout_secs=420\nconnector_tokens=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599\nroute_test={}\nsettlement_test={}\ncurl_available=true\ntycho_stream_ws_buffer_size=default\ntycho_stream_subscription_buffer_size=default\ntest_manifest={}\n",
+            "ready=false\nfynd_repo_root={}\nfynd_repo_exists=true\nfynd_test_exists=true\nroute_test_exists=true\nsettlement_test_exists=true\nlive_test_mapping_ready=true\ntycho_url={}\ntycho_health=unreachable\ntycho_protocols_ready=unreachable\nprotocol_v2_ready=unknown\nprotocol_v3_ready=unknown\nchain=ethereum\nrpc_url={}\nrust_log={}\nhealth_timeout_secs=300\ntraded_n_days_ago=3\nclient_timeout_secs=5\nclient_retry_max_attempts=1\nmin_token_quality=100\nhealth_mode_override=default\nroute_health_mode=quote_ready\nsettlement_health_mode=quote_ready\nquote_timeout_secs=420\nconnector_tokens=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599\nroute_test={}\nsettlement_test={}\ncurl_available=true\ntycho_stream_ws_buffer_size=default\ntycho_stream_subscription_buffer_size=default\ntest_manifest={}\n",
             fynd_repo_root.display(),
             tycho_url,
             rpc_url,
@@ -10124,6 +10037,26 @@ mod recorder_tests {
     }
 
     #[test]
+    fn combined_family_live_gate_manifest_tests_exist_in_fynd_e2e_quote_file() {
+        let e2e_quote_path = combined_family_fynd_repo_root()
+            .join("tests")
+            .join("e2e_quote.rs");
+        let source = std::fs::read_to_string(&e2e_quote_path).unwrap_or_else(|err| {
+            panic!("expected to read Fynd e2e quote test file at {}: {err}", e2e_quote_path.display())
+        });
+        for test_name in [
+            combined_family_fynd_route_test_name(),
+            combined_family_fynd_settlement_test_name(),
+        ] {
+            assert!(
+                source.contains(&format!("fn {test_name}(")),
+                "live gate manifest test `{test_name}` must exist in {}",
+                e2e_quote_path.display()
+            );
+        }
+    }
+
+    #[test]
     fn combined_family_fynd_live_e2e_script_list_reports_manifest_backed_mapping() {
         let script_path = combined_family_fynd_live_e2e_script_path();
         let route_test = combined_family_fynd_route_test_name();
@@ -10150,6 +10083,69 @@ mod recorder_tests {
             format!("route={route_test}\nsettlement={settlement_test}\n"),
             "list mode should report the manifest-backed live test mapping"
         );
+    }
+
+    #[test]
+    fn combined_family_fynd_live_e2e_script_doctor_rejects_missing_manifest_mapped_tests() {
+        let script_path = combined_family_fynd_live_e2e_script_path();
+        let temp_root = std::env::temp_dir().join(format!(
+            "combined-family-live-missing-tests-{}-{}",
+            std::process::id(),
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let fake_fynd = temp_root.join("fynd");
+        std::fs::create_dir_all(fake_fynd.join("tests")).expect("create fake fynd tests dir");
+        std::fs::write(fake_fynd.join("Cargo.toml"), "[package]\nname='fynd'\nversion='0.0.0'\n")
+            .expect("write fake fynd Cargo.toml");
+        std::fs::write(
+            fake_fynd.join("tests").join("e2e_quote.rs"),
+            "#[test]\nfn unrelated_live_test() {}\n",
+        )
+        .expect("write fake fynd e2e_quote.rs without manifest-backed tests");
+
+        let output = std::process::Command::new(&script_path)
+            .arg("doctor")
+            .env("FYND_REPO_ROOT", &fake_fynd)
+            .env("FYND_E2E_TYCHO_URL", "127.0.0.1:1")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd live E2E script doctor mode with missing mapped tests at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "Fynd live E2E script doctor mode with missing mapped tests should still emit diagnostics, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("Fynd live E2E missing-mapped-tests doctor mode should emit utf8");
+        assert!(
+            rendered.contains("ready=false"),
+            "doctor output should mark the live gate unready when manifest-backed tests are missing"
+        );
+        assert!(
+            rendered.contains("fynd_test_exists=true"),
+            "doctor output should distinguish file existence from manifest-backed test presence"
+        );
+        assert!(
+            rendered.contains("route_test_exists=false"),
+            "doctor output should report missing route test mapping"
+        );
+        assert!(
+            rendered.contains("settlement_test_exists=false"),
+            "doctor output should report missing settlement test mapping"
+        );
+        assert!(
+            rendered.contains("live_test_mapping_ready=false"),
+            "doctor output should expose the combined manifest-to-file mapping failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
@@ -10452,6 +10448,14 @@ mod recorder_tests {
         assert!(
             script.contains("cargo test --test e2e_quote"),
             "script should drive the Fynd ignored e2e_quote tests"
+        );
+        assert!(
+            script.contains("env_cmd+=(-u \"TYCHO_STREAM_WS_BUFFER_SIZE\")"),
+            "live gate should explicitly unset an empty websocket buffer override instead of inheriting an exported empty string"
+        );
+        assert!(
+            script.contains("env_cmd+=(-u \"TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE\")"),
+            "live gate should explicitly unset an empty subscription buffer override instead of inheriting an exported empty string"
         );
     }
 
@@ -11144,6 +11148,10 @@ mod recorder_tests {
             "missing live test prerequisites should keep the unmanaged live gate unready"
         );
         assert!(
+            rendered.contains("live_test_mapping_ready=unknown"),
+            "when the Fynd e2e test file is missing, mapping readiness should remain unknown"
+        );
+        assert!(
             rendered.contains("managed_live_ready=false"),
             "managed live readiness must still require the Fynd live prerequisites, not just operator readiness"
         );
@@ -11175,8 +11183,15 @@ mod recorder_tests {
         std::fs::write(fake_fynd.join("Cargo.toml"), "[package]\nname='fynd'\nversion='0.0.0'\n")
             .expect("write fake fynd Cargo.toml");
         std::fs::create_dir_all(fake_fynd.join("tests")).expect("create fake fynd tests dir");
-        std::fs::write(fake_fynd.join("tests").join("e2e_quote.rs"), "// fake live e2e\n")
-            .expect("write fake fynd e2e_quote.rs");
+        std::fs::write(
+            fake_fynd.join("tests").join("e2e_quote.rs"),
+            format!(
+                "#[test]\nfn {}() {{}}\n#[test]\nfn {}() {{}}\n",
+                combined_family_fynd_route_test_name(),
+                combined_family_fynd_settlement_test_name(),
+            ),
+        )
+        .expect("write fake fynd e2e_quote.rs");
 
         let write_fake_exec = |name: &str, body: &str| {
             let path = fake_bin.join(name);
@@ -11195,7 +11210,21 @@ mod recorder_tests {
         );
         write_fake_exec("psql", "#!/usr/bin/env bash\nexit 0\n");
         write_fake_exec("cargo", "#!/usr/bin/env bash\nexit 0\n");
-        write_fake_exec("curl", "#!/usr/bin/env bash\nexit 0\n");
+        write_fake_exec(
+            "curl",
+            "#!/usr/bin/env bash\n\
+for arg in \"$@\"; do\n\
+  if [[ \"${arg}\" == *\"/v1/health\"* ]]; then\n\
+    printf 'ok'\n\
+    exit 0\n\
+  fi\n\
+  if [[ \"${arg}\" == *\"/v1/protocol_components\"* ]]; then\n\
+    printf '{\"protocol_components\":[],\"pagination\":{\"page\":0,\"page_size\":1,\"total\":1}}'\n\
+    exit 0\n\
+  fi\n\
+done\n\
+exit 0\n",
+        );
 
         let path_env = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake_bin.to_string_lossy());
         let output = std::process::Command::new(&script_path)
@@ -11233,6 +11262,10 @@ mod recorder_tests {
             "fake curl plus fake Fynd repo should make the live gate ready"
         );
         assert!(
+            rendered.contains("live_test_mapping_ready=true"),
+            "fake Fynd repo should only satisfy live readiness once the manifest-backed tests exist in e2e_quote.rs"
+        );
+        assert!(
             rendered.contains("acceptance_ready=true"),
             "acceptance readiness should be true once extensibility and repo gates are ready"
         );
@@ -11255,6 +11288,124 @@ mod recorder_tests {
         assert!(
             rendered.contains("ready=true"),
             "aggregate readiness should become true once every validation surface is ready"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn combined_family_validation_script_managed_live_fails_fast_when_indexer_exits_after_readiness(
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_script_path = combined_family_validation_script_path();
+        let temp_root = std::env::temp_dir().join(format!(
+            "combined-family-managed-live-fast-fail-{}-{}",
+            std::process::id(),
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let fake_bin = temp_root.join("bin");
+        let marker_path = temp_root.join("indexer-ready.marker");
+        let fake_script_path = temp_root.join("check-combined-family.sh");
+        let fake_indexer_script_path = temp_root.join("run-combined-family-indexer.sh");
+        let fake_live_script_path = temp_root.join("check-combined-family-fynd-live-e2e.sh");
+        let fake_db_script_path = temp_root.join("check-combined-family-db.sh");
+        let fake_extensibility_script_path =
+            temp_root.join("check-combined-family-extensibility.sh");
+
+        std::fs::create_dir_all(&fake_bin).expect("create fake bin dir");
+        std::fs::copy(&source_script_path, &fake_script_path).unwrap_or_else(|err| {
+            panic!(
+                "copy combined-family validation script from {} to {}: {err}",
+                source_script_path.display(),
+                fake_script_path.display()
+            )
+        });
+
+        let chmod_exec = |path: &std::path::Path| {
+            let mut perms = std::fs::metadata(path)
+                .expect("read executable metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod executable");
+        };
+        chmod_exec(&fake_script_path);
+
+        let write_fake_exec = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body)
+                .unwrap_or_else(|err| panic!("write fake executable {}: {err}", path.display()));
+            chmod_exec(path);
+        };
+
+        write_fake_exec(
+            &fake_bin.join("curl"),
+            "#!/usr/bin/env bash\nexit 1\n",
+        );
+
+        write_fake_exec(
+            &fake_db_script_path,
+            "#!/usr/bin/env bash\ncase \"${1:-}\" in\n  doctor)\n    printf 'ready=true\\n'\n    ;;\n  command)\n    printf 'fake-db-command\\n'\n    ;;\n  run)\n    exit 0\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
+        );
+        write_fake_exec(
+            &fake_extensibility_script_path,
+            "#!/usr/bin/env bash\ncase \"${1:-}\" in\n  doctor)\n    printf 'ready=true\\n'\n    ;;\n  command)\n    printf 'fake-extensibility-command\\n'\n    ;;\n  run)\n    exit 0\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
+        );
+        write_fake_exec(
+            &fake_live_script_path,
+            &format!(
+                "#!/usr/bin/env bash\ncase \"${{1:-}}\" in\n  doctor)\n    if [[ -f {} ]]; then\n      printf 'ready=true\\n'\n    else\n      printf 'ready=false\\n'\n    fi\n    ;;\n  command)\n    printf 'fake-live-command\\n'\n    ;;\n  run-route|run-settlement|run-all)\n    printf 'unexpected-live-run\\n' >&2\n    exit 99\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
+                shell_escape_for_rust_script_path(&marker_path)
+            ),
+        );
+        write_fake_exec(
+            &fake_indexer_script_path,
+            &format!(
+                "#!/usr/bin/env bash\ncase \"${{1:-}}\" in\n  doctor)\n    printf 'ready=true\\n'\n    ;;\n  command)\n    printf 'fake-indexer-command\\n'\n    ;;\n  run)\n    : > {}\n    printf 'Error: Stream errored: status: Unauthenticated, message: \"invalid JWT token\"\\n' >&2\n    exit 1\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
+                shell_escape_for_rust_script_path(&marker_path)
+            ),
+        );
+
+        let path_env = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake_bin.to_string_lossy());
+        let output = std::process::Command::new(&fake_script_path)
+            .arg("run-live-managed")
+            .env("PATH", path_env)
+            .env("FYND_E2E_TYCHO_URL", "127.0.0.1:1")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected copied combined-family validation script managed live mode at {}: {err}",
+                    fake_script_path.display()
+                )
+            });
+        assert!(
+            !output.status.success(),
+            "managed live should fail when the managed indexer exits immediately after readiness"
+        );
+        let stderr =
+            String::from_utf8(output.stderr).expect("managed live stderr should emit utf8");
+        assert!(
+            stderr.contains("managed combined-family indexer exited immediately after reporting readiness"),
+            "stderr should attribute the failure to the managed indexer exit after readiness, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("managed indexer log:"),
+            "stderr should surface the managed indexer log path, got: {stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "managed indexer failure hint: StreamingFast rejected SUBSTREAMS_API_TOKEN (invalid JWT token)"
+            ),
+            "stderr should surface the explicit invalid-token hint when the managed indexer log contains that failure, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("managed combined-family indexer did not become ready within"),
+            "fast-fail path should not degrade to the generic readiness-timeout message, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unexpected-live-run"),
+            "managed live should fail before invoking the downstream live gate when the indexer is already dead, got: {stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -11405,6 +11556,34 @@ mod recorder_tests {
         assert!(
             script.contains("run-combined-family-indexer.sh"),
             "script should surface the canonical combined-family indexer operator entrypoint"
+        );
+        assert!(
+            script.contains("wait_for_live_tycho_readiness \"${MANAGED_HEALTH_TIMEOUT_SECS}\" \"${indexer_pid}\""),
+            "managed live mode should wait on readiness with the managed indexer pid in scope"
+        );
+        assert!(
+            script.contains("managed combined-family indexer exited before becoming ready"),
+            "managed live mode should fail fast when the managed indexer exits before readiness"
+        );
+        assert!(
+            script.contains("managed combined-family indexer exited immediately after reporting readiness"),
+            "managed live mode should explain when readiness races with an immediate managed indexer exit"
+        );
+        assert!(
+            script.contains("managed combined-family indexer exited during live validation"),
+            "managed live mode should attribute downstream live-test failures to a dead managed indexer when possible"
+        );
+        assert!(
+            script.contains("managed indexer failure hint: StreamingFast rejected SUBSTREAMS_API_TOKEN (invalid JWT token)"),
+            "managed live mode should surface an explicit invalid-token hint for the known upstream auth failure"
+        );
+        assert!(
+            script.contains("emit_managed_indexer_failure_hint"),
+            "managed live mode should centralize managed indexer failure-hint emission"
+        );
+        assert!(
+            script.contains("kill -0 \"${managed_pid}\""),
+            "managed live readiness loop should detect early managed indexer exit"
         );
         assert!(
             script.contains("TYCHO_COMBINED_FAMILY_MANAGED_HEALTH_TIMEOUT_SECS"),

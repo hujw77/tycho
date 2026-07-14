@@ -318,6 +318,11 @@ pub(crate) trait StateUpdateBufferEntry: std::fmt::Debug {
         keys: Vec<(&ProtocolStateIdType, &ProtocolStateKeyType)>,
     ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue>;
 
+    fn get_protocol_state_update_for_components(
+        &self,
+        component_ids: Vec<&ProtocolStateIdType>,
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue>;
+
     #[allow(clippy::mutable_key_type)]
     fn get_filtered_account_state_update(
         &self,
@@ -379,6 +384,23 @@ where
         }
 
         (res, remaining_keys.into_iter().collect())
+    }
+
+    pub fn lookup_protocol_state_for_components(
+        &self,
+        component_ids: &[&ProtocolStateIdType],
+    ) -> HashMap<(ProtocolStateIdType, ProtocolStateKeyType), BufferedProtocolStateValue> {
+        let mut res = HashMap::new();
+
+        for block_message in self.block_messages.iter().rev() {
+            for (key, val) in block_message.get_protocol_state_update_for_components(
+                component_ids.to_vec(),
+            ) {
+                res.entry(key).or_insert(val);
+            }
+        }
+
+        res
     }
 
     /// Looks up buffered account state updates for the provided keys. Returns a map of updates and

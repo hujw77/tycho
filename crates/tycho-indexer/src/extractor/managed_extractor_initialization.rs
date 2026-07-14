@@ -26,7 +26,9 @@ use crate::extractor::{
     post_processors::POST_PROCESSOR_REGISTRY,
     protocol_cache::ProtocolMemoryCache,
     protocol_extractor::{ExtractorPgGateway, ProtocolExtractor},
-    protocol_message_registry::AuxiliaryProtocolMessageDecoder,
+    protocol_message_registry::{
+        AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator,
+    },
     ExtractionError, Extractor, ExtractorExtension,
 };
 
@@ -93,6 +95,7 @@ pub(crate) struct ExtractorBuilder {
     rpc_client: Option<EthereumRpcClient>,
     database_insert_batch_size: Option<usize>,
     auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
+    auxiliary_protocol_state_hydrators: Vec<AuxiliaryProtocolStateHydrator>,
     family_runtime_registry: Option<FamilyRuntimeRegistry<'static>>,
     partial_blocks: bool,
 }
@@ -110,6 +113,7 @@ impl ExtractorBuilder {
             rpc_client: None,
             database_insert_batch_size: None,
             auxiliary_protocol_message_decoders: Vec::new(),
+            auxiliary_protocol_state_hydrators: Vec::new(),
             family_runtime_registry: None,
             partial_blocks: false,
         }
@@ -130,6 +134,14 @@ impl ExtractorBuilder {
         decoders: Vec<AuxiliaryProtocolMessageDecoder>,
     ) -> Self {
         self.auxiliary_protocol_message_decoders = decoders;
+        self
+    }
+
+    pub(crate) fn auxiliary_protocol_state_hydrators(
+        mut self,
+        hydrators: Vec<AuxiliaryProtocolStateHydrator>,
+    ) -> Self {
+        self.auxiliary_protocol_state_hydrators = hydrators;
         self
     }
 
@@ -292,8 +304,11 @@ impl ExtractorBuilder {
             None
         };
 
-        let extractor =
-            ProtocolExtractor::<ExtractorPgGateway, EthereumTokenPreProcessor, DCIPlugin<_>>::new(
+        let extractor = ProtocolExtractor::<
+            ExtractorPgGateway,
+            EthereumTokenPreProcessor,
+            DCIPlugin<_>,
+        >::new_with_runtime_support(
                 gw,
                 self.database_insert_batch_size
                     .unwrap_or_default(),
@@ -307,9 +322,12 @@ impl ExtractorBuilder {
                 protocol_types,
                 self.auxiliary_protocol_message_decoders
                     .clone(),
+                self.auxiliary_protocol_state_hydrators
+                    .clone(),
                 token_pre_processor.clone(),
                 post_processor,
                 dci_plugin,
+                self.rpc_client.clone(),
             )
             .await?;
 
@@ -329,7 +347,6 @@ pub(crate) struct ManagedExtractorBuildContext<'a> {
     pub(crate) token_pre_processor: &'a EthereumTokenPreProcessor,
     pub(crate) protocol_cache: &'a ProtocolMemoryCache,
     pub(crate) rpc_client: &'a EthereumRpcClient,
-    pub(crate) final_block_only: bool,
     pub(crate) partial_blocks: bool,
     pub(crate) family_runtime_registry: FamilyRuntimeRegistry<'static>,
 }
@@ -339,6 +356,7 @@ impl ManagedExtractorBuildContext<'_> {
         &self,
         extractor_config: &ExtractorConfig,
         auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
+        auxiliary_protocol_state_hydrators: Vec<AuxiliaryProtocolStateHydrator>,
     ) -> Result<Arc<dyn Extractor>, ExtractionError> {
         let builder = ExtractorBuilder::new(
             extractor_config,
@@ -348,6 +366,7 @@ impl ManagedExtractorBuildContext<'_> {
         )
         .database_insert_batch_size(self.database_insert_batch_size)
         .auxiliary_protocol_message_decoders(auxiliary_protocol_message_decoders)
+        .auxiliary_protocol_state_hydrators(auxiliary_protocol_state_hydrators)
         .family_runtime_registry(self.family_runtime_registry)
         .partial_blocks(self.partial_blocks);
 
@@ -371,6 +390,10 @@ impl ManagedExtractorBuildContext<'_> {
             String,
             Vec<AuxiliaryProtocolMessageDecoder>,
         >,
+        auxiliary_protocol_state_hydrators_by_protocol_system: &HashMap<
+            String,
+            Vec<AuxiliaryProtocolStateHydrator>,
+        >,
     ) -> Result<HashMap<String, Arc<dyn Extractor>>, ExtractionError> {
         let mut extractors = HashMap::with_capacity(extractor_configs.len());
 
@@ -382,6 +405,10 @@ impl ManagedExtractorBuildContext<'_> {
                 .build_initialized_extractor(
                     extractor_config,
                     auxiliary_protocol_message_decoders_by_protocol_system
+                        .get(extractor_config.protocol_system())
+                        .cloned()
+                        .unwrap_or_default(),
+                    auxiliary_protocol_state_hydrators_by_protocol_system
                         .get(extractor_config.protocol_system())
                         .cloned()
                         .unwrap_or_default(),

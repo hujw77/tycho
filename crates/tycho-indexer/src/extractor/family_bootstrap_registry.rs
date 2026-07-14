@@ -456,9 +456,9 @@ mod tests {
         extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig},
         family_registry::{
             canonical_shared_family_runtime_spec, default_family_runtime_registry,
-            pool_list_bootstrap_member_runtime, shared_family_member_spec, FamilyMemberSpec,
-            shared_family_member_with_bootstrap, shared_family_runtime_spec, FamilyRuntimeRegistry,
-            FamilyRuntimeSpec,
+            pool_list_bootstrap_member_runtime, shared_family_member_spec,
+            shared_family_member_with_bootstrap, shared_family_runtime_spec,
+            FamilyRuntimeRegistry, FamilyRuntimeSpec,
         },
         family_runtime_metadata::FamilyRuntimeConfig,
         models::BlockChanges,
@@ -868,31 +868,29 @@ mod tests {
 
     #[test]
     fn registry_rejects_duplicate_member_protocol_systems_across_families() {
-        const FAMILY_A: FamilyRuntimeSpec = FamilyRuntimeSpec::new(
+        const FAMILY_A: FamilyRuntimeSpec = shared_family_runtime_spec(
             "family_a",
-            &[FamilyMemberSpec {
-                protocol_system: "shared_protocol",
-                shared_route_protocols: &[],
-                shared_bootstrap: None,
-            }],
+            &[crate::extractor::family_registry::shared_family_member_spec(
+                "shared_protocol",
+                &[],
+                None,
+            )],
             "map_family_a",
             "family_a_stream",
             "family::family_a",
             None,
-            &[],
         );
-        const FAMILY_B: FamilyRuntimeSpec = FamilyRuntimeSpec::new(
+        const FAMILY_B: FamilyRuntimeSpec = shared_family_runtime_spec(
             "family_b",
-            &[FamilyMemberSpec {
-                protocol_system: "shared_protocol",
-                shared_route_protocols: &[],
-                shared_bootstrap: None,
-            }],
+            &[crate::extractor::family_registry::shared_family_member_spec(
+                "shared_protocol",
+                &[],
+                None,
+            )],
             "map_family_b",
             "family_b_stream",
             "family::family_b",
             None,
-            &[],
         );
         const SPECS: &[FamilyRuntimeSpec] = &[FAMILY_A, FAMILY_B];
         let registry = FamilyRuntimeRegistry::new(SPECS);
@@ -908,25 +906,24 @@ mod tests {
 
     #[test]
     fn registry_rejects_duplicate_normalized_route_aliases() {
-        const BROKEN_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec::new(
+        const BROKEN_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
             "broken_family",
             &[
-                FamilyMemberSpec {
-                    protocol_system: "protocol_a",
-                    shared_route_protocols: &["Example-V2"],
-                    shared_bootstrap: None,
-                },
-                FamilyMemberSpec {
-                    protocol_system: "protocol_b",
-                    shared_route_protocols: &["example_v2"],
-                    shared_bootstrap: None,
-                },
+                crate::extractor::family_registry::shared_family_member_spec(
+                    "protocol_a",
+                    &["Example-V2"],
+                    None,
+                ),
+                crate::extractor::family_registry::shared_family_member_spec(
+                    "protocol_b",
+                    &["example_v2"],
+                    None,
+                ),
             ],
             "map_broken_family",
             "broken_family_stream",
             "family::broken_family",
             None,
-            &[],
         );
         let registry = FamilyRuntimeRegistry::new(&[BROKEN_FAMILY]);
 

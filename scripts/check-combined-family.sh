@@ -138,12 +138,17 @@ is_live_tycho_ready_for_combined_family() {
 
 wait_for_live_tycho_readiness() {
   local timeout_secs="$1"
+  local managed_pid="${2:-}"
   local start_ts
   start_ts="$(date +%s)"
 
   while true; do
     if is_live_tycho_ready_for_combined_family; then
       return 0
+    fi
+
+    if [[ -n "${managed_pid}" ]] && ! kill -0 "${managed_pid}" >/dev/null 2>&1; then
+      return 2
     fi
 
     local now_ts
@@ -173,6 +178,23 @@ cleanup_managed_indexer() {
   fi
 }
 
+emit_managed_indexer_failure_hint() {
+  local log_path="$1"
+  if [[ ! -f "${log_path}" ]]; then
+    return
+  fi
+
+  if grep -Fq 'invalid JWT token' "${log_path}"; then
+    echo "managed indexer failure hint: StreamingFast rejected SUBSTREAMS_API_TOKEN (invalid JWT token)" >&2
+    return
+  fi
+
+  if grep -Fq 'status: Unauthenticated' "${log_path}"; then
+    echo "managed indexer failure hint: upstream Substreams authentication failed; verify SUBSTREAMS_API_TOKEN" >&2
+    return
+  fi
+}
+
 run_live_managed() {
   local log_path
   local indexer_pid=""
@@ -199,14 +221,39 @@ run_live_managed() {
 
   trap 'cleanup_managed_indexer "${TYCHO_COMBINED_FAMILY_MANAGED_PID:-}"' EXIT
 
-  if ! wait_for_live_tycho_readiness "${MANAGED_HEALTH_TIMEOUT_SECS}"; then
-    echo "managed combined-family indexer did not become ready within ${MANAGED_HEALTH_TIMEOUT_SECS}s" >&2
+  local wait_status=0
+  if ! wait_for_live_tycho_readiness "${MANAGED_HEALTH_TIMEOUT_SECS}" "${indexer_pid}"; then
+    wait_status=$?
+  fi
+  if [[ "${wait_status}" -ne 0 ]]; then
+    if [[ "${wait_status}" -eq 2 ]]; then
+      echo "managed combined-family indexer exited before becoming ready" >&2
+    else
+      echo "managed combined-family indexer did not become ready within ${MANAGED_HEALTH_TIMEOUT_SECS}s" >&2
+    fi
     echo "managed indexer log: ${log_path}" >&2
+    emit_managed_indexer_failure_hint "${log_path}"
     tail -n 40 "${log_path}" >&2 || true
     return 1
   fi
 
-  run_live
+  if ! kill -0 "${indexer_pid}" >/dev/null 2>&1; then
+    echo "managed combined-family indexer exited immediately after reporting readiness" >&2
+    echo "managed indexer log: ${log_path}" >&2
+    emit_managed_indexer_failure_hint "${log_path}"
+    tail -n 40 "${log_path}" >&2 || true
+    return 1
+  fi
+
+  if ! run_live; then
+    if ! kill -0 "${indexer_pid}" >/dev/null 2>&1; then
+      echo "managed combined-family indexer exited during live validation" >&2
+      echo "managed indexer log: ${log_path}" >&2
+      emit_managed_indexer_failure_hint "${log_path}"
+      tail -n 40 "${log_path}" >&2 || true
+    fi
+    return 1
+  fi
 }
 
 readiness_from_output() {
@@ -244,6 +291,7 @@ doctor() {
   local operator_ready
   local live_fynd_repo_exists
   local live_fynd_test_exists
+  local live_test_mapping_ready
   local live_curl_available
   local managed_live_ready
   local managed_full_ready
@@ -259,6 +307,7 @@ doctor() {
   operator_ready="$(readiness_from_output "${operator_output}")"
   live_fynd_repo_exists="$(field_from_output "${live_output}" "fynd_repo_exists")"
   live_fynd_test_exists="$(field_from_output "${live_output}" "fynd_test_exists")"
+  live_test_mapping_ready="$(field_from_output "${live_output}" "live_test_mapping_ready")"
   live_curl_available="$(field_from_output "${live_output}" "curl_available")"
 
   if [[ "${extensibility_ready}" != "true" || "${repo_ready}" != "true" || "${live_ready}" != "true" ]]; then
@@ -269,6 +318,7 @@ doctor() {
   if [[ "${operator_ready}" == "true" \
     && "${live_fynd_repo_exists}" == "true" \
     && "${live_fynd_test_exists}" == "true" \
+    && "${live_test_mapping_ready}" == "true" \
     && "${live_curl_available}" == "true" ]]; then
     managed_live_ready="true"
   fi
@@ -288,6 +338,10 @@ live_ready=${live_ready}
 operator_ready=${operator_ready}
 managed_live_ready=${managed_live_ready}
 managed_full_ready=${managed_full_ready}
+live_fynd_repo_exists=${live_fynd_repo_exists}
+live_fynd_test_exists=${live_fynd_test_exists}
+live_test_mapping_ready=${live_test_mapping_ready}
+live_curl_available=${live_curl_available}
 extensibility_gate_script=${EXTENSIBILITY_GATE_SCRIPT}
 db_gate_script=${DB_GATE_SCRIPT}
 live_gate_script=${LIVE_GATE_SCRIPT}
