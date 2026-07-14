@@ -13,12 +13,11 @@ use tycho_common::{
 use tycho_ethereum::rpc::EthereumRpcClient;
 
 use crate::extractor::{
-    family_runtime::{
-        default_family_runtime_registry, FamilyRuntimeRegistry,
-        ResolvedSharedBootstrapBranchRuntime,
-    },
+    extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
+    family_bootstrap_registry::ResolvedSharedBootstrapBranchRuntime,
+    family_registry::default_family_runtime_registry,
+    family_registry::FamilyRuntimeRegistry,
     models::{BlockChanges, TxWithContractChanges},
-    runner::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
     ExtractionError, Extractor,
 };
 
@@ -722,15 +721,15 @@ mod tests {
     use tycho_ethereum::rpc::EthereumRpcClient;
 
     use crate::extractor::{
+        extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
+        family_bootstrap_registry::SharedBootstrapParamsParser,
+        family_registry::{shared_family_member_with_bootstrap, shared_family_runtime_spec},
         family_registry::{
-            shared_bootstrap_member_runtime, shared_family_member_spec, shared_family_runtime_spec,
-        },
-        family_runtime::{
             default_family_runtime_registry, FamilyMemberSpec, FamilyRuntimeRegistry,
-            FamilyRuntimeSpec, SharedBootstrapParamsParser,
+            FamilyRuntimeSpec,
         },
+        family_runtime_metadata::FamilyRuntimeConfig,
         models::{BlockChanges, TxWithContractChanges},
-        runner::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
         ExtractionError,
     };
 
@@ -933,7 +932,7 @@ mod tests {
             None,
         )
         .with_protocol_system("uniswap_v2")
-        .with_family_runtime(Some(crate::extractor::family_runtime::FamilyRuntimeConfig {
+        .with_family_runtime(Some(FamilyRuntimeConfig {
             family: "uniswap".to_string(),
             ..Default::default()
         }));
@@ -955,7 +954,7 @@ mod tests {
             None,
         )
         .with_protocol_system("future_v1")
-        .with_family_runtime(Some(crate::extractor::family_runtime::FamilyRuntimeConfig {
+        .with_family_runtime(Some(FamilyRuntimeConfig {
             family: "future_swap".to_string(),
             ..Default::default()
         }));
@@ -1061,7 +1060,7 @@ mod tests {
             None,
         )
         .with_protocol_system("uniswap_v2")
-        .with_family_runtime(Some(crate::extractor::family_runtime::FamilyRuntimeConfig {
+        .with_family_runtime(Some(FamilyRuntimeConfig {
             family: "uniswap".to_string(),
             ..Default::default()
         }));
@@ -1092,14 +1091,12 @@ mod tests {
     fn rejects_shared_bootstrap_plan_with_mismatched_inferred_families() {
         const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
             "future_swap",
-            &[shared_family_member_spec(
+            &[shared_family_member_with_bootstrap(
                 "future_v1",
                 &["futurev1"],
-                Some(shared_bootstrap_member_runtime(
-                    BootstrapStrategy::UniswapV2Rpc,
-                    SharedBootstrapParamsParser::Custom(parse_future_params),
-                    materialize_future_branch,
-                )),
+                BootstrapStrategy::UniswapV2Rpc,
+                SharedBootstrapParamsParser::Custom(parse_future_params),
+                materialize_future_branch,
             )],
             "map_future_swap_family_protocol_changes",
             "future_swap_family",
@@ -1151,19 +1148,19 @@ mod tests {
 
     #[test]
     fn rejects_shared_bootstrap_plan_with_invalid_custom_registry() {
-        const INVALID_FUTURE_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec {
-            family_name: "future_swap",
-            members: &[FamilyMemberSpec {
+        const INVALID_FUTURE_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec::new(
+            "future_swap",
+            &[FamilyMemberSpec {
                 protocol_system: "future_v1",
                 shared_route_protocols: &["futurev1"],
                 shared_bootstrap: None,
             }],
-            output_module: "map_future_swap_family_protocol_changes",
-            shared_stream_name: "future_swap_family",
-            durability_scope: "family::future_swap",
-            shared_bootstrap_runtime: None,
-            auxiliary_protocol_message_decoders: &[],
-        };
+            "map_future_swap_family_protocol_changes",
+            "future_swap_family",
+            "family::future_swap",
+            None,
+            &[],
+        );
         let registry = FamilyRuntimeRegistry::new(&[INVALID_FUTURE_FAMILY]);
         let future_config = ExtractorConfig::new(
             "future_v1".to_owned(),
@@ -1236,23 +1233,19 @@ mod tests {
         const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
             "future_swap",
             &[
-                shared_family_member_spec(
+                shared_family_member_with_bootstrap(
                     "future_v1",
                     &["futurev1"],
-                    Some(shared_bootstrap_member_runtime(
-                        BootstrapStrategy::UniswapV2Rpc,
-                        SharedBootstrapParamsParser::Custom(parse_future_params),
-                        materialize_future_branch,
-                    )),
+                    BootstrapStrategy::UniswapV2Rpc,
+                    SharedBootstrapParamsParser::Custom(parse_future_params),
+                    materialize_future_branch,
                 ),
-                shared_family_member_spec(
+                shared_family_member_with_bootstrap(
                     "future_v2",
                     &["futurev2"],
-                    Some(shared_bootstrap_member_runtime(
-                        BootstrapStrategy::UniswapV2Rpc,
-                        SharedBootstrapParamsParser::Custom(parse_future_params),
-                        materialize_future_branch,
-                    )),
+                    BootstrapStrategy::UniswapV2Rpc,
+                    SharedBootstrapParamsParser::Custom(parse_future_params),
+                    materialize_future_branch,
                 ),
             ],
             "map_future_swap_family_protocol_changes",

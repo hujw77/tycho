@@ -1,4 +1,16 @@
+use std::{collections::HashMap, sync::Arc};
+
 use super::*;
+use crate::extractor::family_runtime_planning::resolved_family_execution_config_from_extractor_configs_for_tests;
+use crate::extractor::managed_stream_startup::build_substreams_stream_from_prepared_request;
+use crate::extractor::managed_substreams_request::PreparedSubstreamsRequest;
+use crate::extractor::runtime_target_planning::ResolvedRuntimeTarget;
+use crate::extractor::substreams_package_loader::LoadedSubstreamsPackage;
+use crate::extractor::{Extractor, PersistedExtractorStateScope};
+use crate::pb::sf::substreams::v1::Package;
+use crate::substreams::SubstreamsEndpoint;
+use futures03::StreamExt;
+use tycho_ethereum::rpc::EthereumRpcClient;
 
 #[tokio::test]
 async fn test_resolve_family_stream_start_uses_next_aligned_resume_block() {
@@ -6,16 +18,28 @@ async fn test_resolve_family_stream_start_uses_next_aligned_resume_block() {
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -43,6 +67,9 @@ async fn test_resolve_family_stream_cursor_rejects_misaligned_resumed_branch_cur
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-v2".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -51,6 +78,9 @@ async fn test_resolve_family_stream_cursor_rejects_misaligned_resumed_branch_cur
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-v3".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -80,6 +110,9 @@ async fn test_resolve_family_stream_position_returns_aligned_resume_start_and_cu
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -88,6 +121,9 @@ async fn test_resolve_family_stream_position_returns_aligned_resume_start_and_cu
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -106,11 +142,64 @@ async fn test_resolve_family_stream_position_returns_aligned_resume_start_and_cu
 
     assert_eq!(
         position,
-        ResolvedFamilyStreamPosition {
-            start_block: 101,
-            cursor: Some("cursor-100".to_string()),
-        }
+        ResolvedFamilyStreamPosition { start_block: 101, cursor: Some("cursor-100".to_string()) }
     );
+}
+
+#[tokio::test]
+async fn test_resolve_family_stream_position_rejects_legacy_fallback_cursor_scope() {
+    let mut v2 = MockExtractor::new();
+    v2.expect_get_last_processed_block()
+        .once()
+        .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
+    v2.expect_get_cursor()
+        .once()
+        .returning(|| "cursor-100".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
+    v2.expect_get_cursor_state_scope()
+        .once()
+        .returning(|| Ok(PersistedExtractorStateScope::LegacyExtractorFallback));
+
+    let mut v3 = MockExtractor::new();
+    v3.expect_get_last_processed_block()
+        .once()
+        .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
+    v3.expect_get_cursor()
+        .once()
+        .returning(|| "cursor-100".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
+    v3.expect_get_cursor_state_scope()
+        .once()
+        .returning(|| Ok(PersistedExtractorStateScope::LegacyExtractorFallback));
+
+    let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
+        ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
+        ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
+    ]);
+    let configs = make_uniswap_family_runtime_test_configs(42, 42);
+    let config_refs = configs.iter().collect::<Vec<_>>();
+
+    let err = resolve_family_stream_position(
+        &extractors,
+        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
+            .expect("family execution derives for legacy fallback cursor scope"),
+    )
+    .await
+    .expect_err("legacy fallback cursor scope should fail shared family resume");
+
+    assert!(err
+        .to_string()
+        .contains("legacy extractor-scoped fallback cursor state"));
 }
 
 #[tokio::test]
@@ -122,6 +211,9 @@ async fn test_resolve_family_stream_position_uses_shared_cursor_for_alias_named_
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-100-shared".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -130,6 +222,9 @@ async fn test_resolve_family_stream_position_uses_shared_cursor_for_alias_named_
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-100-shared".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2_alias".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -164,6 +259,9 @@ async fn test_resolve_family_stream_position_rejects_empty_resumed_shared_cursor
     v2.expect_get_cursor()
         .times(0..=1)
         .returning(String::new);
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -172,6 +270,9 @@ async fn test_resolve_family_stream_position_rejects_empty_resumed_shared_cursor
     v3.expect_get_cursor()
         .times(0..=1)
         .returning(String::new);
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -202,6 +303,9 @@ async fn test_resolve_family_stream_position_treats_bootstrap_marker_as_no_resum
     v2.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@42".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -210,6 +314,9 @@ async fn test_resolve_family_stream_position_treats_bootstrap_marker_as_no_resum
     v3.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@42".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -238,6 +345,9 @@ async fn test_resolve_family_stream_position_rejects_mixed_bootstrap_marker_and_
     v2.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@42".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -246,6 +356,9 @@ async fn test_resolve_family_stream_position_rejects_mixed_bootstrap_marker_and_
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor@42".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -274,6 +387,9 @@ async fn test_resolve_family_stream_position_rejects_bootstrap_marker_block_drif
     v2.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@41".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -282,6 +398,9 @@ async fn test_resolve_family_stream_position_rejects_bootstrap_marker_block_drif
     v3.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@41".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -312,6 +431,9 @@ async fn test_resolve_family_stream_position_rejects_resume_block_overflow() {
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-max".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
@@ -320,6 +442,9 @@ async fn test_resolve_family_stream_position_rejects_resume_block_overflow() {
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-max".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -347,10 +472,22 @@ async fn test_resolve_family_stream_start_rejects_misaligned_resume_blocks() {
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_get_cursor()
+        .once()
+        .returning(|| "cursor-v2".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 101, ..Default::default() }));
+    v3.expect_get_cursor()
+        .once()
+        .returning(|| "cursor-v3".to_string());
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -377,10 +514,22 @@ async fn test_resolve_family_stream_start_rejects_mixed_resumed_and_fresh_branch
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_get_cursor()
+        .once()
+        .returning(|| "cursor-v2".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v3.expect_get_cursor()
+        .once()
+        .returning(String::new);
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -405,12 +554,30 @@ async fn test_resolve_family_stream_start_rejects_mixed_resumed_and_fresh_branch
 async fn test_resolve_family_stream_start_uses_bootstrap_adjusted_aligned_fresh_start() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
+    v2.expect_get_cursor()
+        .once()
+        .returning(String::new);
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
+    v3.expect_get_cursor()
+        .once()
+        .returning(String::new);
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -505,7 +672,7 @@ async fn test_resolve_family_stream_start_rejects_misaligned_fresh_branch_starts
 
     assert!(family_execution
         .to_string()
-        .contains("family runner requires aligned branch start blocks"));
+        .contains("family `uniswap` requires aligned branch start blocks"));
 }
 
 #[tokio::test]
@@ -514,10 +681,22 @@ async fn test_run_family_bootstrap_if_needed_rejects_mixed_progress_before_boots
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_get_cursor()
+        .once()
+        .returning(|| "cursor-v2".to_string());
+    v2.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v3.expect_get_cursor()
+        .once()
+        .returning(String::new);
+    v3.expect_get_completed_bootstrap_block()
+        .once()
+        .returning(|| Ok(None));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -559,16 +738,22 @@ fn fail_if_shared_bootstrap_materialized<'a>(
 async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_completion_exists() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v2.expect_get_cursor()
+        .once()
+        .returning(String::new);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v3.expect_get_cursor()
+        .once()
+        .returning(String::new);
     v3.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
@@ -582,10 +767,12 @@ async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_c
     let mut family_execution =
         resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
             .expect("family execution config derives for completion test");
-    family_execution.shared_bootstrap_execution.plan_materializer =
-        fail_if_shared_bootstrap_materialized;
+    family_execution
+        .shared_bootstrap_execution
+        .plan_materializer = fail_if_shared_bootstrap_materialized;
 
-    let rpc_client = EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
+    let rpc_client =
+        EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
     run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
         .await
@@ -596,16 +783,22 @@ async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_c
 async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootstrap_blocks() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v2.expect_get_cursor()
+        .once()
+        .returning(String::new);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v3.expect_get_cursor()
+        .once()
+        .returning(String::new);
     v3.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(43)));
@@ -619,10 +812,12 @@ async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootst
     let mut family_execution =
         resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
             .expect("family execution config derives for misaligned completion test");
-    family_execution.shared_bootstrap_execution.plan_materializer =
-        fail_if_shared_bootstrap_materialized;
+    family_execution
+        .shared_bootstrap_execution
+        .plan_materializer = fail_if_shared_bootstrap_materialized;
 
-    let rpc_client = EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
+    let rpc_client =
+        EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
     let err = run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
         .await
@@ -633,23 +828,40 @@ async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootst
 }
 
 #[tokio::test]
-async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_after_completed_shared_bootstrap(
-) {
+async fn test_run_family_bootstrap_if_needed_rejects_legacy_fallback_bootstrap_scope() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
+    v2.expect_get_cursor()
+        .once()
+        .returning(String::new);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
+    v2.expect_get_completed_bootstrap_state_scope()
+        .once()
+        .returning(|| Ok(PersistedExtractorStateScope::LegacyExtractorFallback));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
-        .times(2)
+        .once()
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(true);
+    v3.expect_get_cursor()
+        .once()
+        .returning(String::new);
     v3.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
+    v3.expect_get_completed_bootstrap_state_scope()
+        .once()
+        .returning(|| Ok(PersistedExtractorStateScope::LegacyExtractorFallback));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -657,8 +869,65 @@ async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_af
     ]);
     let configs = make_uniswap_family_bootstrap_test_configs();
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let resolved_family = resolved_family_runtime_from_configs_for_tests(&config_refs, "test-shared.spkg");
-    let rpc_client = EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
+    let mut family_execution =
+        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
+            .expect("family execution config derives for legacy fallback bootstrap scope");
+    family_execution
+        .shared_bootstrap_execution
+        .plan_materializer = fail_if_shared_bootstrap_materialized;
+
+    let rpc_client =
+        EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
+
+    let err = run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
+        .await
+        .expect_err("legacy fallback bootstrap scope should fail shared bootstrap skip path");
+    assert!(err
+        .to_string()
+        .contains("legacy extractor-scoped fallback bootstrap state"));
+}
+
+#[tokio::test]
+async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_after_completed_shared_bootstrap(
+) {
+    let mut v2 = MockExtractor::new();
+    v2.expect_get_last_processed_block()
+        .times(2)
+        .returning(|| None);
+    v2.expect_get_cursor()
+        .times(2)
+        .returning(String::new);
+    v2.expect_get_completed_bootstrap_block()
+        .times(2)
+        .returning(|| Ok(Some(42)));
+    v2.expect_supports_persisted_state_scope()
+        .times(2)
+        .return_const(false);
+
+    let mut v3 = MockExtractor::new();
+    v3.expect_get_last_processed_block()
+        .times(2)
+        .returning(|| None);
+    v3.expect_get_cursor()
+        .times(2)
+        .returning(String::new);
+    v3.expect_get_completed_bootstrap_block()
+        .times(2)
+        .returning(|| Ok(Some(42)));
+    v3.expect_supports_persisted_state_scope()
+        .times(2)
+        .return_const(false);
+
+    let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
+        ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
+        ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
+    ]);
+    let configs = make_uniswap_family_bootstrap_test_configs();
+    let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "test-shared.spkg");
+    let rpc_client =
+        EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
     let prepared_request = resolved_family
         .prepare_substreams_request(&extractors, &rpc_client)
@@ -667,7 +936,10 @@ async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_af
 
     assert_eq!(
         prepared_request.request.spkg,
-        resolved_family.execution.shared_stream.spkg
+        resolved_family
+            .execution
+            .shared_stream
+            .spkg
     );
     assert_eq!(prepared_request.request.module, family_output_module_for_tests("uniswap"));
     assert_eq!(prepared_request.request.start_block, 43);
@@ -684,16 +956,22 @@ async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
     v2.expect_get_last_processed_block()
         .times(2)
         .returning(|| None);
+    v2.expect_get_cursor()
+        .times(2)
+        .returning(String::new);
     v2.expect_get_completed_bootstrap_block()
-        .once()
+        .times(2)
         .returning(|| Ok(Some(42)));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
         .times(2)
         .returning(|| None);
+    v3.expect_get_cursor()
+        .times(2)
+        .returning(String::new);
     v3.expect_get_completed_bootstrap_block()
-        .once()
+        .times(2)
         .returning(|| Ok(Some(42)));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
@@ -706,13 +984,15 @@ async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
     let mut family_execution =
         resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
             .expect("family execution config derives for stream request test");
-    family_execution.shared_bootstrap_execution.plan_materializer =
-        fail_if_shared_bootstrap_materialized;
+    family_execution
+        .shared_bootstrap_execution
+        .plan_materializer = fail_if_shared_bootstrap_materialized;
     let mut resolved_family =
         resolved_family_runtime_from_configs_for_tests(&config_refs, "test-family.spkg");
     resolved_family.execution = family_execution.clone();
 
-    let rpc_client = EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
+    let rpc_client =
+        EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
     run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
         .await

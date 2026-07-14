@@ -1,4 +1,5 @@
 use super::*;
+use crate::extractor::family_runtime_metadata::ResolvedSharedFamilyStream;
 
 #[test]
 fn test_resolved_family_execution_config_rejects_partial_shared_bootstrap_config() {
@@ -67,18 +68,14 @@ fn test_resolved_family_execution_config_derives_shared_branch_and_stream_settin
             "uniswap_v3_pool".to_string(),
             FinancialType::Swap,
         )],
-        substreams_params: HashMap::from([(
-            "map_events".to_string(),
-            "factory=0x02".to_string(),
-        )]),
+        substreams_params: HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
         ..Default::default()
     };
 
-    let execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-            .expect("family execution config derives");
+    let execution = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
+        .expect("family execution config derives");
     let shared_stream = uniswap_shared_stream_for_tests("/tmp/shared-family.spkg");
-    let expected_shared_stream = crate::extractor::family_runtime::ResolvedSharedFamilyStream {
+    let expected_shared_stream = ResolvedSharedFamilyStream {
         spkg: "/tmp/shared-family.spkg".to_string(),
         ..shared_stream
     };
@@ -88,10 +85,7 @@ fn test_resolved_family_execution_config_derives_shared_branch_and_stream_settin
     assert!(execution.bootstrap_plan.is_none());
     assert_eq!(execution.shared_stream.module, expected_shared_stream.module);
     assert_eq!(execution.shared_stream.extractor_id, expected_shared_stream.extractor_id);
-    assert_eq!(
-        execution.shared_stream.durability_scope,
-        expected_shared_stream.durability_scope
-    );
+    assert_eq!(execution.shared_stream.durability_scope, expected_shared_stream.durability_scope);
     assert_eq!(
         FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
         HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
@@ -130,18 +124,14 @@ fn test_resolved_family_execution_config_uses_protocol_systems_for_aliased_membe
             "uniswap_v3_pool".to_string(),
             FinancialType::Swap,
         )],
-        substreams_params: HashMap::from([(
-            "map_events".to_string(),
-            "factory=0x02".to_string(),
-        )]),
+        substreams_params: HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
         ..Default::default()
     };
 
-    let execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-            .expect("aliased family execution config derives");
+    let execution = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
+        .expect("aliased family execution config derives");
     let shared_stream = uniswap_shared_stream_for_tests("/tmp/shared-family.spkg");
-    let expected_shared_stream = crate::extractor::family_runtime::ResolvedSharedFamilyStream {
+    let expected_shared_stream = ResolvedSharedFamilyStream {
         spkg: "/tmp/shared-family.spkg".to_string(),
         ..shared_stream
     };
@@ -151,10 +141,7 @@ fn test_resolved_family_execution_config_uses_protocol_systems_for_aliased_membe
     assert!(execution.bootstrap_plan.is_none());
     assert_eq!(execution.shared_stream.module, expected_shared_stream.module);
     assert_eq!(execution.shared_stream.extractor_id, expected_shared_stream.extractor_id);
-    assert_eq!(
-        execution.shared_stream.durability_scope,
-        expected_shared_stream.durability_scope
-    );
+    assert_eq!(execution.shared_stream.durability_scope, expected_shared_stream.durability_scope);
     assert_eq!(
         FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
         HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
@@ -193,10 +180,7 @@ fn test_resolved_family_execution_config_is_reused_from_resolved_family_runtime(
             "uniswap_v3_pool".to_string(),
             FinancialType::Swap,
         )],
-        substreams_params: HashMap::from([(
-            "map_events".to_string(),
-            "factory=0x02".to_string(),
-        )]),
+        substreams_params: HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
         ..Default::default()
     };
     let config_refs = vec![&v2, &v3];
@@ -236,8 +220,7 @@ fn test_resolved_family_execution_config_precomputes_shared_bootstrap_plan_and_s
         bootstrap: Some(BootstrapConfig {
             strategy: BootstrapStrategy::UniswapV2Rpc,
             start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                .to_owned(),
+            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         }),
         ..Default::default()
     };
@@ -253,15 +236,13 @@ fn test_resolved_family_execution_config_precomputes_shared_bootstrap_plan_and_s
         bootstrap: Some(BootstrapConfig {
             strategy: BootstrapStrategy::UniswapV3Rpc,
             start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
-                .to_owned(),
+            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678".to_owned(),
         }),
         ..Default::default()
     };
 
-    let execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-            .expect("family execution config derives");
+    let execution = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
+        .expect("family execution config derives");
 
     assert_eq!(execution.configured_start_block, 43);
     let bootstrap_plan = execution
@@ -495,9 +476,9 @@ fn test_validate_family_runner_membership_rejects_explicit_family_mismatch() {
 
     let err = validate_family_runner_membership(&family, &[&wrong_family_v2])
         .expect_err("explicit family mismatch should fail");
-    assert!(err.to_string().contains(
-        "cannot include extractor `wrong_family_v2` declared for family `future_swap`"
-    ));
+    assert!(err
+        .to_string()
+        .contains("cannot include extractor `wrong_family_v2` declared for family `future_swap`"));
 }
 
 #[test]
@@ -517,7 +498,7 @@ fn test_validate_family_runner_membership_rejects_missing_protocol_types() {
 
     let err = validate_family_runner_membership(&family, &[&typeless_v2])
         .expect_err("missing protocol types should fail");
-    assert!(err
-        .to_string()
-        .contains("requires extractor `typeless_v2` to declare at least one protocol type for branch routing"));
+    assert!(err.to_string().contains(
+        "requires extractor `typeless_v2` to declare at least one protocol type for branch routing"
+    ));
 }

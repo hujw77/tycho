@@ -1,81 +1,113 @@
-use crate::extractor::{family_registry, ExtractionError};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+};
 
-pub(crate) enum AuxiliaryProtocolMessage {
-    UniswapV3Events(crate::extractor::uniswap_v3_stream::Events),
+use async_trait::async_trait;
+use tycho_common::{
+    models::{
+        protocol::{ComponentBalance, ProtocolComponent},
+        Address, Chain, ComponentId,
+    },
+    Bytes,
+};
+
+use crate::extractor::{
+    models::BlockChanges,
+    ExtractionError,
+};
+use crate::extractor::family_registry::FamilyRuntimeRegistry;
+
+pub(crate) type AuxiliaryProtocolMessageBuildFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>>;
+
+#[async_trait]
+pub(crate) trait AuxiliaryProtocolMessageContext: Send + Sync {
+    fn extractor_name(&self) -> &str;
+
+    fn chain(&self) -> Chain;
+
+    fn protocol_system(&self) -> &str;
+
+    async fn get_protocol_components(
+        &self,
+        component_ids: &[ComponentId],
+    ) -> Result<HashMap<ComponentId, ProtocolComponent>, ExtractionError>;
+
+    async fn get_protocol_state_values_at_tip(
+        &self,
+        keys: &[(String, String)],
+    ) -> Result<HashMap<String, HashMap<String, Bytes>>, ExtractionError>;
+
+    async fn get_component_balances_at_tip(
+        &self,
+        reverted_balances_keys: &[(&String, &Bytes)],
+    ) -> Result<HashMap<String, HashMap<Address, ComponentBalance>>, ExtractionError>;
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AuxiliaryProtocolMessageDecoder {
     pub protocol_system: &'static str,
     pub type_url_suffix: &'static str,
-    pub decode: fn(&[u8]) -> Result<AuxiliaryProtocolMessage, ExtractionError>,
+    pub build_block_changes: for<'a> fn(
+        &'a dyn AuxiliaryProtocolMessageContext,
+        &'a [u8],
+        u64,
+        Option<u32>,
+    ) -> AuxiliaryProtocolMessageBuildFuture<'a>,
 }
 
-pub(crate) fn decode_auxiliary_protocol_message_with_decoders(
+pub(crate) fn auxiliary_protocol_message_decoder_for(
     decoders: &[AuxiliaryProtocolMessageDecoder],
     protocol_system: &str,
     type_url: &str,
-    value: &[u8],
-) -> Result<Option<AuxiliaryProtocolMessage>, ExtractionError> {
-    let Some(decoder) = decoders.iter().find(|decoder| {
+    ) -> Option<AuxiliaryProtocolMessageDecoder> {
+    decoders.iter().find(|decoder| {
         decoder.protocol_system == protocol_system && type_url.ends_with(decoder.type_url_suffix)
-    }) else {
-        return Ok(None);
-    };
-
-    (decoder.decode)(value).map(Some)
+    }).copied()
 }
 
-pub(crate) fn decode_auxiliary_protocol_message(
+pub(crate) fn default_auxiliary_protocol_message_decoders_for_protocol_system(
     protocol_system: &str,
-    type_url: &str,
-    value: &[u8],
-) -> Result<Option<AuxiliaryProtocolMessage>, ExtractionError> {
-    for family in family_registry::default_family_runtime_specs() {
-        if let Some(decoded) = decode_auxiliary_protocol_message_with_decoders(
-            family.auxiliary_protocol_message_decoders,
-            protocol_system,
-            type_url,
-            value,
-        )? {
-            return Ok(Some(decoded));
-        }
-    }
-
-    Ok(None)
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Vec<AuxiliaryProtocolMessageDecoder> {
+    registry
+        .registered_protocol_system_defaults(protocol_system)
+        .map(|defaults| defaults.auxiliary_protocol_message_decoders().to_vec())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message;
-    use crate::extractor::uniswap_v3_stream;
+    use crate::extractor::family_registry::default_family_runtime_registry;
 
     #[test]
-    fn decodes_registered_uniswap_v3_auxiliary_message() {
-        let events = uniswap_v3_stream::Events::default();
-        let decoded = decode_auxiliary_protocol_message(
+    fn finds_registered_uniswap_v3_auxiliary_decoder() {
+        let decoder = auxiliary_protocol_message_decoder_for(
+            &default_auxiliary_protocol_message_decoders_for_protocol_system(
+                "uniswap_v3",
+                default_family_runtime_registry(),
+            ),
             "uniswap_v3",
             "type.googleapis.com/tycho.evm.uniswap.v3.Events",
-            &events.encode_to_vec(),
-        )
-        .expect("registered decoder should succeed");
+        );
 
-        assert!(matches!(
-            decoded,
-            Some(AuxiliaryProtocolMessage::UniswapV3Events(_))
-        ));
+        assert!(decoder.is_some());
     }
 
     #[test]
     fn ignores_unregistered_auxiliary_protocol_message() {
-        let decoded = decode_auxiliary_protocol_message(
+        let decoder = auxiliary_protocol_message_decoder_for(
+            &default_auxiliary_protocol_message_decoders_for_protocol_system(
+                "future_swap_v1",
+                default_family_runtime_registry(),
+            ),
             "future_swap_v1",
             "type.googleapis.com/future.swap.Events",
-            &[],
-        )
-        .expect("unknown protocol should be ignored");
+        );
 
-        assert!(decoded.is_none());
+        assert!(decoder.is_none());
     }
 }

@@ -1,4 +1,7 @@
+use std::{collections::HashMap, sync::Arc};
+
 use super::*;
+use crate::extractor::Extractor;
 
 #[tokio::test]
 async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() {
@@ -85,7 +88,12 @@ async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() 
         .returning(|changes, cursor| {
             assert_eq!(cursor, "bootstrap@42");
             assert_eq!(changes.txs_with_update.len(), 1);
-            assert_eq!(changes.txs_with_update[0].protocol_components.len(), 1);
+            assert_eq!(
+                changes.txs_with_update[0]
+                    .protocol_components
+                    .len(),
+                1
+            );
             assert!(changes.txs_with_update[0]
                 .protocol_components
                 .contains_key("v2-pool"));
@@ -113,7 +121,12 @@ async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() 
         .returning(|changes, cursor| {
             assert_eq!(cursor, "bootstrap@42");
             assert_eq!(changes.txs_with_update.len(), 1);
-            assert_eq!(changes.txs_with_update[0].protocol_components.len(), 1);
+            assert_eq!(
+                changes.txs_with_update[0]
+                    .protocol_components
+                    .len(),
+                1
+            );
             assert!(changes.txs_with_update[0]
                 .protocol_components
                 .contains_key("v3-pool"));

@@ -243,6 +243,30 @@ impl ProtocolMemoryCache {
 
         Ok(resolved)
     }
+
+    pub async fn cached_protocol_components_by_contract_addresses(
+        &self,
+        contract_addresses: &HashSet<Vec<u8>>,
+        protocol_systems: &HashSet<String>,
+    ) -> HashMap<ComponentId, ProtocolComponent> {
+        let components = self.components.read().await;
+        protocol_systems
+            .iter()
+            .filter_map(|protocol_system| {
+                components
+                    .get(protocol_system)
+                    .map(|components| (protocol_system, components))
+            })
+            .flat_map(|(_, components)| components.values())
+            .filter(|component| {
+                component
+                    .contract_addresses
+                    .iter()
+                    .any(|contract| contract_addresses.contains(&contract.to_vec()))
+            })
+            .map(|component| (component.id.clone(), component.clone()))
+            .collect()
+    }
 }
 
 #[async_trait]

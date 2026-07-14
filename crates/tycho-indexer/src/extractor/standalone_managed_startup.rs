@@ -1,103 +1,131 @@
-use tokio::runtime::Handle;
-use tycho_ethereum::{
-    rpc::EthereumRpcClient,
-    services::token_pre_processor::EthereumTokenPreProcessor,
+use crate::extractor::{
+    extractor_config::ExtractorConfig,
+    family_registry::FamilyRuntimeRegistry,
+    managed_extractor_initialization::ManagedExtractorBuildContext,
+    managed_stream_startup::PreparedSingleRunnerStartup,
+    protocol_message_registry::default_auxiliary_protocol_message_decoders_for_protocol_system,
+    runtime_target_planning::ResolvedStandaloneRuntime,
+    ExtractionError,
 };
-use tycho_storage::postgres::cache::CachedGateway;
 
-use crate::{
-    extractor::{
-        chain_state::ChainState,
-        family_runtime::default_auxiliary_protocol_message_decoders_for_protocol_system,
-        protocol_cache::ProtocolMemoryCache,
-        runner::{
-            load_substreams_package, ExtractorBuilder, ExtractorHandle, ManagedRunner,
-            PreparedSingleRunnerStartup,
+fn standalone_auxiliary_protocol_message_decoders(
+    extractor_config: &ExtractorConfig,
+    registry: FamilyRuntimeRegistry<'static>,
+) -> Vec<crate::extractor::protocol_message_registry::AuxiliaryProtocolMessageDecoder> {
+    default_auxiliary_protocol_message_decoders_for_protocol_system(
+        extractor_config.protocol_system(),
+        registry,
+    )
+}
+
+impl<'a> ResolvedStandaloneRuntime<'a> {
+    pub(crate) async fn prepare_managed_startup(
+        self,
+        extractor_build: ManagedExtractorBuildContext<'_>,
+    ) -> Result<PreparedSingleRunnerStartup, ExtractionError> {
+        let auxiliary_protocol_message_decoders = standalone_auxiliary_protocol_message_decoders(
+            self.extractor_config,
+            extractor_build.family_runtime_registry,
+        );
+        let extractor = extractor_build
+            .build_initialized_extractor(
+                self.extractor_config,
+                auxiliary_protocol_message_decoders,
+            )
+            .await?;
+        let extractor_id = extractor.get_id();
+        let prepared_request = self
+            .prepare_substreams_request(
+                extractor.clone(),
+                &extractor_id,
+                extractor_build.rpc_client,
+                extractor_build.family_runtime_registry,
+            )
+            .await?;
+        PreparedSingleRunnerStartup::from_prepared_request(
+            &extractor_build,
+            extractor,
+            extractor_id,
+            prepared_request,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tycho_common::models::{Chain, FinancialType, ImplementationType};
+
+    use super::*;
+    use crate::extractor::{
+        extractor_config::ProtocolTypeConfig,
+        family_registry::{FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec},
+        protocol_message_registry::{
+            AuxiliaryProtocolMessageBuildFuture, AuxiliaryProtocolMessageContext,
+            AuxiliaryProtocolMessageDecoder,
         },
-        ExtractionError,
-    },
-    substreams::stream::SubstreamsStream,
-};
+    };
 
-#[derive(Clone, Copy)]
-pub(crate) struct StandaloneRuntimeBuildContext<'a> {
-    pub(crate) chain_state: ChainState,
-    pub(crate) endpoint_url: &'a str,
-    pub(crate) s3_bucket: Option<&'a str>,
-    pub(crate) substreams_api_token: &'a str,
-    pub(crate) cached_gw: &'a CachedGateway,
-    pub(crate) database_insert_batch_size: usize,
-    pub(crate) token_pre_processor: &'a EthereumTokenPreProcessor,
-    pub(crate) protocol_cache: &'a ProtocolMemoryCache,
-    pub(crate) rpc_client: &'a EthereumRpcClient,
-    pub(crate) partial_blocks: bool,
-    pub(crate) final_block_only: bool,
-}
+    fn build_future_events_for_startup_test<'a>(
+        _context: &'a dyn AuxiliaryProtocolMessageContext,
+        _value: &'a [u8],
+        _finalized_block_height: u64,
+        _partial_block_index: Option<u32>,
+    ) -> AuxiliaryProtocolMessageBuildFuture<'a> {
+        Box::pin(async {
+            Err(ExtractionError::Unknown(
+                "test-only decoder should not run".to_string(),
+            ))
+        })
+    }
 
-pub(crate) async fn prepare_standalone_managed_startup(
-    extractor_config: &crate::extractor::runner::ExtractorConfig,
-    context: StandaloneRuntimeBuildContext<'_>,
-) -> Result<PreparedSingleRunnerStartup, ExtractionError> {
-    let builder = ExtractorBuilder::new(
-        extractor_config,
-        context.endpoint_url,
-        context.s3_bucket,
-        context.substreams_api_token,
-    )
-    .database_insert_batch_size(context.database_insert_batch_size)
-    .auxiliary_protocol_message_decoders(
-        default_auxiliary_protocol_message_decoders_for_protocol_system(
-            extractor_config.protocol_system(),
-        ),
-    )
-    .partial_blocks(context.partial_blocks)
-    .build(
-        context.chain_state,
-        context.cached_gw,
-        context.token_pre_processor,
-        context.protocol_cache,
-        context.rpc_client,
-    )
-    .await?;
-    let extractor = builder.initialized_extractor();
-    let extractor_id = extractor.get_id();
-    let prepared_request = builder
-        .prepare_substreams_request(extractor.clone(), &extractor_id)
-        .await?;
-    let loaded_substreams = load_substreams_package(
-        context.s3_bucket,
-        &prepared_request.request.spkg,
-        context.endpoint_url,
-        Some(context.substreams_api_token.to_string()),
-    )
-    .await?;
+    #[tokio::test]
+    async fn prepare_standalone_managed_startup_injects_custom_registry_decoders() {
+        const FUTURE_DECODERS: &[AuxiliaryProtocolMessageDecoder] =
+            &[AuxiliaryProtocolMessageDecoder {
+                protocol_system: "future_v1",
+                type_url_suffix: "FutureEvents",
+                build_block_changes: build_future_events_for_startup_test,
+            }];
+        const FUTURE_FAMILY: FamilyRuntimeSpec = FamilyRuntimeSpec::new(
+            "future_swap",
+            &[FamilyMemberSpec {
+                protocol_system: "future_v1",
+                shared_route_protocols: &["futurev1"],
+                shared_bootstrap: None,
+            }],
+            "map_future_swap_family_protocol_changes",
+            "future_swap_family",
+            "family::future_swap",
+            None,
+            FUTURE_DECODERS,
+        );
+        let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
+        let config = ExtractorConfig::new(
+            "future_v1_alias".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1,
+            42,
+            None,
+            vec![ProtocolTypeConfig::new("future_pool".to_string(), FinancialType::Swap)],
+            "/tmp/future-v1-test.spkg".to_string(),
+            "map_future_pool_events".to_string(),
+            vec![],
+            0,
+            None,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .with_protocol_system("future_v1");
 
-    let stream = SubstreamsStream::new(
-        loaded_substreams.endpoint,
-        prepared_request.cursor.clone(),
-        Some(loaded_substreams.spkg),
-        prepared_request.request.module.clone(),
-        prepared_request.request.start_block,
-        prepared_request.request.stop_block,
-        context.final_block_only,
-        prepared_request.request.extractor_id.clone(),
-        context.partial_blocks,
-        prepared_request.request.params.clone(),
-    );
+        let decoders = standalone_auxiliary_protocol_message_decoders(&config, registry);
 
-    Ok(PreparedSingleRunnerStartup {
-        extractor,
-        extractor_id,
-        stream,
-    })
-}
-
-pub(crate) fn build_standalone_managed_runner_from_startup(
-    prepared_startup: PreparedSingleRunnerStartup,
-    runtime: Option<Handle>,
-    partial_blocks: bool,
-) -> (ManagedRunner, Vec<ExtractorHandle>) {
-    let (runner, handle) =
-        ExtractorBuilder::build_from_startup(prepared_startup, runtime, partial_blocks);
-    (ManagedRunner::Single(runner), vec![handle])
+        assert_eq!(decoders.len(), 1);
+        assert_eq!(decoders[0].protocol_system, "future_v1");
+        assert_eq!(decoders[0].type_url_suffix, "FutureEvents");
+    }
 }

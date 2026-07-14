@@ -18,7 +18,7 @@ use tycho_common::{
 };
 use uuid::Uuid;
 
-use crate::extractor::runner::MessageSender;
+use crate::extractor::control::MessageSender;
 
 /// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -589,7 +589,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::extractor::{runner::ControlMessage, ExtractorMsg};
+    use crate::extractor::{control::ControlMessage, ExtractorMsg};
 
     pub struct MyMessageSender {
         extractor_id: ExtractorIdentity,

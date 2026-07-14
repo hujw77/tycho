@@ -1,13 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{
-    mpsc::Sender,
-    Mutex,
-};
+use tokio::sync::{mpsc::Sender, Mutex};
 use tycho_common::models::ExtractorIdentity;
 
 use crate::extractor::{
-    runner::{BranchSubscriptionsMap, ControlMessage, ExtractorBuilder, ExtractorHandle},
+    control::{BranchSubscriptionsMap, ControlMessage, ExtractorHandle},
     Extractor,
 };
 
@@ -39,19 +36,15 @@ impl FamilyBranchRuntimeWiring {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn extractors_by_protocol_system(
-    built_builders: Vec<ExtractorBuilder>,
+    extractors: Vec<(String, Arc<dyn Extractor>)>,
 ) -> HashMap<String, Arc<dyn Extractor>> {
-    built_builders
-        .into_iter()
-        .map(ExtractorBuilder::into_protocol_system_and_extractor)
-        .collect()
+    extractors.into_iter().collect()
 }
 
 impl FamilyBranchSubscriptionIndex {
-    pub(crate) fn from_extractors(
-        extractors: &HashMap<String, Arc<dyn Extractor>>,
-    ) -> Self {
+    pub(crate) fn from_extractors(extractors: &HashMap<String, Arc<dyn Extractor>>) -> Self {
         let mut keys = HashMap::new();
 
         for (protocol_system, extractor) in extractors {

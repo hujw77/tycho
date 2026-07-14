@@ -18,7 +18,8 @@ Modes:
   doctor    Report whether the combined-family validation surface is ready.
             With `--strict`, exits non-zero when any required dependency is not ready.
   command   Print the exact command for the selected validation mode.
-            `acceptance` runs the repo-local DB-backed shared-runtime acceptance gate.
+            `acceptance` runs the repo-local extensibility contract gate plus the DB-backed
+            shared-runtime acceptance gate.
             `repo` runs the repo-local DB-backed regression gate.
             `live` runs the live combined-family Fynd E2E gate.
             `live-managed` starts the combined-family indexer, waits for health, then runs the
@@ -26,18 +27,23 @@ Modes:
             `full` runs `acceptance` first, then `live`.
             `full-managed` runs `acceptance` first, then `live-managed`.
             `all` runs `repo` first, then `live`.
-  run-acceptance Execute the repo-local DB-backed shared-runtime acceptance gate.
+  run-acceptance Execute the repo-local extensibility contract gate, then the DB-backed
+                 shared-runtime acceptance gate.
   run-repo  Execute the repo-local DB-backed regression gate.
   run-live  Execute the live combined-family Fynd E2E gate.
   run-live-managed Start the combined-family indexer, then execute the live Fynd E2E gate.
-  run-full  Execute the repo-local DB gate, then the live Fynd E2E gate.
-  run-full-managed Execute the repo-local DB gate, then the managed live Fynd E2E gate.
+  run-full  Execute the repo-local extensibility contract gate, then the DB-backed
+            shared-runtime acceptance gate, then the live Fynd E2E gate.
+  run-full-managed Execute the repo-local extensibility contract gate, then the DB-backed
+                   shared-runtime acceptance gate, then the managed live Fynd E2E gate.
   run-all   Execute the repo-local DB gate, then the live Fynd E2E gate.
 
 Environment:
   DATABASE_URL           Forwarded to `check-combined-family-db.sh`
   TYCHO_COMBINED_FAMILY_DB_TEST_MANIFEST
                          Forwarded to `check-combined-family-db.sh`
+  TYCHO_COMBINED_FAMILY_EXTENSIBILITY_TEST_MANIFEST
+                         Forwarded to `check-combined-family-extensibility.sh`
   TYCHO_COMBINED_FAMILY_LIVE_SELECTION
                          Default: all
                          One of: route, settlement, all
@@ -54,11 +60,21 @@ Environment:
   FYND_E2E_TYCHO_URL     Forwarded to `check-combined-family-fynd-live-e2e.sh`
   FYND_E2E_RPC_URL       Forwarded to `check-combined-family-fynd-live-e2e.sh`
   FYND_E2E_RUST_LOG      Forwarded to `check-combined-family-fynd-live-e2e.sh`
+  FYND_E2E_HEALTH_TIMEOUT_SECS
+                         Forwarded to `check-combined-family-fynd-live-e2e.sh`
+  FYND_E2E_TRADED_N_DAYS_AGO
+                         Forwarded to `check-combined-family-fynd-live-e2e.sh`
+  FYND_E2E_MIN_TOKEN_QUALITY
+                         Forwarded to `check-combined-family-fynd-live-e2e.sh`
+  FYND_E2E_CONNECTOR_TOKENS
+                         Forwarded to `check-combined-family-fynd-live-e2e.sh`
+  TYCHO_COMBINED_FAMILY_LIVE_TEST_MANIFEST
+                         Forwarded to `check-combined-family-fynd-live-e2e.sh`
   FYND_E2E_ROUTE_TEST    Forwarded to `check-combined-family-fynd-live-e2e.sh`
   FYND_E2E_SETTLEMENT_TEST
                          Forwarded to `check-combined-family-fynd-live-e2e.sh`
   TYCHO_COMBINED_FAMILY_MANAGED_HEALTH_TIMEOUT_SECS
-                         Default: 90
+                         Default: FYND_E2E_HEALTH_TIMEOUT_SECS or 300
                          Used by `run-live-managed` and `run-full-managed`
   TYCHO_COMBINED_FAMILY_MANAGED_INDEXER_LOG
                          Optional fixed log file for the managed indexer process
@@ -76,13 +92,14 @@ shell_escape() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-db.sh"
+EXTENSIBILITY_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-extensibility.sh"
 LIVE_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-fynd-live-e2e.sh"
 INDEXER_RUN_SCRIPT="${SCRIPT_DIR}/run-combined-family-indexer.sh"
 
 mode="${1:-}"
 strict="false"
 LIVE_SELECTION="${TYCHO_COMBINED_FAMILY_LIVE_SELECTION:-all}"
-MANAGED_HEALTH_TIMEOUT_SECS="${TYCHO_COMBINED_FAMILY_MANAGED_HEALTH_TIMEOUT_SECS:-90}"
+MANAGED_HEALTH_TIMEOUT_SECS="${TYCHO_COMBINED_FAMILY_MANAGED_HEALTH_TIMEOUT_SECS:-${FYND_E2E_HEALTH_TIMEOUT_SECS:-300}}"
 
 if [[ -z "${mode}" || "${mode}" == "-h" || "${mode}" == "--help" ]]; then
   usage
@@ -111,13 +128,21 @@ is_live_tycho_healthy() {
   curl -fsS "http://${FYND_E2E_TYCHO_URL:-127.0.0.1:4242}/v1/health" >/dev/null 2>&1
 }
 
-wait_for_live_tycho_health() {
+is_live_tycho_ready_for_combined_family() {
+  local live_output
+  live_output="$(run_doctor_capture "${LIVE_GATE_SCRIPT}")"
+  local live_ready
+  live_ready="$(readiness_from_output "${live_output}")"
+  [[ "${live_ready}" == "true" ]]
+}
+
+wait_for_live_tycho_readiness() {
   local timeout_secs="$1"
   local start_ts
   start_ts="$(date +%s)"
 
   while true; do
-    if is_live_tycho_healthy; then
+    if is_live_tycho_ready_for_combined_family; then
       return 0
     fi
 
@@ -137,36 +162,47 @@ managed_indexer_log_path() {
     return
   fi
 
-  mktemp "${TMPDIR:-/tmp}/tycho-combined-family-indexer.XXXXXX.log"
+  mktemp "${TMPDIR:-/tmp}/tycho-combined-family-indexer.XXXXXX"
+}
+
+cleanup_managed_indexer() {
+  local managed_pid="${1:-}"
+  if [[ -n "${managed_pid}" ]] && kill -0 "${managed_pid}" >/dev/null 2>&1; then
+    kill "${managed_pid}" >/dev/null 2>&1 || true
+    wait "${managed_pid}" >/dev/null 2>&1 || true
+  fi
 }
 
 run_live_managed() {
-  if is_live_tycho_healthy; then
+  local log_path
+  local indexer_pid=""
+
+  if is_live_tycho_ready_for_combined_family; then
     run_live
     return
   fi
 
+  if is_live_tycho_healthy; then
+    echo "existing Tycho instance at ${FYND_E2E_TYCHO_URL:-127.0.0.1:4242} is healthy but not ready for combined-family live validation" >&2
+    echo "expected both uniswap_v2 and uniswap_v3 protocol components to be queryable before running managed live validation" >&2
+    return 1
+  fi
+
   "${INDEXER_RUN_SCRIPT}" doctor --strict >/dev/null
 
-  local log_path
   log_path="$(managed_indexer_log_path)"
 
   cd "${SCRIPT_DIR}"
   "${INDEXER_RUN_SCRIPT}" run >"${log_path}" 2>&1 &
-  local indexer_pid=$!
+  indexer_pid=$!
+  export TYCHO_COMBINED_FAMILY_MANAGED_PID="${indexer_pid}"
 
-  cleanup_managed_indexer() {
-    if kill -0 "${indexer_pid}" >/dev/null 2>&1; then
-      kill "${indexer_pid}" >/dev/null 2>&1 || true
-      wait "${indexer_pid}" >/dev/null 2>&1 || true
-    fi
-  }
+  trap 'cleanup_managed_indexer "${TYCHO_COMBINED_FAMILY_MANAGED_PID:-}"' EXIT
 
-  trap cleanup_managed_indexer EXIT
-
-  if ! wait_for_live_tycho_health "${MANAGED_HEALTH_TIMEOUT_SECS}"; then
-    echo "managed combined-family indexer did not become healthy within ${MANAGED_HEALTH_TIMEOUT_SECS}s" >&2
+  if ! wait_for_live_tycho_readiness "${MANAGED_HEALTH_TIMEOUT_SECS}"; then
+    echo "managed combined-family indexer did not become ready within ${MANAGED_HEALTH_TIMEOUT_SECS}s" >&2
     echo "managed indexer log: ${log_path}" >&2
+    tail -n 40 "${log_path}" >&2 || true
     return 1
   fi
 
@@ -178,58 +214,101 @@ readiness_from_output() {
   printf '%s\n' "${rendered}" | awk -F= '$1 == "ready" { print $2; exit }'
 }
 
+field_from_output() {
+  local rendered="$1"
+  local field_name="$2"
+  printf '%s\n' "${rendered}" | awk -F= -v field_name="${field_name}" '$1 == field_name { print $2; exit }'
+}
+
 run_doctor_capture() {
   local target_script="$1"
-  local output
-  if ! output="$("${target_script}" doctor)"; then
+  local output_file
+  output_file="$(mktemp "${TMPDIR:-/tmp}/combined-family-doctor.XXXXXX")"
+  if ! "${target_script}" doctor >"${output_file}"; then
+    rm -f "${output_file}"
     echo "failed to execute doctor mode for ${target_script}" >&2
     exit 1
   fi
-  printf '%s' "${output}"
+  cat "${output_file}"
+  rm -f "${output_file}"
 }
 
 doctor() {
   local repo_output
+  local extensibility_output
   local live_output
   local operator_output
+  local extensibility_ready
   local repo_ready
   local live_ready
   local operator_ready
+  local live_fynd_repo_exists
+  local live_fynd_test_exists
+  local live_curl_available
+  local managed_live_ready
+  local managed_full_ready
   local ready="true"
 
+  extensibility_output="$(run_doctor_capture "${EXTENSIBILITY_GATE_SCRIPT}")"
   repo_output="$(run_doctor_capture "${DB_GATE_SCRIPT}")"
   live_output="$(run_doctor_capture "${LIVE_GATE_SCRIPT}")"
   operator_output="$(run_doctor_capture "${INDEXER_RUN_SCRIPT}")"
+  extensibility_ready="$(readiness_from_output "${extensibility_output}")"
   repo_ready="$(readiness_from_output "${repo_output}")"
   live_ready="$(readiness_from_output "${live_output}")"
   operator_ready="$(readiness_from_output "${operator_output}")"
+  live_fynd_repo_exists="$(field_from_output "${live_output}" "fynd_repo_exists")"
+  live_fynd_test_exists="$(field_from_output "${live_output}" "fynd_test_exists")"
+  live_curl_available="$(field_from_output "${live_output}" "curl_available")"
 
-  if [[ "${repo_ready}" != "true" || "${live_ready}" != "true" ]]; then
+  if [[ "${extensibility_ready}" != "true" || "${repo_ready}" != "true" || "${live_ready}" != "true" ]]; then
     ready="false"
+  fi
+
+  managed_live_ready="false"
+  if [[ "${operator_ready}" == "true" \
+    && "${live_fynd_repo_exists}" == "true" \
+    && "${live_fynd_test_exists}" == "true" \
+    && "${live_curl_available}" == "true" ]]; then
+    managed_live_ready="true"
+  fi
+
+  managed_full_ready="false"
+  if [[ "${extensibility_ready}" == "true" && "${repo_ready}" == "true" && "${managed_live_ready}" == "true" ]]; then
+    managed_full_ready="true"
   fi
 
   cat <<EOF
 ready=${ready}
-acceptance_ready=${repo_ready}
+acceptance_ready=$([[ "${extensibility_ready}" == "true" && "${repo_ready}" == "true" ]] && printf 'true' || printf 'false')
 full_ready=${ready}
+extensibility_ready=${extensibility_ready}
 repo_ready=${repo_ready}
 live_ready=${live_ready}
 operator_ready=${operator_ready}
-managed_live_ready=$(if [[ "${operator_ready}" == "true" ]]; then printf 'true'; else printf 'false'; fi)
-managed_full_ready=$(if [[ "${repo_ready}" == "true" && "${operator_ready}" == "true" ]]; then printf 'true'; else printf 'false'; fi)
+managed_live_ready=${managed_live_ready}
+managed_full_ready=${managed_full_ready}
+extensibility_gate_script=${EXTENSIBILITY_GATE_SCRIPT}
 db_gate_script=${DB_GATE_SCRIPT}
 live_gate_script=${LIVE_GATE_SCRIPT}
 indexer_run_script=${INDEXER_RUN_SCRIPT}
+extensibility_doctor_command=$(printf '%s doctor' "$(shell_escape "${EXTENSIBILITY_GATE_SCRIPT}")")
 repo_doctor_command=$(printf '%s doctor' "$(shell_escape "${DB_GATE_SCRIPT}")")
 live_doctor_command=$(printf '%s doctor' "$(shell_escape "${LIVE_GATE_SCRIPT}")")
 operator_doctor_command=$(printf '%s doctor' "$(shell_escape "${INDEXER_RUN_SCRIPT}")")
-acceptance_run_command=$("${DB_GATE_SCRIPT}" command | flatten_output)
+acceptance_run_command=$(
+  {
+    "${EXTENSIBILITY_GATE_SCRIPT}" command
+    "${DB_GATE_SCRIPT}" command
+  } | flatten_output
+)
 repo_run_command=$("${DB_GATE_SCRIPT}" command | flatten_output)
 live_run_command=$("${LIVE_GATE_SCRIPT}" command "${LIVE_SELECTION}" | flatten_output)
 managed_live_run_command=$(printf '%s run-live-managed' "$(shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
 operator_run_command=$("${INDEXER_RUN_SCRIPT}" command | flatten_output)
 full_run_command=$(
   {
+    "${EXTENSIBILITY_GATE_SCRIPT}" command
     "${DB_GATE_SCRIPT}" command
     "${LIVE_GATE_SCRIPT}" command "${LIVE_SELECTION}"
   } | flatten_output
@@ -247,7 +326,10 @@ render_command() {
 
   case "${selection}" in
     acceptance)
-      "${DB_GATE_SCRIPT}" command
+      cat <<EOF
+$("${EXTENSIBILITY_GATE_SCRIPT}" command)
+$("${DB_GATE_SCRIPT}" command)
+EOF
       ;;
     repo)
       "${DB_GATE_SCRIPT}" command
@@ -262,6 +344,7 @@ EOF
       ;;
     full)
       cat <<EOF
+$("${EXTENSIBILITY_GATE_SCRIPT}" command)
 $("${DB_GATE_SCRIPT}" command)
 $("${LIVE_GATE_SCRIPT}" command "${LIVE_SELECTION}")
 EOF
@@ -285,10 +368,11 @@ EOF
 }
 
 run_repo() {
-  "${DB_GATE_SCRIPT}" run
+  TYCHO_COMBINED_FAMILY_SKIP_DB_DOCTOR=1 "${DB_GATE_SCRIPT}" run
 }
 
 run_acceptance() {
+  "${EXTENSIBILITY_GATE_SCRIPT}" run
   run_repo
 }
 
@@ -317,7 +401,8 @@ run_full_managed() {
 }
 
 run_all() {
-  run_full
+  run_repo
+  run_live
 }
 
 case "${mode}" in

@@ -373,7 +373,7 @@ mod tests {
     }
 
     fn family_stream_identity(family_name: &str) -> (String, String) {
-        let registry = crate::extractor::family_runtime::default_family_runtime_registry();
+        let registry = crate::extractor::family_registry::default_family_runtime_registry();
         let identity = registry
             .shared_stream_identity_for_family(tycho_common::models::Chain::Ethereum, family_name)
             .unwrap_or_else(|| panic!("family `{family_name}` shared stream identity"));

@@ -1,4 +1,20 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use futures03::stream;
+use prost::Message;
+use tokio::sync::{mpsc, Mutex};
+use tycho_common::models::{blockchain::BlockAggregatedChanges, Chain, ExtractorIdentity};
+use tycho_substreams::pb::tycho::evm::v1 as substreams;
+
 use super::*;
+use crate::{
+    extractor::{protocol_cache::ProtocolMemoryCache, ExtractionError, Extractor},
+    pb::sf::substreams::rpc::v2::BlockScopedData,
+    substreams::stream::{BlockResponse, SubstreamsStream},
+};
 
 #[tokio::test]
 async fn test_family_runner_dispatches_shared_stream_into_branch_extractors() {
@@ -18,9 +34,15 @@ async fn test_family_runner_dispatches_shared_stream_into_branch_extractors() {
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
             assert_eq!(decoded.changes.len(), 1);
-            assert_eq!(decoded.changes[0].component_changes.len(), 1);
+            assert_eq!(
+                decoded.changes[0]
+                    .component_changes
+                    .len(),
+                1
+            );
             assert_eq!(decoded.changes[0].component_changes[0].id, "v2-pool");
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
         });
@@ -42,9 +64,15 @@ async fn test_family_runner_dispatches_shared_stream_into_branch_extractors() {
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
             assert_eq!(decoded.changes.len(), 1);
-            assert_eq!(decoded.changes[0].component_changes.len(), 1);
+            assert_eq!(
+                decoded.changes[0]
+                    .component_changes
+                    .len(),
+                1
+            );
             assert_eq!(decoded.changes[0].component_changes[0].id, "v3-pool");
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
         });
@@ -257,12 +285,22 @@ async fn test_family_runner_reconnects_and_dispatches_follow_up_updates() {
                 match *call {
                     1 => {
                         assert_eq!(inp.cursor, "cursor-42");
-                        assert_eq!(decoded.changes[0].component_changes.len(), 1);
+                        assert_eq!(
+                            decoded.changes[0]
+                                .component_changes
+                                .len(),
+                            1
+                        );
                         assert_eq!(decoded.changes[0].component_changes[0].id, "v2-pool");
                     }
                     2 => {
                         assert_eq!(inp.cursor, "cursor-43");
-                        assert_eq!(decoded.changes[0].component_changes.len(), 0);
+                        assert_eq!(
+                            decoded.changes[0]
+                                .component_changes
+                                .len(),
+                            0
+                        );
                         assert_eq!(decoded.changes[0].entity_changes.len(), 1);
                         assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v2-pool");
                     }
@@ -298,12 +336,22 @@ async fn test_family_runner_reconnects_and_dispatches_follow_up_updates() {
                 match *call {
                     1 => {
                         assert_eq!(inp.cursor, "cursor-42");
-                        assert_eq!(decoded.changes[0].component_changes.len(), 1);
+                        assert_eq!(
+                            decoded.changes[0]
+                                .component_changes
+                                .len(),
+                            1
+                        );
                         assert_eq!(decoded.changes[0].component_changes[0].id, "v3-pool");
                     }
                     2 => {
                         assert_eq!(inp.cursor, "cursor-43");
-                        assert_eq!(decoded.changes[0].component_changes.len(), 0);
+                        assert_eq!(
+                            decoded.changes[0]
+                                .component_changes
+                                .len(),
+                            0
+                        );
                         assert_eq!(decoded.changes[0].entity_changes.len(), 1);
                         assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v3-pool");
                     }
@@ -383,10 +431,16 @@ async fn test_family_runner_routes_existing_components_after_restart_style_prese
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
             assert_eq!(inp.cursor, "cursor-43");
             assert_eq!(decoded.changes.len(), 1);
-            assert_eq!(decoded.changes[0].component_changes.len(), 0);
+            assert_eq!(
+                decoded.changes[0]
+                    .component_changes
+                    .len(),
+                0
+            );
             assert_eq!(decoded.changes[0].entity_changes.len(), 1);
             assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v2-pool");
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
@@ -406,10 +460,16 @@ async fn test_family_runner_routes_existing_components_after_restart_style_prese
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
             assert_eq!(inp.cursor, "cursor-43");
             assert_eq!(decoded.changes.len(), 1);
-            assert_eq!(decoded.changes[0].component_changes.len(), 0);
+            assert_eq!(
+                decoded.changes[0]
+                    .component_changes
+                    .len(),
+                0
+            );
             assert_eq!(decoded.changes[0].entity_changes.len(), 1);
             assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v3-pool");
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
@@ -455,7 +515,8 @@ async fn test_family_runner_routes_existing_components_after_restart_style_prese
 
 #[tokio::test]
 async fn test_family_runner_routes_contract_and_storage_follow_ups_after_restart_style_preseed() {
-    let follow_up_block = make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44");
+    let follow_up_block =
+        make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44");
 
     let mut v2 = MockExtractor::new();
     v2.expect_get_id()
@@ -471,10 +532,16 @@ async fn test_family_runner_routes_contract_and_storage_follow_ups_after_restart
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
             assert_eq!(inp.cursor, "cursor-44");
             assert_eq!(decoded.changes.len(), 1);
-            assert_eq!(decoded.changes[0].contract_changes.len(), 1);
+            assert_eq!(
+                decoded.changes[0]
+                    .contract_changes
+                    .len(),
+                1
+            );
             assert_eq!(decoded.changes[0].contract_changes[0].address, vec![0x44; 20]);
             assert!(decoded.storage_changes.is_empty());
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
@@ -494,7 +561,8 @@ async fn test_family_runner_routes_contract_and_storage_follow_ups_after_restart
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
             assert_eq!(inp.cursor, "cursor-44");
             assert!(decoded.changes.is_empty());
             assert_eq!(decoded.storage_changes.len(), 1);
@@ -593,12 +661,15 @@ async fn test_family_dispatcher_from_protocol_cache_preseeds_component_and_contr
             .expect("dispatcher builds from cache");
 
     let dispatched = dispatcher
-        .dispatch_block_scoped_data(
-            make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44"),
-        )
+        .dispatch_block_scoped_data(make_family_contract_and_storage_follow_up_block_scoped_data(
+            44,
+            "cursor-44",
+        ))
         .expect("contract/storage follow-up routes from cache preload");
 
-    let v2 = dispatched.get("uniswap_v2").expect("v2 branch present");
+    let v2 = dispatched
+        .get("uniswap_v2")
+        .expect("v2 branch present");
     let v2_changes = substreams::BlockChanges::decode(
         v2.output
             .as_ref()
@@ -610,10 +681,17 @@ async fn test_family_dispatcher_from_protocol_cache_preseeds_component_and_contr
     .expect("decode v2 block changes");
     assert_eq!(v2_changes.changes.len(), 1);
     assert_eq!(v2_changes.storage_changes.len(), 0);
-    assert_eq!(v2_changes.changes[0].contract_changes.len(), 1);
+    assert_eq!(
+        v2_changes.changes[0]
+            .contract_changes
+            .len(),
+        1
+    );
     assert_eq!(v2_changes.changes[0].contract_changes[0].address, vec![0x44; 20]);
 
-    let v3 = dispatched.get("uniswap_v3").expect("v3 branch present");
+    let v3 = dispatched
+        .get("uniswap_v3")
+        .expect("v3 branch present");
     let v3_changes = substreams::BlockChanges::decode(
         v3.output
             .as_ref()
@@ -625,7 +703,12 @@ async fn test_family_dispatcher_from_protocol_cache_preseeds_component_and_contr
     .expect("decode v3 block changes");
     assert_eq!(v3_changes.changes.len(), 0);
     assert_eq!(v3_changes.storage_changes.len(), 1);
-    assert_eq!(v3_changes.storage_changes[0].storage_changes.len(), 1);
+    assert_eq!(
+        v3_changes.storage_changes[0]
+            .storage_changes
+            .len(),
+        1
+    );
     assert_eq!(v3_changes.storage_changes[0].storage_changes[0].address, vec![0x55; 20]);
 }
 
@@ -703,9 +786,10 @@ async fn test_build_family_dispatcher_from_populated_cache_uses_gateway_seeded_c
             .expect("dispatcher builds from populated cache");
 
     let dispatched = dispatcher
-        .dispatch_block_scoped_data(
-            make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44"),
-        )
+        .dispatch_block_scoped_data(make_family_contract_and_storage_follow_up_block_scoped_data(
+            44,
+            "cursor-44",
+        ))
         .expect("dispatch follow-up block after populated-cache preseed");
 
     assert!(dispatched.contains_key("uniswap_v2"));
@@ -765,7 +849,8 @@ async fn test_family_runner_hydrates_missing_component_ownership_from_protocol_c
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
             assert_eq!(decoded.changes.len(), 1);
             assert_eq!(decoded.changes[0].entity_changes.len(), 1);
             assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v2-pool");
@@ -789,10 +874,158 @@ async fn test_family_runner_hydrates_missing_component_ownership_from_protocol_c
                 .as_ref()
                 .expect("map output")
                 .value;
-            let decoded = substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
             assert_eq!(decoded.changes.len(), 1);
             assert_eq!(decoded.changes[0].entity_changes.len(), 1);
             assert_eq!(decoded.changes[0].entity_changes[0].component_id, "v3-pool");
+            Ok(Some(Arc::new(BlockAggregatedChanges::default())))
+        });
+    v3.expect_flush()
+        .once()
+        .returning(|| Ok(()));
+
+    let dispatcher = FamilyBlockChangesDispatcher::new([
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v2".to_string(),
+            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
+        },
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v3".to_string(),
+            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
+        },
+    ])
+    .expect("dispatcher builds");
+
+    let extractors = HashMap::from([
+        ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
+        ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
+    ]);
+    let runtime_state = FamilyRuntimeState::new(&extractors, dispatcher, protocol_cache);
+    let runner = FamilyExtractorRunner::new(
+        extractors,
+        SubstreamsStream::from_stream(Box::pin(stream::iter(vec![
+            Ok(BlockResponse::New(follow_up_block)),
+            Ok(BlockResponse::Ended),
+        ]))),
+        HashMap::from([
+            ("uniswap_v2".to_string(), Arc::new(Mutex::new(HashMap::new()))),
+            ("uniswap_v3".to_string(), Arc::new(Mutex::new(HashMap::new()))),
+        ]),
+        mpsc::channel(4).1,
+        None,
+        false,
+        runtime_state,
+    );
+
+    runner.run().await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_family_runner_hydrates_missing_contract_and_storage_ownership_from_protocol_cache() {
+    let follow_up_block =
+        make_family_contract_and_storage_follow_up_block_scoped_data(44, "cursor-44");
+
+    let protocol_cache = ProtocolMemoryCache::new(
+        Chain::Ethereum,
+        chrono::Duration::seconds(60),
+        Arc::new(MockGateway::new()),
+    );
+    protocol_cache
+        .add_components(vec![
+            ProtocolComponent::new(
+                "v2-pool",
+                "uniswap_v2",
+                "pool",
+                Chain::Ethereum,
+                vec![],
+                vec![Bytes::from(vec![0x44; 20])],
+                HashMap::new(),
+                ChangeType::Creation,
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+            ProtocolComponent::new(
+                "v3-pool",
+                "uniswap_v3",
+                "pool",
+                Chain::Ethereum,
+                vec![],
+                vec![Bytes::from(vec![0x55; 20])],
+                HashMap::new(),
+                ChangeType::Creation,
+                Bytes::default(),
+                NaiveDateTime::default(),
+            ),
+        ])
+        .await
+        .expect("seed protocol cache");
+
+    let mut v2 = MockExtractor::new();
+    v2.expect_get_id()
+        .returning(|| ExtractorIdentity::new(Chain::Ethereum, "uniswap_v2"));
+    v2.expect_handle_tick_scoped_data()
+        .once()
+        .returning(|inp: BlockScopedData| {
+            let raw = &inp
+                .output
+                .as_ref()
+                .expect("output")
+                .map_output
+                .as_ref()
+                .expect("map output")
+                .value;
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v2 branch");
+            assert_eq!(decoded.changes.len(), 1);
+            assert_eq!(
+                decoded.changes[0]
+                    .contract_changes
+                    .len(),
+                1
+            );
+            assert_eq!(decoded.changes[0].contract_changes[0].address, vec![0x44; 20]);
+            assert!(
+                decoded.storage_changes.is_empty(),
+                "v2 branch should not receive v3 storage-only follow-up"
+            );
+            Ok(Some(Arc::new(BlockAggregatedChanges::default())))
+        });
+    v2.expect_flush()
+        .once()
+        .returning(|| Ok(()));
+
+    let mut v3 = MockExtractor::new();
+    v3.expect_get_id()
+        .returning(|| ExtractorIdentity::new(Chain::Ethereum, "uniswap_v3"));
+    v3.expect_handle_tick_scoped_data()
+        .once()
+        .returning(|inp: BlockScopedData| {
+            let raw = &inp
+                .output
+                .as_ref()
+                .expect("output")
+                .map_output
+                .as_ref()
+                .expect("map output")
+                .value;
+            let decoded =
+                substreams::BlockChanges::decode(raw.as_slice()).expect("decode v3 branch");
+            assert!(
+                decoded.changes.is_empty()
+                    || decoded.changes[0]
+                        .contract_changes
+                        .is_empty(),
+                "v3 branch should not receive v2 contract-only follow-up"
+            );
+            assert_eq!(decoded.storage_changes.len(), 1);
+            assert_eq!(
+                decoded.storage_changes[0]
+                    .storage_changes
+                    .len(),
+                1
+            );
+            assert_eq!(decoded.storage_changes[0].storage_changes[0].address, vec![0x55; 20]);
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
         });
     v3.expect_flush()

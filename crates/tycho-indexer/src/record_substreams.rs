@@ -1,18 +1,23 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use tracing::info;
 use tycho_indexer::{
     cli::{GlobalArgs, RecordSubstreamsArgs},
     extractor::{
-        family_runtime::{
-            default_family_runtime_registry, FamilyRuntimeRegistry, ResolvedRuntimeTarget,
-            ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets,
+        family_registry::{default_family_runtime_registry, FamilyRuntimeRegistry},
+        runtime_target_planning::{
+            ResolvedRuntimeTarget, ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets,
             ResolvedSubstreamsExecutionRequest,
         },
-        runner::load_substreams_package,
+        substreams_package_loader::load_substreams_package,
         ExtractionError,
     },
-    substreams::{mock::write_mock_substreams_fixture, stream::build_substreams_request},
+    pb::sf::substreams::{rpc::v3::Request, v1::Package},
+    substreams::{
+        mock::{write_mock_substreams_fixture, MockSubstreamsScript},
+        stream::build_substreams_request,
+        SubstreamsEndpoint,
+    },
 };
 
 use crate::config::ExtractorConfigs;
@@ -109,16 +114,11 @@ pub(crate) fn resolve_record_substreams_request_with_registry(
         };
         let default_resolved = target.substreams_execution_request()?;
         let effective_start_block =
-            record_args.start_block.unwrap_or(default_resolved.start_block);
+            target.effective_substreams_start_block(record_args.start_block)?;
         let effective_stop_block = record_args
             .stop_block(effective_start_block)
             .unwrap_or(default_resolved.stop_block as i64);
-        let resolved = targets.resolve_substreams_execution_request(
-            selector,
-            &format!(
-                "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
-            ),
-            extractors_config_path,
+        let resolved = target.substreams_execution_request_with_overrides(
             Some(effective_start_block),
             Some(effective_stop_block),
             &override_params,
@@ -163,6 +163,70 @@ pub(crate) fn resolve_record_substreams_request_with_registry(
     })
 }
 
+pub(crate) trait SubstreamsFixtureRecorder: Send + Sync {
+    fn record<'a>(
+        &'a self,
+        request: Request,
+        max_responses: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = Result<MockSubstreamsScript, anyhow::Error>> + Send + 'a>>;
+}
+
+impl SubstreamsFixtureRecorder for SubstreamsEndpoint {
+    fn record<'a>(
+        &'a self,
+        request: Request,
+        max_responses: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = Result<MockSubstreamsScript, anyhow::Error>> + Send + 'a>>
+    {
+        let endpoint = Arc::new(self.clone());
+        Box::pin(async move {
+            endpoint
+                .record(request, max_responses)
+                .await
+        })
+    }
+}
+
+pub(crate) async fn record_substreams_fixture_from_package_and_recorder<R>(
+    loaded_spkg: Package,
+    recorder: Arc<R>,
+    resolved_request: ResolvedSubstreamsExecutionRequest,
+    record_args: &RecordSubstreamsArgs,
+) -> Result<(), ExtractionError>
+where
+    R: SubstreamsFixtureRecorder + ?Sized,
+{
+    let request = build_substreams_request(
+        None,
+        Some(loaded_spkg),
+        resolved_request.module,
+        resolved_request.start_block,
+        resolved_request.stop_block,
+        record_args.final_blocks_only,
+        record_args
+            .substreams_args
+            .enable_partial_blocks,
+        resolved_request.params,
+    );
+
+    let script = recorder
+        .record(request, record_args.max_responses)
+        .await
+        .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
+
+    let output_path = std::path::Path::new(&record_args.output);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            ExtractionError::Setup(format!("Failed to create output directory: {err}"))
+        })?;
+    }
+    write_mock_substreams_fixture(output_path, &[script])
+        .map_err(|err| ExtractionError::Setup(format!("Failed to write fixture: {err}")))?;
+
+    info!(output = %record_args.output, "Recorded Substreams fixture");
+    Ok(())
+}
+
 pub(crate) async fn record_substreams_fixture(
     global_args: &GlobalArgs,
     record_args: &RecordSubstreamsArgs,
@@ -199,34 +263,11 @@ pub(crate) async fn record_substreams_fixture_with_registry(
     )
     .await?;
 
-    let request = build_substreams_request(
-        None,
-        Some(loaded.spkg),
-        resolved_request.module,
-        resolved_request.start_block,
-        resolved_request.stop_block,
-        record_args.final_blocks_only,
-        record_args
-            .substreams_args
-            .enable_partial_blocks,
-        resolved_request.params,
-    );
-
-    let script = loaded
-        .endpoint
-        .record(request, record_args.max_responses)
-        .await
-        .map_err(|err| ExtractionError::SubstreamsError(err.to_string()))?;
-
-    let output_path = std::path::Path::new(&record_args.output);
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            ExtractionError::Setup(format!("Failed to create output directory: {err}"))
-        })?;
-    }
-    write_mock_substreams_fixture(output_path, &[script])
-        .map_err(|err| ExtractionError::Setup(format!("Failed to write fixture: {err}")))?;
-
-    info!(output = %record_args.output, "Recorded Substreams fixture");
-    Ok(())
+    record_substreams_fixture_from_package_and_recorder(
+        loaded.spkg,
+        loaded.endpoint,
+        resolved_request,
+        record_args,
+    )
+    .await
 }

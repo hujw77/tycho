@@ -488,6 +488,8 @@ where
             let mut new_components = HashMap::new();
             let mut count_token_skips = 0;
             let mut components_to_store = HashMap::new();
+            let mut protocol_snapshot_failed_components = HashSet::new();
+            let mut protocol_routing_mismatches = Vec::new();
             {
                 let state_guard = self.state.read().await;
 
@@ -497,6 +499,16 @@ where
                     .get_states()
                     .clone()
                 {
+                    let snapshot_protocol_system = snapshot.component.protocol_system.clone();
+                    let snapshot_protocol_type_name = snapshot.component.protocol_type_name.clone();
+                    if snapshot_protocol_system != *protocol {
+                        protocol_routing_mismatches.push((
+                            id.clone(),
+                            snapshot_protocol_system.clone(),
+                            snapshot_protocol_type_name.clone(),
+                        ));
+                    }
+
                     // Skip any unsupported pools
                     if self
                         .inclusion_filters
@@ -521,6 +533,7 @@ where
                                     Err(_) => {
                                         count_token_skips += 1;
                                         msg_failed_components.insert(id.clone());
+                                        protocol_snapshot_failed_components.insert(id.clone());
                                         warn!(
                                             "Token address could not be decoded {}, ignoring pool {:x?}",
                                             token.address, id
@@ -548,6 +561,7 @@ where
                             None => {
                                 count_token_skips += 1;
                                 msg_failed_components.insert(id.clone());
+                                protocol_snapshot_failed_components.insert(id.clone());
                                 debug!("Token not found {}, ignoring pool {:x?}", token, id);
                                 continue 'snapshot_loop;
                             }
@@ -614,11 +628,26 @@ where
                             }
                             Err(e) => {
                                 if self.skip_state_decode_failures {
-                                    warn!(pool = id, error = %e, "StateDecodingFailure");
+                                    warn!(
+                                        pool = id,
+                                        stream_protocol = %protocol,
+                                        snapshot_protocol_system = %snapshot_protocol_system,
+                                        snapshot_protocol_type_name = %snapshot_protocol_type_name,
+                                        error = %e,
+                                        "StateDecodingFailure"
+                                    );
                                     msg_failed_components.insert(id.clone());
+                                    protocol_snapshot_failed_components.insert(id.clone());
                                     continue 'snapshot_loop;
                                 } else {
-                                    error!(pool = id, error = %e, "StateDecodingFailure");
+                                    error!(
+                                        pool = id,
+                                        stream_protocol = %protocol,
+                                        snapshot_protocol_system = %snapshot_protocol_system,
+                                        snapshot_protocol_type_name = %snapshot_protocol_type_name,
+                                        error = %e,
+                                        "StateDecodingFailure"
+                                    );
                                     return Err(StreamDecodeError::Fatal(format!("{e}")));
                                 }
                             }
@@ -626,6 +655,7 @@ where
                     } else if self.skip_state_decode_failures {
                         warn!(pool = id, "MissingDecoderRegistration");
                         msg_failed_components.insert(id.clone());
+                        protocol_snapshot_failed_components.insert(id.clone());
                         continue 'snapshot_loop;
                     } else {
                         error!(pool = id, "MissingDecoderRegistration");
@@ -647,9 +677,9 @@ where
             }
 
             let snapshot_count = protocol_msg.snapshots.states.len();
-            let failed_snapshot_count = msg_failed_components.len();
+            let failed_snapshot_count = protocol_snapshot_failed_components.len();
             if snapshot_count > 0 {
-                let failed_samples = msg_failed_components
+                let failed_samples = protocol_snapshot_failed_components
                     .iter()
                     .take(5)
                     .cloned()
@@ -669,6 +699,23 @@ where
                     protocol = %protocol,
                     count_token_skips,
                     "Skipped pools due to missing tokens",
+                );
+            }
+            if !protocol_routing_mismatches.is_empty() {
+                let mismatch_samples = protocol_routing_mismatches
+                    .iter()
+                    .take(5)
+                    .map(|(id, actual_protocol_system, actual_protocol_type_name)| {
+                        format!(
+                            "{id}:{actual_protocol_system}:{actual_protocol_type_name}"
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                warn!(
+                    stream_protocol = %protocol,
+                    mismatch_count = protocol_routing_mismatches.len(),
+                    mismatch_samples = ?mismatch_samples,
+                    "Protocol snapshot routing mismatch",
                 );
             }
 

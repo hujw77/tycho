@@ -33,16 +33,30 @@ use crate::{
 };
 
 pub mod chain_state;
+pub mod bootstrap_lifecycle;
+pub mod control;
 mod dynamic_contract_indexer;
+pub mod execution_loop;
+pub mod extractor_config;
+pub mod extractor_lifecycle;
+pub mod family_bootstrap_registry;
+pub mod family_default_registry;
 pub mod family_dispatch;
+pub mod family_dispatch_payloads;
+pub mod family_dispatch_registry;
+pub mod family_dispatch_splitter;
 pub mod family_lifecycle;
 pub mod family_managed_startup;
 pub mod family_registry;
 pub mod family_runner_wiring;
-pub mod family_runtime_execution;
 pub mod family_runtime;
+pub mod family_runtime_execution;
+pub mod family_runtime_metadata;
+pub mod family_runtime_planning;
 pub mod family_uniswap;
-pub mod extractor_lifecycle;
+pub mod managed_extractor_initialization;
+pub mod managed_substreams_request;
+pub mod managed_stream_startup;
 pub mod models;
 pub mod post_processors;
 pub mod protobuf_deserialisation;
@@ -51,9 +65,14 @@ pub mod protocol_extractor;
 pub(crate) mod protocol_message_registry;
 pub mod reorg_buffer;
 pub mod runner;
+pub mod runtime_target_planning;
+pub mod runtime_targets_startup;
+pub mod shared_config;
 pub mod shared_bootstrap;
+pub mod single_runtime_execution;
 pub mod standalone_managed_startup;
 pub mod startup;
+pub mod substreams_package_loader;
 pub mod token_analysis_cron;
 mod u256_num;
 pub mod uniswap_v2_bootstrap;
@@ -107,19 +126,51 @@ pub struct ExtractorProgressSnapshot {
     pub cursor: String,
     pub last_processed_block: Option<Block>,
     pub completed_bootstrap_block: Option<u64>,
+    pub cursor_scope: PersistedExtractorStateScope,
+    pub completed_bootstrap_scope: PersistedExtractorStateScope,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PersistedExtractorStateScope {
+    #[default]
+    Unknown,
+    ExtractorLocal,
+    SharedDurability,
+    LegacyExtractorFallback,
 }
 
 pub async fn load_extractor_progress_snapshot(
     extractor: &dyn Extractor,
 ) -> Result<ExtractorProgressSnapshot, ExtractionError> {
+    let cursor = extractor.get_cursor().await;
+    let last_processed_block = extractor
+        .get_last_processed_block()
+        .await;
+    let completed_bootstrap_block = extractor
+        .get_completed_bootstrap_block()
+        .await?;
+    let supports_scope = extractor.supports_persisted_state_scope();
+    let cursor_scope = if supports_scope && last_processed_block.is_some() {
+        extractor
+            .get_cursor_state_scope()
+            .await?
+    } else {
+        PersistedExtractorStateScope::Unknown
+    };
+    let completed_bootstrap_scope = if supports_scope && completed_bootstrap_block.is_some() {
+        extractor
+            .get_completed_bootstrap_state_scope()
+            .await?
+    } else {
+        PersistedExtractorStateScope::Unknown
+    };
+
     Ok(ExtractorProgressSnapshot {
-        cursor: extractor.get_cursor().await,
-        last_processed_block: extractor
-            .get_last_processed_block()
-            .await,
-        completed_bootstrap_block: extractor
-            .get_completed_bootstrap_block()
-            .await?,
+        cursor,
+        last_processed_block,
+        completed_bootstrap_block,
+        cursor_scope,
+        completed_bootstrap_scope,
     })
 }
 
@@ -131,6 +182,11 @@ pub trait Extractor: Send + Sync {
 
     /// Returns the stable protocol-system identity served by this extractor.
     fn protocol_system(&self) -> String;
+
+    /// Indicates whether this extractor can report persisted-state scope provenance precisely.
+    fn supports_persisted_state_scope(&self) -> bool {
+        false
+    }
 
     /// Ensures all protocol types this extractor needs are registered in
     /// storage. Safe to call multiple times.
@@ -175,6 +231,20 @@ pub trait Extractor: Send + Sync {
         bootstrap_block: u64,
         block_hash: tycho_common::models::BlockHash,
     ) -> Result<(), ExtractionError>;
+
+    /// Returns the scope of the currently persisted cursor state, when known.
+    async fn get_cursor_state_scope(
+        &self,
+    ) -> Result<PersistedExtractorStateScope, ExtractionError> {
+        Ok(PersistedExtractorStateScope::Unknown)
+    }
+
+    /// Returns the scope of the currently persisted bootstrap-completion state, when known.
+    async fn get_completed_bootstrap_state_scope(
+        &self,
+    ) -> Result<PersistedExtractorStateScope, ExtractionError> {
+        Ok(PersistedExtractorStateScope::Unknown)
+    }
 
     /// Drains the partial block buffer and processes the accumulated block as a full block.
     /// The runner calls this when it has sent the last partial for a block.

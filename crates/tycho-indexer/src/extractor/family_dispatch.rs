@@ -1,23 +1,27 @@
 use std::collections::{HashMap, HashSet};
 
-use prost::Message;
 use tycho_substreams::pb::tycho::evm::v1 as substreams;
 
 use crate::{
-    extractor::{protocol_cache::ProtocolMemoryCache, runner::ExtractorConfig, ExtractionError},
-    pb::sf::substreams::rpc::v2::{BlockScopedData, MapModuleOutput},
+    extractor::{
+        extractor_config::ExtractorConfig,
+        family_dispatch_payloads::{
+            decode_family_block_scoped_data_changes, dispatch_block_scoped_data_by_protocol_system,
+            referenced_component_ids_from_block_scoped_data,
+            referenced_contract_addresses_from_block_scoped_data,
+        },
+        family_dispatch_registry::{FamilyDispatchRegistry, FamilyDispatcherSeed},
+        family_dispatch_splitter::split_family_block_changes,
+        protocol_cache::ProtocolMemoryCache,
+        ExtractionError,
+    },
+    pb::sf::substreams::rpc::v2::BlockScopedData,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FamilyBranchSpec {
     pub protocol_system: String,
     pub protocol_type_names: HashSet<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FamilyDispatcherSeed {
-    pub component_systems: HashMap<String, String>,
-    pub contract_systems: HashMap<Vec<u8>, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,10 +111,7 @@ impl FamilyBranchSpec {
 
 #[derive(Clone, Debug, Default)]
 pub struct FamilyBlockChangesDispatcher {
-    branch_protocol_systems: HashSet<String>,
-    protocol_type_to_system: HashMap<String, String>,
-    component_to_system: HashMap<String, String>,
-    contract_to_system: HashMap<Vec<u8>, String>,
+    registry: FamilyDispatchRegistry,
 }
 
 impl FamilyBlockChangesDispatcher {
@@ -121,10 +122,10 @@ impl FamilyBlockChangesDispatcher {
         let membership = FamilyBranchSpec::resolve_membership(branches.iter())?;
 
         Ok(Self {
-            branch_protocol_systems: membership.protocol_systems,
-            protocol_type_to_system: membership.protocol_type_to_system,
-            component_to_system: HashMap::new(),
-            contract_to_system: HashMap::new(),
+            registry: FamilyDispatchRegistry::new(
+                membership.protocol_systems,
+                membership.protocol_type_to_system,
+            ),
         })
     }
 
@@ -152,32 +153,19 @@ impl FamilyBlockChangesDispatcher {
         protocol_cache: &ProtocolMemoryCache,
         component_ids: &HashSet<String>,
     ) -> Result<bool, ExtractionError> {
-        let components = protocol_cache
-            .ensure_protocol_components_by_id(component_ids)
-            .await?;
+        self.registry
+            .hydrate_from_protocol_cache_by_component_ids(protocol_cache, component_ids)
+            .await
+    }
 
-        let mut hydrated_components = HashMap::new();
-        let mut hydrated_contracts = HashMap::new();
-        for component in components.into_values() {
-            if !self
-                .branch_protocol_systems
-                .contains(&component.protocol_system)
-            {
-                continue;
-            }
-            hydrated_components.insert(component.id.clone(), component.protocol_system.clone());
-            for contract in component.contract_addresses {
-                hydrated_contracts.insert(contract.to_vec(), component.protocol_system.clone());
-            }
-        }
-
-        if hydrated_components.is_empty() && hydrated_contracts.is_empty() {
-            return Ok(false);
-        }
-
-        self.register_component_systems(hydrated_components);
-        self.register_contract_systems(hydrated_contracts);
-        Ok(true)
+    pub async fn hydrate_from_protocol_cache_by_contract_addresses(
+        &mut self,
+        protocol_cache: &ProtocolMemoryCache,
+        contract_addresses: &HashSet<Vec<u8>>,
+    ) -> Result<bool, ExtractionError> {
+        self.registry
+            .hydrate_from_protocol_cache_by_contract_addresses(protocol_cache, contract_addresses)
+            .await
     }
 
     pub async fn dispatch_block_scoped_data_with_protocol_cache_fallback(
@@ -193,18 +181,34 @@ impl FamilyBlockChangesDispatcher {
                 }
 
                 let referenced_component_ids =
-                    Self::referenced_component_ids_from_block_scoped_data(&block_scoped_data)?;
-                if referenced_component_ids.is_empty() {
+                    referenced_component_ids_from_block_scoped_data(&block_scoped_data)?;
+                let referenced_contract_addresses =
+                    referenced_contract_addresses_from_block_scoped_data(&block_scoped_data)?;
+                if referenced_component_ids.is_empty() && referenced_contract_addresses.is_empty() {
                     return Err(err);
                 }
 
-                if !self
-                    .hydrate_from_protocol_cache_by_component_ids(
+                let hydrated_components = if referenced_component_ids.is_empty() {
+                    false
+                } else {
+                    self.hydrate_from_protocol_cache_by_component_ids(
                         protocol_cache,
                         &referenced_component_ids,
                     )
                     .await?
-                {
+                };
+
+                let hydrated_contracts = if referenced_contract_addresses.is_empty() {
+                    false
+                } else {
+                    self.hydrate_from_protocol_cache_by_contract_addresses(
+                        protocol_cache,
+                        &referenced_contract_addresses,
+                    )
+                    .await?
+                };
+
+                if !(hydrated_components || hydrated_contracts) {
                     return Err(err);
                 }
 
@@ -217,6 +221,8 @@ impl FamilyBlockChangesDispatcher {
         matches!(
             err,
             ExtractionError::DecodeError(message) if message.contains("unknown component `")
+                || message.contains("unable to route contract changes")
+                || message.contains("unable to route storage changes")
         )
     }
 
@@ -225,16 +231,16 @@ impl FamilyBlockChangesDispatcher {
         component_id: impl Into<String>,
         protocol_system: impl Into<String>,
     ) {
-        self.component_to_system
-            .insert(component_id.into(), protocol_system.into());
+        self.registry
+            .register_component_system(component_id, protocol_system);
     }
 
     pub fn register_component_systems(
         &mut self,
         component_systems: impl IntoIterator<Item = (String, String)>,
     ) {
-        self.component_to_system
-            .extend(component_systems);
+        self.registry
+            .register_component_systems(component_systems);
     }
 
     pub fn register_contract_system(
@@ -242,459 +248,42 @@ impl FamilyBlockChangesDispatcher {
         contract_address: impl Into<Vec<u8>>,
         protocol_system: impl Into<String>,
     ) {
-        self.contract_to_system
-            .insert(contract_address.into(), protocol_system.into());
+        self.registry
+            .register_contract_system(contract_address, protocol_system);
     }
 
     pub fn register_contract_systems(
         &mut self,
         contract_systems: impl IntoIterator<Item = (Vec<u8>, String)>,
     ) {
-        self.contract_to_system
-            .extend(contract_systems);
+        self.registry
+            .register_contract_systems(contract_systems);
     }
 
-    fn admit_component_change(
-        &mut self,
-        component_change: &substreams::ProtocolComponent,
-    ) -> Result<String, ExtractionError> {
-        let protocol_type_name = component_change
-            .protocol_type
-            .as_ref()
-            .map(|protocol_type| protocol_type.name.clone())
-            .ok_or_else(|| {
-                ExtractionError::DecodeError(format!(
-                    "component `{}` is missing protocol_type",
-                    component_change.id
-                ))
-            })?;
-        let protocol_system = self
-            .protocol_type_to_system
-            .get(&protocol_type_name)
-            .cloned()
-            .ok_or_else(|| {
-                ExtractionError::DecodeError(format!(
-                    "unknown protocol type `{protocol_type_name}` while routing component `{}`",
-                    component_change.id
-                ))
-            })?;
+    pub fn component_system(&self, component_id: &str) -> Option<&String> {
+        self.registry
+            .component_system(component_id)
+    }
 
-        self.component_to_system
-            .insert(component_change.id.clone(), protocol_system.clone());
-        for contract in &component_change.contracts {
-            self.contract_to_system
-                .insert(contract.clone(), protocol_system.clone());
-        }
-
-        Ok(protocol_system)
+    pub fn contract_system(&self, contract_address: &[u8]) -> Option<&String> {
+        self.registry
+            .contract_system(contract_address)
     }
 
     pub fn dispatch_block_changes(
         &mut self,
         msg: substreams::BlockChanges,
     ) -> Result<HashMap<String, substreams::BlockChanges>, ExtractionError> {
-        let block = msg.block.clone();
-        self.pre_register_block_components(&msg)?;
-        let mut txs_by_system: HashMap<String, Vec<substreams::TransactionChanges>> =
-            HashMap::new();
-        let mut tx_systems_by_hash: HashMap<Vec<u8>, HashSet<String>> = HashMap::new();
-
-        for tx_changes in msg.changes {
-            let tx = tx_changes.tx.clone().ok_or_else(|| {
-                ExtractionError::DecodeError("TransactionChanges misses a transaction".to_string())
-            })?;
-            let tx_hash = tx.hash.clone();
-            let (split_txs, touched_systems) = self.dispatch_transaction_changes(tx_changes)?;
-
-            for (protocol_system, split_tx) in split_txs {
-                txs_by_system
-                    .entry(protocol_system.clone())
-                    .or_default()
-                    .push(split_tx);
-                tx_systems_by_hash
-                    .entry(tx_hash.clone())
-                    .or_default()
-                    .insert(protocol_system);
-            }
-
-            if touched_systems.is_empty() {
-                tx_systems_by_hash
-                    .entry(tx_hash)
-                    .or_default();
-            }
-        }
-
-        let mut storage_by_system: HashMap<String, Vec<substreams::TransactionStorageChanges>> =
-            HashMap::new();
-        for storage_changes in msg.storage_changes {
-            let tx = storage_changes
-                .tx
-                .clone()
-                .ok_or_else(|| {
-                    ExtractionError::DecodeError(
-                        "TransactionStorageChanges misses a transaction".to_string(),
-                    )
-                })?;
-            let systems = tx_systems_by_hash
-                .get(&tx.hash)
-                .cloned()
-                .unwrap_or_default();
-
-            match systems.len() {
-                0 => {
-                    let inferred_systems = self.resolve_storage_systems(&storage_changes)?;
-                    match inferred_systems.len() {
-                        0 => {
-                            return Err(ExtractionError::DecodeError(format!(
-                                "unable to route storage changes for tx 0x{}: no protocol branch matched",
-                                hex::encode(tx.hash)
-                            )));
-                        }
-                        1 => {
-                            let protocol_system = inferred_systems
-                                .into_iter()
-                                .next()
-                                .expect("one system");
-                            storage_by_system
-                                .entry(protocol_system)
-                                .or_default()
-                                .push(storage_changes);
-                        }
-                        _ => {
-                            return Err(ExtractionError::DecodeError(format!(
-                                "unable to route storage changes for tx 0x{}: multiple protocol branches matched",
-                                hex::encode(tx.hash)
-                            )));
-                        }
-                    }
-                }
-                1 => {
-                    let protocol_system = systems
-                        .into_iter()
-                        .next()
-                        .expect("one system");
-                    storage_by_system
-                        .entry(protocol_system)
-                        .or_default()
-                        .push(storage_changes);
-                }
-                _ => {
-                    return Err(ExtractionError::DecodeError(format!(
-                        "unable to route storage changes for tx 0x{}: multiple protocol branches matched",
-                        hex::encode(tx.hash)
-                    )));
-                }
-            }
-        }
-
-        let mut dispatched = HashMap::new();
-        let mut all_systems = self.branch_protocol_systems.clone();
-        all_systems.extend(txs_by_system.keys().cloned());
-        all_systems.extend(storage_by_system.keys().cloned());
-
-        for protocol_system in all_systems {
-            dispatched.insert(
-                protocol_system.clone(),
-                substreams::BlockChanges {
-                    block: block.clone(),
-                    changes: txs_by_system
-                        .remove(&protocol_system)
-                        .unwrap_or_default(),
-                    storage_changes: storage_by_system
-                        .remove(&protocol_system)
-                        .unwrap_or_default(),
-                },
-            );
-        }
-
-        Ok(dispatched)
-    }
-
-    fn pre_register_block_components(
-        &mut self,
-        msg: &substreams::BlockChanges,
-    ) -> Result<(), ExtractionError> {
-        for tx_changes in &msg.changes {
-            for component_change in &tx_changes.component_changes {
-                self.admit_component_change(component_change)?;
-            }
-        }
-
-        Ok(())
+        split_family_block_changes(&mut self.registry, msg)
     }
 
     pub fn dispatch_block_scoped_data(
         &mut self,
         block_scoped_data: BlockScopedData,
     ) -> Result<HashMap<String, BlockScopedData>, ExtractionError> {
-        let output = block_scoped_data
-            .output
-            .clone()
-            .ok_or_else(|| {
-                ExtractionError::DecodeError("Missing output in block scoped data".to_string())
-            })?;
-        let map_output = output
-            .map_output
-            .clone()
-            .ok_or_else(|| {
-                ExtractionError::DecodeError(
-                    "Missing map_output in block scoped data's output".to_string(),
-                )
-            })?;
-
-        if !map_output
-            .type_url
-            .ends_with("BlockChanges")
-        {
-            return Err(ExtractionError::DecodeError(format!(
-                "family dispatcher only supports BlockChanges outputs, got {}",
-                map_output.type_url
-            )));
-        }
-
-        let raw_msg = substreams::BlockChanges::decode(map_output.value.as_slice())?;
+        let raw_msg = decode_family_block_scoped_data_changes(&block_scoped_data)?;
         let dispatched = self.dispatch_block_changes(raw_msg)?;
-
-        Ok(dispatched
-            .into_iter()
-            .map(|(protocol_system, branch_changes)| {
-                let mut branch_bsd = block_scoped_data.clone();
-                branch_bsd.output = Some(MapModuleOutput {
-                    name: output.name.clone(),
-                    map_output: Some(prost_types::Any {
-                        type_url: map_output.type_url.clone(),
-                        value: branch_changes.encode_to_vec(),
-                    }),
-                    debug_info: output.debug_info.clone(),
-                });
-                (protocol_system, branch_bsd)
-            })
-            .collect())
-    }
-
-    pub fn referenced_component_ids_from_block_scoped_data(
-        block_scoped_data: &BlockScopedData,
-    ) -> Result<HashSet<String>, ExtractionError> {
-        let output = block_scoped_data
-            .output
-            .as_ref()
-            .ok_or_else(|| {
-                ExtractionError::DecodeError("Missing output in block scoped data".to_string())
-            })?;
-        let map_output = output
-            .map_output
-            .as_ref()
-            .ok_or_else(|| {
-                ExtractionError::DecodeError(
-                    "Missing map_output in block scoped data's output".to_string(),
-                )
-            })?;
-
-        if !map_output
-            .type_url
-            .ends_with("BlockChanges")
-        {
-            return Err(ExtractionError::DecodeError(format!(
-                "family dispatcher only supports BlockChanges outputs, got {}",
-                map_output.type_url
-            )));
-        }
-
-        let raw_msg = substreams::BlockChanges::decode(map_output.value.as_slice())?;
-        Self::referenced_component_ids_from_block_changes(&raw_msg)
-    }
-
-    pub fn referenced_component_ids_from_block_changes(
-        msg: &substreams::BlockChanges,
-    ) -> Result<HashSet<String>, ExtractionError> {
-        let mut component_ids = HashSet::new();
-
-        for tx_changes in &msg.changes {
-            for component_change in &tx_changes.component_changes {
-                component_ids.insert(component_change.id.clone());
-            }
-            for entity_change in &tx_changes.entity_changes {
-                component_ids.insert(entity_change.component_id.clone());
-            }
-            for balance_change in &tx_changes.balance_changes {
-                let component_id =
-                    String::from_utf8(balance_change.component_id.clone()).map_err(|err| {
-                        ExtractionError::DecodeError(format!(
-                            "balance change component id is not utf8: {err}"
-                        ))
-                    })?;
-                component_ids.insert(component_id);
-            }
-            for entrypoint in &tx_changes.entrypoints {
-                component_ids.insert(entrypoint.component_id.clone());
-            }
-            for entrypoint_params in &tx_changes.entrypoint_params {
-                if let Some(component_id) = &entrypoint_params.component_id {
-                    component_ids.insert(component_id.clone());
-                }
-            }
-        }
-
-        Ok(component_ids)
-    }
-
-    fn dispatch_transaction_changes(
-        &mut self,
-        tx_changes: substreams::TransactionChanges,
-    ) -> Result<(HashMap<String, substreams::TransactionChanges>, HashSet<String>), ExtractionError>
-    {
-        let tx = tx_changes.tx.clone().ok_or_else(|| {
-            ExtractionError::DecodeError("TransactionChanges misses a transaction".to_string())
-        })?;
-        let mut split_txs: HashMap<String, substreams::TransactionChanges> = HashMap::new();
-        let mut touched_systems = HashSet::new();
-
-        for component_change in tx_changes.component_changes {
-            let protocol_system = self.admit_component_change(&component_change)?;
-            touched_systems.insert(protocol_system.clone());
-            split_txs
-                .entry(protocol_system)
-                .or_insert_with(|| empty_transaction_changes(&tx))
-                .component_changes
-                .push(component_change);
-        }
-
-        for entity_change in tx_changes.entity_changes {
-            let protocol_system = self.resolve_component_system(&entity_change.component_id)?;
-            touched_systems.insert(protocol_system.clone());
-            split_txs
-                .entry(protocol_system)
-                .or_insert_with(|| empty_transaction_changes(&tx))
-                .entity_changes
-                .push(entity_change);
-        }
-
-        for balance_change in tx_changes.balance_changes {
-            let component_id =
-                String::from_utf8(balance_change.component_id.clone()).map_err(|err| {
-                    ExtractionError::DecodeError(format!(
-                        "balance change component id is not utf8: {err}"
-                    ))
-                })?;
-            let protocol_system = self.resolve_component_system(&component_id)?;
-            touched_systems.insert(protocol_system.clone());
-            split_txs
-                .entry(protocol_system)
-                .or_insert_with(|| empty_transaction_changes(&tx))
-                .balance_changes
-                .push(balance_change);
-        }
-
-        for entrypoint in tx_changes.entrypoints {
-            let protocol_system = self.resolve_component_system(&entrypoint.component_id)?;
-            touched_systems.insert(protocol_system.clone());
-            split_txs
-                .entry(protocol_system)
-                .or_insert_with(|| empty_transaction_changes(&tx))
-                .entrypoints
-                .push(entrypoint);
-        }
-
-        for entrypoint_params in tx_changes.entrypoint_params {
-            let component_id = entrypoint_params
-                .component_id
-                .clone()
-                .ok_or_else(|| {
-                    ExtractionError::DecodeError(
-                        "Entrypoint params should have a component id".to_owned(),
-                    )
-                })?;
-            let protocol_system = self.resolve_component_system(&component_id)?;
-            touched_systems.insert(protocol_system.clone());
-            split_txs
-                .entry(protocol_system)
-                .or_insert_with(|| empty_transaction_changes(&tx))
-                .entrypoint_params
-                .push(entrypoint_params);
-        }
-
-        if !tx_changes.contract_changes.is_empty() {
-            let contract_systems = if touched_systems.is_empty() {
-                tx_changes
-                    .contract_changes
-                    .iter()
-                    .filter_map(|change| {
-                        self.contract_to_system
-                            .get(&change.address)
-                            .cloned()
-                    })
-                    .collect::<HashSet<_>>()
-            } else {
-                touched_systems.clone()
-            };
-
-            match contract_systems.len() {
-                0 => {
-                    return Err(ExtractionError::DecodeError(format!(
-                        "unable to route contract changes for tx 0x{}: no protocol branch matched",
-                        hex::encode(tx.hash.clone())
-                    )));
-                }
-                1 => {
-                    let protocol_system = contract_systems
-                        .iter()
-                        .next()
-                        .cloned()
-                        .expect("one system");
-                    split_txs
-                        .entry(protocol_system)
-                        .or_insert_with(|| empty_transaction_changes(&tx))
-                        .contract_changes
-                        .extend(tx_changes.contract_changes);
-                }
-                _ => {
-                    return Err(ExtractionError::DecodeError(format!(
-                        "unable to route contract changes for tx 0x{}: multiple protocol branches matched",
-                        hex::encode(tx.hash.clone())
-                    )));
-                }
-            }
-        }
-
-        Ok((split_txs, touched_systems))
-    }
-
-    fn resolve_component_system(&self, component_id: &str) -> Result<String, ExtractionError> {
-        self.component_to_system
-            .get(component_id)
-            .cloned()
-            .ok_or_else(|| {
-                ExtractionError::DecodeError(format!(
-                    "unknown component `{component_id}` while routing family block changes"
-                ))
-            })
-    }
-
-    fn resolve_storage_systems(
-        &self,
-        storage_changes: &substreams::TransactionStorageChanges,
-    ) -> Result<HashSet<String>, ExtractionError> {
-        Ok(storage_changes
-            .storage_changes
-            .iter()
-            .filter_map(|change| {
-                self.contract_to_system
-                    .get(&change.address)
-                    .cloned()
-            })
-            .collect())
-    }
-}
-
-fn empty_transaction_changes(tx: &substreams::Transaction) -> substreams::TransactionChanges {
-    substreams::TransactionChanges {
-        tx: Some(tx.clone()),
-        contract_changes: vec![],
-        entity_changes: vec![],
-        component_changes: vec![],
-        balance_changes: vec![],
-        entrypoints: vec![],
-        entrypoint_params: vec![],
+        dispatch_block_scoped_data_by_protocol_system(block_scoped_data, dispatched)
     }
 }
 
@@ -708,8 +297,8 @@ mod tests {
     use tycho_substreams::pb::tycho::evm::v1 as substreams;
 
     use crate::extractor::{
+        extractor_config::{ExtractorConfig, ProtocolTypeConfig},
         protocol_cache::{ProtocolDataCache, ProtocolMemoryCache},
-        runner::{ExtractorConfig, ProtocolTypeConfig},
     };
     use crate::pb::sf::substreams::{
         rpc::v2::{BlockScopedData, MapModuleOutput},
@@ -1080,18 +669,8 @@ mod tests {
         )
         .expect("dispatcher builds with preloaded seed");
 
-        assert_eq!(
-            dispatcher
-                .component_to_system
-                .get("seeded-v2-pool"),
-            Some(&"uniswap_v2".to_string())
-        );
-        assert_eq!(
-            dispatcher
-                .contract_to_system
-                .get(&vec![0x77; 20]),
-            Some(&"uniswap_v3".to_string())
-        );
+        assert_eq!(dispatcher.component_system("seeded-v2-pool"), Some(&"uniswap_v2".to_string()));
+        assert_eq!(dispatcher.contract_system(&vec![0x77; 20]), Some(&"uniswap_v3".to_string()));
     }
 
     #[test]
@@ -1702,30 +1281,10 @@ mod tests {
             .expect("dispatcher hydrates from cache");
 
         assert!(hydrated);
-        assert_eq!(
-            dispatcher
-                .component_to_system
-                .get("seeded-v2-pool"),
-            Some(&"uniswap_v2".to_string())
-        );
-        assert_eq!(
-            dispatcher
-                .contract_to_system
-                .get(&vec![0x81; 20]),
-            Some(&"uniswap_v2".to_string())
-        );
-        assert_eq!(
-            dispatcher
-                .component_to_system
-                .get("other-pool"),
-            None
-        );
-        assert_eq!(
-            dispatcher
-                .contract_to_system
-                .get(&vec![0x91; 20]),
-            None
-        );
+        assert_eq!(dispatcher.component_system("seeded-v2-pool"), Some(&"uniswap_v2".to_string()));
+        assert_eq!(dispatcher.contract_system(&vec![0x81; 20]), Some(&"uniswap_v2".to_string()));
+        assert_eq!(dispatcher.component_system("other-pool"), None);
+        assert_eq!(dispatcher.contract_system(&vec![0x91; 20]), None);
     }
 
     #[tokio::test]
@@ -1781,9 +1340,107 @@ mod tests {
 
         assert_eq!(block_changes.changes.len(), 1);
         assert_eq!(
-            String::from_utf8(block_changes.changes[0].balance_changes[0].component_id.clone())
-                .expect("component id should be utf8"),
+            String::from_utf8(
+                block_changes.changes[0].balance_changes[0]
+                    .component_id
+                    .clone()
+            )
+            .expect("component id should be utf8"),
             "seeded-v2-pool"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_block_scoped_data_with_protocol_cache_fallback_hydrates_contract_only_follow_up(
+    ) {
+        let cache = ProtocolMemoryCache::new(
+            Chain::Ethereum,
+            Duration::seconds(60),
+            std::sync::Arc::new(MockGateway::new()),
+        );
+        cache
+            .add_components(vec![tycho_common::models::protocol::ProtocolComponent::new(
+                "seeded-v2-pool",
+                "uniswap_v2",
+                "uniswap_v2_pool",
+                Chain::Ethereum,
+                Vec::new(),
+                vec![tycho_common::Bytes::from(vec![0x81; 20])],
+                HashMap::new(),
+                tycho_common::models::ChangeType::Creation,
+                tycho_common::Bytes::default(),
+                chrono::NaiveDateTime::default(),
+            )])
+            .await
+            .expect("add cached component");
+
+        let branches = vec![branch("uniswap_v2", "uniswap_v2_pool")];
+        let mut dispatcher =
+            FamilyBlockChangesDispatcher::new(branches).expect("dispatcher builds");
+
+        let block_changes = substreams::BlockChanges {
+            block: Some(test_block()),
+            changes: vec![substreams::TransactionChanges {
+                tx: Some(test_tx()),
+                contract_changes: vec![test_contract_change(vec![0x81; 20])],
+                entity_changes: vec![],
+                component_changes: vec![],
+                balance_changes: vec![],
+                entrypoints: vec![],
+                entrypoint_params: vec![],
+            }],
+            storage_changes: vec![substreams::TransactionStorageChanges {
+                tx: Some(test_tx()),
+                storage_changes: vec![test_storage_change(vec![0x81; 20])],
+            }],
+        };
+
+        let dispatched = dispatcher
+            .dispatch_block_scoped_data_with_protocol_cache_fallback(
+                BlockScopedData {
+                    output: Some(MapModuleOutput {
+                        name: "map_family_protocol_changes".to_string(),
+                        map_output: Some(prost_types::Any {
+                            type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
+                            value: block_changes.encode_to_vec(),
+                        }),
+                        debug_info: None,
+                    }),
+                    clock: Some(Clock { id: "43".to_string(), number: 43, timestamp: None }),
+                    cursor: "cursor-43".to_string(),
+                    final_block_height: 43,
+                    debug_map_outputs: vec![],
+                    debug_store_outputs: vec![],
+                    attestation: "test_attestation".to_string(),
+                    is_partial: false,
+                    partial_index: None,
+                    is_last_partial: None,
+                },
+                &cache,
+            )
+            .await
+            .expect("dispatcher should hydrate contract ownership from cache and redispatch");
+
+        let output = dispatched["uniswap_v2"]
+            .output
+            .as_ref()
+            .expect("branch output");
+        let map_output = output
+            .map_output
+            .as_ref()
+            .expect("branch map output");
+        let block_changes = substreams::BlockChanges::decode(map_output.value.as_slice())
+            .expect("decode dispatched block changes");
+
+        assert_eq!(block_changes.changes.len(), 1);
+        assert_eq!(
+            block_changes.changes[0]
+                .contract_changes
+                .len(),
+            1
+        );
+        assert_eq!(block_changes.changes[0].contract_changes[0].address, vec![0x81; 20]);
+        assert_eq!(block_changes.storage_changes.len(), 1);
+        assert_eq!(block_changes.storage_changes[0].storage_changes[0].address, vec![0x81; 20]);
     }
 }

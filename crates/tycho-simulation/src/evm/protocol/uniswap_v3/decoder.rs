@@ -117,14 +117,16 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for UniswapV3State {
             .collect();
 
         let mut ticks = match ticks {
-            Ok(ticks) if !ticks.is_empty() => ticks
+            Ok(ticks) => ticks
                 .into_iter()
                 .filter(|t| t.net_liquidity != 0)
                 .collect::<Vec<_>>(),
-            _ => {
-                return Err(InvalidSnapshotError::MissingAttribute("tick_liquidities".to_string()))
-            }
+            Err(err) => return Err(err),
         };
+
+        if ticks.is_empty() && liquidity != 0 {
+            return Err(InvalidSnapshotError::MissingAttribute("tick_liquidities".to_string()));
+        }
 
         ticks.sort_by_key(|tick| tick.index);
 
@@ -205,6 +207,31 @@ mod tests {
             vec![TickInfo::new(60, 400).unwrap()],
         )
         .unwrap();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_usv3_try_from_zero_liquidity_without_ticks() {
+        let mut attributes = usv3_attributes();
+        attributes.insert("liquidity".to_string(), Bytes::from([0; 16].to_vec()));
+        attributes.remove("ticks/60/net_liquidity");
+
+        let snapshot = ComponentWithState {
+            state: ProtocolComponentState {
+                component_id: "State1".to_owned(),
+                attributes,
+                balances: HashMap::new(),
+            },
+            component: usv3_component(),
+            component_tvl: None,
+            entrypoints: Vec::new(),
+        };
+
+        let result = try_decode_snapshot_with_defaults::<UniswapV3State>(snapshot).await;
+
+        assert!(result.is_ok());
+        let expected = UniswapV3State::new(0, U256::from(200), FeeAmount::Medium, 300, vec![])
+            .unwrap();
         assert_eq!(result.unwrap(), expected);
     }
 

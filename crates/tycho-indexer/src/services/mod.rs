@@ -1,10 +1,7 @@
 //! This module contains Tycho web services implementation
 // TODO: remove once deprecated ProtocolId struct is removed
 #![allow(deprecated)]
-use std::{
-    collections::HashMap,
-    sync::{mpsc, Arc},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use actix_cors::Cors;
 use actix_web::{dev::ServerHandle, http, middleware as actix_middleware, web, App, HttpServer};
@@ -21,7 +18,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    extractor::{runner::ExtractorHandle, ExtractionError},
+    extractor::{control::ExtractorHandle, ExtractionError},
     services::{
         api_docs::ApiDoc,
         deltas_buffer::PendingDeltas,
@@ -123,7 +120,7 @@ where
     /// Starts the Tycho server. Returns a tuple containing a handle for the server and a Tokio
     /// handle for the tasks. If no extractor tasks are registered, it starts the server without
     /// running the delta tasks.
-    pub fn run(
+    pub async fn run(
         self,
     ) -> Result<(ServerHandle, JoinHandle<Result<(), ExtractionError>>), ExtractionError> {
         let open_api = ApiDoc::openapi();
@@ -135,12 +132,13 @@ where
         } else {
             info!("Starting full server");
             self.start_server_with_deltas(open_api)
+                .await
         }
     }
 
     /// Runs the server with both RPC and WebSocket services, and spawns tasks for handling
     /// pending delta processing.
-    fn start_server_with_deltas(
+    async fn start_server_with_deltas(
         self,
         openapi: utoipa::openapi::OpenApi,
     ) -> Result<(ServerHandle, JoinHandle<Result<(), ExtractionError>>), ExtractionError> {
@@ -154,7 +152,7 @@ where
             .clone()
             .into_values();
         let pending_deltas_clone = pending_deltas.clone();
-        let (start_tx, start_rx) = mpsc::sync_channel::<()>(1);
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
         let deltas_task = tokio::spawn(async move {
             pending_deltas_clone
                 .run(extractor_handles_clone, start_tx)
@@ -163,7 +161,7 @@ where
         });
 
         // Wait for the pending deltas task to start
-        start_rx.recv().map_err(|err| {
+        start_rx.await.map_err(|err| {
             ExtractionError::ServiceError(format!(
                 "Failed to receive PendingDeltas start signal: {err}"
             ))

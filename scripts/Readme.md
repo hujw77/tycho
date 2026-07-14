@@ -187,7 +187,7 @@ Use `scripts/check-combined-family-fynd-live-e2e.sh` to standardize the live com
 Fynd route-return and quote-settlement checks against a local Tycho RPC plus a live Ethereum RPC.
 
 Check whether the sibling `fynd` repository is present and whether the local Tycho endpoint is
-reachable:
+both reachable and already serving queryable `uniswap_v2` and `uniswap_v3` protocol components:
 
 ```bash
 scripts/check-combined-family-fynd-live-e2e.sh doctor
@@ -211,11 +211,17 @@ Run only the combined-family route-return ignored test:
 scripts/check-combined-family-fynd-live-e2e.sh run-route
 ```
 
+By default this forwards `FYND_E2E_HEALTH_MODE=quote_ready` so the route gate can start as soon as
+the combined-family feed is queryable.
+
 Run only the combined-family quote-settlement ignored test:
 
 ```bash
 scripts/check-combined-family-fynd-live-e2e.sh run-settlement
 ```
+
+By default this forwards `FYND_E2E_HEALTH_MODE=strict` so the settlement gate waits for full Fynd
+derived-data readiness before requesting the quote it will dry-run on-chain.
 
 Run both combined-family ignored tests in sequence:
 
@@ -229,6 +235,7 @@ Optional overrides:
 - `FYND_E2E_TYCHO_URL`
 - `FYND_E2E_RPC_URL`
 - `FYND_E2E_RUST_LOG`
+- `TYCHO_COMBINED_FAMILY_CHAIN`
 - `TYCHO_STREAM_WS_BUFFER_SIZE`
 - `TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE`
 

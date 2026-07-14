@@ -1,0 +1,382 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use prost::Message;
+use tokio::sync::mpsc;
+use tycho_common::models::{Chain, FinancialType};
+use tycho_substreams::pb::tycho::evm::v1 as substreams;
+
+use super::*;
+use crate::{
+    extractor::{
+        control::BranchSubscriptionsMap,
+        extractor_config::{BootstrapConfig, ExtractorConfig, ProtocolTypeConfig},
+        family_dispatch::FamilyBlockChangesDispatcher,
+        family_registry::default_family_runtime_registry,
+        family_runtime_planning::resolved_family_execution_config_from_extractor_configs_for_tests,
+        family_runtime_metadata::ResolvedSharedFamilyStream,
+        family_runtime_planning::{
+            validate_family_runtime_membership, DetectedFamilyRuntime, ResolvedFamilyRuntime,
+        },
+        family_runtime_execution::FamilyRuntimeState,
+        protocol_cache::ProtocolMemoryCache,
+        ExtractionError, Extractor,
+    },
+    pb::sf::substreams::rpc::v2::BlockScopedData,
+    pb::sf::substreams::v1::Clock,
+    substreams::stream::SubstreamsStream,
+    testing::{
+        family_detected_runtime_from_configs_for_tests, family_output_module_for_tests, MockGateway,
+    },
+};
+
+pub(super) fn uniswap_shared_stream_for_tests(
+    shared_spkg: &str,
+) -> ResolvedSharedFamilyStream {
+    default_family_runtime_registry()
+        .resolved_shared_stream_for_family(Chain::Ethereum, "uniswap", shared_spkg)
+        .expect("registered uniswap shared stream")
+}
+
+pub(super) fn family_runtime_state_for_tests(
+    extractors: &HashMap<String, Arc<dyn Extractor>>,
+    dispatcher: FamilyBlockChangesDispatcher,
+) -> FamilyRuntimeState {
+    let protocol_cache = ProtocolMemoryCache::new(
+        Chain::Ethereum,
+        chrono::Duration::seconds(60),
+        Arc::new(MockGateway::new()),
+    );
+    FamilyRuntimeState::new(extractors, dispatcher, protocol_cache)
+}
+
+pub(super) fn family_runner_for_tests(
+    extractors: HashMap<String, Arc<dyn Extractor>>,
+    substreams: SubstreamsStream,
+    subscriptions: BranchSubscriptionsMap,
+    dispatcher: FamilyBlockChangesDispatcher,
+) -> FamilyExtractorRunner {
+    let runtime_state = family_runtime_state_for_tests(&extractors, dispatcher);
+    FamilyExtractorRunner::new(
+        extractors,
+        substreams,
+        subscriptions,
+        mpsc::channel(4).1,
+        None,
+        false,
+        runtime_state,
+    )
+}
+
+pub(super) fn validate_family_runner_membership(
+    family: &DetectedFamilyRuntime,
+    extractor_configs: &[&ExtractorConfig],
+) -> Result<(), ExtractionError> {
+    validate_family_runtime_membership(family, extractor_configs)
+}
+
+/// Builds minimal BlockScopedData for runner message-selection tests.
+pub(super) fn make_block_scoped_data(
+    is_partial: bool,
+    partial_index: Option<u32>,
+    is_last_partial: Option<bool>,
+) -> BlockScopedData {
+    BlockScopedData {
+        output: None,
+        clock: None,
+        cursor: String::new(),
+        final_block_height: 0,
+        debug_map_outputs: vec![],
+        debug_store_outputs: vec![],
+        attestation: String::new(),
+        is_partial,
+        partial_index,
+        is_last_partial,
+    }
+}
+
+pub(super) fn make_family_block_scoped_data() -> BlockScopedData {
+    use crate::pb::sf::substreams::rpc::v2::MapModuleOutput;
+
+    let family_changes = substreams::BlockChanges {
+        block: Some(substreams::Block {
+            number: 42,
+            hash: vec![0x01; 32],
+            parent_hash: vec![0x02; 32],
+            ts: 1_718_000_000,
+        }),
+        changes: vec![substreams::TransactionChanges {
+            tx: Some(substreams::Transaction {
+                hash: vec![0xaa; 32],
+                from: vec![0x11; 20],
+                to: vec![0x22; 20],
+                index: 7,
+            }),
+            contract_changes: vec![],
+            entity_changes: vec![],
+            component_changes: vec![
+                substreams::ProtocolComponent {
+                    id: "v2-pool".to_string(),
+                    protocol_type: Some(substreams::ProtocolType {
+                        name: "uniswap_v2_pool".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                substreams::ProtocolComponent {
+                    id: "v3-pool".to_string(),
+                    protocol_type: Some(substreams::ProtocolType {
+                        name: "uniswap_v3_pool".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            balance_changes: vec![],
+            entrypoints: vec![],
+            entrypoint_params: vec![],
+        }],
+        storage_changes: vec![],
+    };
+
+    BlockScopedData {
+        output: Some(MapModuleOutput {
+            name: family_output_module_for_tests("uniswap"),
+            map_output: Some(prost_types::Any {
+                type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
+                value: family_changes.encode_to_vec(),
+            }),
+            debug_info: None,
+        }),
+        clock: Some(Clock { id: "42".to_string(), number: 42, timestamp: None }),
+        cursor: "cursor-42".to_string(),
+        final_block_height: 42,
+        debug_map_outputs: vec![],
+        debug_store_outputs: vec![],
+        attestation: String::new(),
+        is_partial: false,
+        partial_index: None,
+        is_last_partial: None,
+    }
+}
+
+pub(super) fn make_uniswap_family_bootstrap_test_configs() -> [ExtractorConfig; 2] {
+    [
+        ExtractorConfig {
+            name: "uniswap_v2".to_owned(),
+            protocol_system: "uniswap_v2".to_string(),
+            start_block: 42,
+            protocol_types: vec![ProtocolTypeConfig::new(
+                "uniswap_v2_pool".to_string(),
+                FinancialType::Swap,
+            )],
+            substreams_params: HashMap::from([(
+                "map_pool_events".to_string(),
+                "factory=0x01".to_string(),
+            )]),
+            bootstrap: Some(BootstrapConfig {
+                strategy: BootstrapStrategy::UniswapV2Rpc,
+                start_block: 42,
+                params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
+                    .to_owned(),
+            }),
+            ..Default::default()
+        },
+        ExtractorConfig {
+            name: "uniswap_v3".to_owned(),
+            protocol_system: "uniswap_v3".to_string(),
+            start_block: 42,
+            protocol_types: vec![ProtocolTypeConfig::new(
+                "uniswap_v3_pool".to_string(),
+                FinancialType::Swap,
+            )],
+            substreams_params: HashMap::from([(
+                "map_events".to_string(),
+                "factory=0x02".to_string(),
+            )]),
+            bootstrap: Some(BootstrapConfig {
+                strategy: BootstrapStrategy::UniswapV3Rpc,
+                start_block: 42,
+                params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
+                    .to_owned(),
+            }),
+            ..Default::default()
+        },
+    ]
+}
+
+pub(super) fn make_uniswap_family_runtime_test_configs(
+    v2_start_block: i64,
+    v3_start_block: i64,
+) -> [ExtractorConfig; 2] {
+    [
+        ExtractorConfig {
+            name: "uniswap_v2".to_owned(),
+            protocol_system: "uniswap_v2".to_string(),
+            start_block: v2_start_block,
+            protocol_types: vec![ProtocolTypeConfig::new(
+                "uniswap_v2_pool".to_string(),
+                FinancialType::Swap,
+            )],
+            ..Default::default()
+        },
+        ExtractorConfig {
+            name: "uniswap_v3".to_owned(),
+            protocol_system: "uniswap_v3".to_string(),
+            start_block: v3_start_block,
+            protocol_types: vec![ProtocolTypeConfig::new(
+                "uniswap_v3_pool".to_string(),
+                FinancialType::Swap,
+            )],
+            ..Default::default()
+        },
+    ]
+}
+
+pub(super) fn resolved_family_runtime_from_configs_for_tests<'a>(
+    extractor_configs: &[&'a ExtractorConfig],
+    shared_spkg: &str,
+) -> ResolvedFamilyRuntime<'a> {
+    ResolvedFamilyRuntime {
+        family: family_detected_runtime_from_configs_for_tests(extractor_configs, shared_spkg),
+        extractor_configs: extractor_configs.to_vec(),
+        execution: resolved_family_execution_config_from_extractor_configs_for_tests(
+            extractor_configs,
+        )
+        .expect("family execution config should derive from test configs"),
+    }
+}
+
+pub(super) fn make_family_follow_up_block_scoped_data(
+    block_number: u64,
+    cursor: &str,
+) -> BlockScopedData {
+    use crate::pb::sf::substreams::rpc::v2::MapModuleOutput;
+
+    let family_changes = substreams::BlockChanges {
+        block: Some(substreams::Block {
+            number: block_number,
+            hash: vec![0x04; 32],
+            parent_hash: vec![0x01; 32],
+            ts: 1_718_000_001,
+        }),
+        changes: vec![substreams::TransactionChanges {
+            tx: Some(substreams::Transaction {
+                hash: vec![0xbb; 32],
+                from: vec![0x11; 20],
+                to: vec![0x22; 20],
+                index: 8,
+            }),
+            contract_changes: vec![],
+            entity_changes: vec![
+                substreams::EntityChanges {
+                    component_id: "v2-pool".to_string(),
+                    attributes: vec![],
+                },
+                substreams::EntityChanges {
+                    component_id: "v3-pool".to_string(),
+                    attributes: vec![],
+                },
+            ],
+            component_changes: vec![],
+            balance_changes: vec![],
+            entrypoints: vec![],
+            entrypoint_params: vec![],
+        }],
+        storage_changes: vec![],
+    };
+
+    BlockScopedData {
+        output: Some(MapModuleOutput {
+            name: family_output_module_for_tests("uniswap"),
+            map_output: Some(prost_types::Any {
+                type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
+                value: family_changes.encode_to_vec(),
+            }),
+            debug_info: None,
+        }),
+        clock: Some(Clock { id: block_number.to_string(), number: block_number, timestamp: None }),
+        cursor: cursor.to_string(),
+        final_block_height: block_number,
+        debug_map_outputs: vec![],
+        debug_store_outputs: vec![],
+        attestation: String::new(),
+        is_partial: false,
+        partial_index: None,
+        is_last_partial: None,
+    }
+}
+
+pub(super) fn make_family_contract_and_storage_follow_up_block_scoped_data(
+    block_number: u64,
+    cursor: &str,
+) -> BlockScopedData {
+    use crate::pb::sf::substreams::rpc::v2::MapModuleOutput;
+
+    let family_changes = substreams::BlockChanges {
+        block: Some(substreams::Block {
+            number: block_number,
+            hash: vec![0x05; 32],
+            parent_hash: vec![0x04; 32],
+            ts: 1_718_000_002,
+        }),
+        changes: vec![substreams::TransactionChanges {
+            tx: Some(substreams::Transaction {
+                hash: vec![0xcc; 32],
+                from: vec![0x11; 20],
+                to: vec![0x22; 20],
+                index: 9,
+            }),
+            contract_changes: vec![substreams::ContractChange {
+                address: vec![0x44; 20],
+                balance: vec![],
+                code: vec![],
+                change: 0,
+                slots: vec![],
+                token_balances: vec![],
+            }],
+            entity_changes: vec![],
+            component_changes: vec![],
+            balance_changes: vec![],
+            entrypoints: vec![],
+            entrypoint_params: vec![],
+        }],
+        storage_changes: vec![substreams::TransactionStorageChanges {
+            tx: Some(substreams::Transaction {
+                hash: vec![0xdd; 32],
+                from: vec![0x11; 20],
+                to: vec![0x22; 20],
+                index: 10,
+            }),
+            storage_changes: vec![substreams::StorageChanges {
+                address: vec![0x55; 20],
+                slots: vec![substreams::ContractSlot {
+                    slot: vec![0x01],
+                    value: vec![0x02],
+                    previous_value: vec![],
+                }],
+                native_balance: None,
+            }],
+        }],
+    };
+
+    BlockScopedData {
+        output: Some(MapModuleOutput {
+            name: family_output_module_for_tests("uniswap"),
+            map_output: Some(prost_types::Any {
+                type_url: "type.googleapis.com/tycho.evm.v1.BlockChanges".to_string(),
+                value: family_changes.encode_to_vec(),
+            }),
+            debug_info: None,
+        }),
+        clock: Some(Clock { id: block_number.to_string(), number: block_number, timestamp: None }),
+        cursor: cursor.to_string(),
+        final_block_height: block_number,
+        debug_map_outputs: vec![],
+        debug_store_outputs: vec![],
+        attestation: String::new(),
+        is_partial: false,
+        partial_index: None,
+        is_last_partial: None,
+    }
+}

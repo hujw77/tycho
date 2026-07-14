@@ -24,6 +24,10 @@ Environment:
                          Optional fixed isolated database name for this gate.
   TYCHO_COMBINED_FAMILY_DB_TEST_MANIFEST
                          Optional override manifest path for the DB-backed gate test list.
+  TYCHO_COMBINED_FAMILY_SKIP_DB_DOCTOR
+                         Default: 0
+                         When set to 1, `run` skips the initial readiness probe and relies on the
+                         subsequent `psql` setup + test execution as the authoritative check.
   TYCHO_REQUIRE_TEST_DB  Forced to 1 during `run`
 
 Notes:
@@ -112,6 +116,7 @@ derive_run_database_name() {
 RUN_DATABASE_NAME="$(derive_run_database_name)"
 RUN_DATABASE_URL="$(postgres_url_with_db_name "${BASE_DATABASE_URL_VALUE}" "${RUN_DATABASE_NAME}")"
 MAINTENANCE_DATABASE_URL="$(postgres_url_with_db_name "${BASE_DATABASE_URL_VALUE}" "postgres")"
+SKIP_DB_DOCTOR="${TYCHO_COMBINED_FAMILY_SKIP_DB_DOCTOR:-0}"
 
 render_db_start_command() {
   cat <<EOF
@@ -139,7 +144,7 @@ load_tests
 
 render_test_binary_resolve_command() {
   cat <<'EOF'
-TEST_BINARY="$(cargo test -p tycho-indexer --bin tycho-indexer --no-run --message-format=json | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+TEST_BINARY="$(cargo test -p tycho-indexer --bin tycho-indexer --no-run 2>&1 | sed -n 's/^  Executable .* (\(.*\))$/\1/p' | tail -n 1)"
 if [[ -z "${TEST_BINARY}" || ! -x "${TEST_BINARY}" ]]; then
   echo "failed to resolve tycho-indexer test binary path" >&2
   exit 1
@@ -148,7 +153,7 @@ EOF
 }
 
 resolve_test_binary_path() {
-  TEST_BINARY="$(cargo test -p tycho-indexer --bin tycho-indexer --no-run --message-format=json | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+  TEST_BINARY="$(cargo test -p tycho-indexer --bin tycho-indexer --no-run 2>&1 | sed -n 's/^  Executable .* (\(.*\))$/\1/p' | tail -n 1)"
   if [[ -z "${TEST_BINARY}" || ! -x "${TEST_BINARY}" ]]; then
     echo "failed to resolve tycho-indexer test binary path" >&2
     exit 1
@@ -218,10 +223,12 @@ EOF
 }
 
 run_tests() {
-  local previous_strict_doctor="${STRICT_DOCTOR}"
-  STRICT_DOCTOR="true"
-  doctor
-  STRICT_DOCTOR="${previous_strict_doctor}"
+  if [[ "${SKIP_DB_DOCTOR}" != "1" ]]; then
+    local previous_strict_doctor="${STRICT_DOCTOR}"
+    STRICT_DOCTOR="true"
+    doctor
+    STRICT_DOCTOR="${previous_strict_doctor}"
+  fi
   cd "${REPO_ROOT}"
   export DATABASE_URL="${RUN_DATABASE_URL}"
   export TYCHO_REQUIRE_TEST_DB=1

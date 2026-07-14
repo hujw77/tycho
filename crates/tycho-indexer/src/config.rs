@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    env, fs,
+    collections::{HashMap, HashSet},
+    env,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -8,21 +8,41 @@ use std::{
 
 use actix_web::dev::ServerHandle;
 use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
-use tokio::task::JoinHandle;
+use serde::Deserialize;
+use tokio::{
+    runtime::Handle,
+    signal::unix::{signal, SignalKind},
+    task::{AbortHandle, JoinHandle},
+};
+use tracing::info;
 use tycho_common::models::{Chain, ImplementationType};
 use tycho_common::storage::Gateway;
-use tycho_ethereum::rpc::EthereumRpcClient;
-use tycho_indexer::extractor::family_runtime::{
-    build_resolved_runtime_targets_with_registry, FamilyRuntimeConfig, FamilyRuntimeRegistry,
-    ResolvedRuntimeTargets,
+use tycho_ethereum::{
+    rpc::EthereumRpcClient, services::token_pre_processor::EthereumTokenPreProcessor,
 };
-use tycho_indexer::extractor::runner::{
-    BootstrapConfig, BootstrapStrategy, DCIType, ExtractorConfig, ExtractorHandle,
-    ProtocolTypeConfig,
+use tycho_indexer::extractor::extractor_config::{
+    BootstrapConfig, BootstrapStrategy, DCIType, ExtractorConfig, ProtocolTypeConfig,
 };
 use tycho_indexer::extractor::ExtractionError;
+use tycho_indexer::extractor::{
+    chain_state::ChainState, control::ExtractorHandle,
+    family_registry::default_family_runtime_registry,
+    family_registry::FamilyRuntimeRegistry,
+    family_runtime_metadata::{canonicalize_shared_route_protocol, FamilyRuntimeConfig},
+    family_runtime_planning::build_resolved_runtime_targets_with_registry,
+    shared_config::{
+        protocol_filter_for_protocol_system, resolve_bootstrap_params,
+        resolve_substreams_params_map,
+    },
+    runtime_target_planning::ResolvedRuntimeTargets, startup::ResolvedRuntimeTargetsBuildContext,
+};
+#[cfg(test)]
+use tycho_indexer::extractor::family_runtime_planning::build_family_runtime_plan;
+#[cfg(test)]
+use tycho_indexer::extractor::shared_config::{
+    parse_bootstrap_params_file, parse_bootstrap_params_yaml, parse_substreams_params_file,
+    parse_substreams_params_yaml,
+};
 use tycho_indexer::services::PlansConfig;
 use tycho_indexer::services::ServicesBuilder;
 use tycho_storage::postgres::{builder::GatewayBuilder, cache::CachedGateway};
@@ -38,6 +58,12 @@ pub(crate) struct ResolvedIndexerServiceConfig {
     dci_protocol_systems: Vec<String>,
 }
 
+pub(crate) struct ResolvedIndexerRuntimePlan<'a> {
+    runtime_targets: ResolvedRuntimeTargets<'a>,
+    service_config: ResolvedIndexerServiceConfig,
+    family_runtime_registry: FamilyRuntimeRegistry<'static>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvedServiceLaunchConfig {
     api_key: String,
@@ -47,10 +73,65 @@ pub(crate) struct ResolvedServiceLaunchConfig {
     plans_config: PlansConfig,
 }
 
+pub(crate) struct ManagedServerTasks {
+    pub(crate) server_url: String,
+    pub(crate) server_task: JoinHandle<Result<(), ExtractionError>>,
+    pub(crate) shutdown_task: JoinHandle<Result<(), ExtractionError>>,
+    server_handle: ServerHandle,
+    db_write_executor_abort: Option<AbortHandle>,
+}
+
+pub(crate) struct ManagedIndexerTasks {
+    pub(crate) extraction_tasks: Vec<JoinHandle<Result<(), ExtractionError>>>,
+    pub(crate) service_tasks: Vec<JoinHandle<Result<(), ExtractionError>>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    server_handle: ServerHandle,
+    #[cfg_attr(not(test), allow(dead_code))]
+    db_write_executor_abort: Option<AbortHandle>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedIndexerTaskContext<'a> {
+    pub(crate) database_url: &'a str,
+    pub(crate) chains: &'a [Chain],
+    pub(crate) retention_horizon: NaiveDateTime,
+    pub(crate) endpoint_url: &'a str,
+    pub(crate) s3_bucket: Option<&'a str>,
+    pub(crate) substreams_api_token: &'a str,
+    pub(crate) database_insert_batch_size: usize,
+    pub(crate) settlement_contract: alloy::primitives::Address,
+    pub(crate) extraction_runtime: Option<Handle>,
+    pub(crate) partial_blocks: bool,
+    pub(crate) family_runtime_registry: FamilyRuntimeRegistry<'static>,
+}
+
+impl<'a> ResolvedIndexerTaskContext<'a> {
+    pub(crate) fn runtime_targets_build_context<'b>(
+        &'b self,
+        chain_state: ChainState,
+        cached_gw: &'b CachedGateway,
+        token_pre_processor: &'b EthereumTokenPreProcessor,
+        rpc_client: &'b EthereumRpcClient,
+    ) -> ResolvedRuntimeTargetsBuildContext<'b> {
+        ResolvedRuntimeTargetsBuildContext::new(
+            chain_state,
+            self.endpoint_url,
+            self.s3_bucket,
+            self.substreams_api_token,
+            cached_gw,
+            self.database_insert_batch_size,
+            token_pre_processor,
+            rpc_client,
+            self.extraction_runtime.clone(),
+            false,
+            self.partial_blocks,
+            self.family_runtime_registry,
+        )
+    }
+}
+
 impl ResolvedIndexerServiceConfig {
-    pub(crate) fn from_runtime_targets(
-        runtime_targets: &ResolvedRuntimeTargets<'_>,
-    ) -> Self {
+    pub(crate) fn from_runtime_targets(runtime_targets: &ResolvedRuntimeTargets<'_>) -> Self {
         Self {
             protocol_systems: runtime_targets.protocol_systems(),
             dci_protocol_systems: runtime_targets.dci_protocol_systems(),
@@ -98,7 +179,7 @@ impl ResolvedIndexerServiceConfig {
             .register_extractors(handles)
     }
 
-    pub(crate) fn start_services<G>(
+    pub(crate) async fn start_services<G>(
         &self,
         db_gateway: G,
         rpc: EthereumRpcClient,
@@ -118,6 +199,36 @@ impl ResolvedIndexerServiceConfig {
             .port(port)
             .plans_config(plans_config)
             .run()
+            .await
+    }
+}
+
+impl<'a> ResolvedIndexerRuntimePlan<'a> {
+    pub(crate) fn new(
+        runtime_targets: ResolvedRuntimeTargets<'a>,
+        family_runtime_registry: FamilyRuntimeRegistry<'static>,
+    ) -> Self {
+        let service_config = ResolvedIndexerServiceConfig::from_runtime_targets(&runtime_targets);
+        Self { runtime_targets, service_config, family_runtime_registry }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn service_config(&self) -> &ResolvedIndexerServiceConfig {
+        &self.service_config
+    }
+
+    pub(crate) fn family_runtime_registry(&self) -> FamilyRuntimeRegistry<'static> {
+        self.family_runtime_registry
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_runtime_targets(self) -> ResolvedRuntimeTargets<'a> {
+        self.runtime_targets
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn into_parts(self) -> (ResolvedIndexerServiceConfig, ResolvedRuntimeTargets<'a>) {
+        (self.service_config, self.runtime_targets)
     }
 }
 
@@ -157,7 +268,7 @@ impl ResolvedServiceLaunchConfig {
         format!("http://{}:{}", self.bind, self.port)
     }
 
-    pub(crate) fn start_services<G>(
+    pub(crate) async fn start_services<G>(
         &self,
         service_config: &ResolvedIndexerServiceConfig,
         db_gateway: G,
@@ -167,17 +278,171 @@ impl ResolvedServiceLaunchConfig {
     where
         G: Gateway + Send + Sync + 'static,
     {
-        service_config.start_services(
-            db_gateway,
-            rpc,
-            self.api_key.clone(),
-            handles,
-            &self.prefix,
-            &self.bind,
-            self.port,
-            self.plans_config.clone(),
-        )
+        service_config
+            .start_services(
+                db_gateway,
+                rpc,
+                self.api_key.clone(),
+                handles,
+                &self.prefix,
+                &self.bind,
+                self.port,
+                self.plans_config.clone(),
+            )
+            .await
     }
+
+    pub(crate) async fn start_managed_server<G>(
+        &self,
+        service_config: &ResolvedIndexerServiceConfig,
+        db_gateway: G,
+        rpc: EthereumRpcClient,
+        handles: Vec<ExtractorHandle>,
+        db_write_executor_handle: Option<JoinHandle<()>>,
+    ) -> Result<ManagedServerTasks, ExtractionError>
+    where
+        G: Gateway + Send + Sync + 'static,
+    {
+        let server_url = self.server_url();
+        let (server_handle, server_task) = self
+            .start_services(service_config, db_gateway, rpc, handles.clone())
+            .await?;
+        let shutdown_server_handle = server_handle.clone();
+        let db_write_executor_abort = db_write_executor_handle
+            .as_ref()
+            .map(JoinHandle::abort_handle);
+        let shutdown_task = tokio::spawn(shutdown_handler(
+            shutdown_server_handle,
+            handles,
+            db_write_executor_handle,
+        ));
+
+        Ok(ManagedServerTasks {
+            server_url,
+            server_task,
+            shutdown_task,
+            server_handle,
+            db_write_executor_abort,
+        })
+    }
+
+    pub(crate) async fn start_indexing_tasks(
+        &self,
+        service_config: &ResolvedIndexerServiceConfig,
+        runtime_targets: ResolvedRuntimeTargets<'_>,
+        rpc_client: EthereumRpcClient,
+        context: ResolvedIndexerTaskContext<'_>,
+    ) -> Result<ManagedIndexerTasks, ExtractionError> {
+        let block_number = rpc_client
+            .get_block_number()
+            .await
+            .map_err(|err| {
+                ExtractionError::Unknown(format!("Error getting block number: {err}"))
+            })?;
+
+        let chain_state = ChainState::new(chrono::Local::now().naive_utc(), block_number, 12);
+
+        let (cached_gw, gw_writer_handle) = service_config
+            .build_gateway(context.database_url, context.chains, context.retention_horizon)
+            .await?;
+        let token_processor = EthereumTokenPreProcessor::new(
+            &rpc_client,
+            *context
+                .chains
+                .first()
+                .expect("No chain provided"),
+            context.settlement_contract,
+        );
+
+        let (runners, extractor_handles) = runtime_targets
+            .build_managed_runners(context.runtime_targets_build_context(
+                chain_state,
+                &cached_gw,
+                &token_processor,
+                &rpc_client,
+            ))
+            .await?;
+
+        let managed_server = self
+            .start_managed_server(
+                service_config,
+                cached_gw,
+                rpc_client,
+                extractor_handles,
+                Some(gw_writer_handle),
+            )
+            .await?;
+        info!(server_url = managed_server.server_url, "Http and Ws server started");
+
+        Ok(ManagedIndexerTasks {
+            extraction_tasks: runners
+                .into_iter()
+                .map(|runner| runner.run())
+                .collect(),
+            service_tasks: vec![managed_server.server_task, managed_server.shutdown_task],
+            server_handle: managed_server.server_handle,
+            db_write_executor_abort: managed_server.db_write_executor_abort,
+        })
+    }
+
+    pub(crate) async fn start_indexing_runtime_plan(
+        &self,
+        runtime_plan: ResolvedIndexerRuntimePlan<'_>,
+        rpc_client: EthereumRpcClient,
+        context: ResolvedIndexerTaskContext<'_>,
+    ) -> Result<ManagedIndexerTasks, ExtractionError> {
+        let (service_config, runtime_targets) = runtime_plan.into_parts();
+        self.start_indexing_tasks(&service_config, runtime_targets, rpc_client, context)
+            .await
+    }
+}
+
+impl ManagedIndexerTasks {
+    #[cfg(test)]
+    pub(crate) async fn shutdown(mut self) {
+        for task in self.extraction_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+        self.server_handle.stop(true).await;
+        if let Some(handle) = self.db_write_executor_abort.take() {
+            handle.abort();
+        }
+        for task in self.service_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+async fn shutdown_handler(
+    server_handle: ServerHandle,
+    extractors: Vec<ExtractorHandle>,
+    db_write_executor_handle: Option<JoinHandle<()>>,
+) -> Result<(), ExtractionError> {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm =
+        signal(SignalKind::terminate()).map_err(|e| ExtractionError::Unknown(e.to_string()))?;
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("SIGINT (Ctrl+C) received. Cleaning up...");
+        },
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received. Cleaning up...");
+        },
+    }
+
+    for extractor in &extractors {
+        if let Err(err) = extractor.stop().await {
+            tracing::warn!(extractor_id = %extractor.get_id(), error = %err, "Failed to stop extractor cleanly");
+        }
+    }
+    server_handle.stop(true).await;
+    if let Some(handle) = db_write_executor_handle {
+        handle.abort();
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,14 +550,14 @@ impl ExtractorConfigs {
         &self,
     ) -> Result<ResolvedRuntimeTargets<'_>, tycho_indexer::extractor::ExtractionError> {
         self.resolved_runtime_targets_with_registry(
-            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+            default_family_runtime_registry(),
         )
     }
 
     pub(crate) fn from_yaml(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         Self::from_yaml_with_registry(
             path,
-            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+            default_family_runtime_registry(),
         )
     }
 
@@ -323,6 +588,23 @@ impl ExtractorConfigs {
         )?))
     }
 
+    pub(crate) fn resolved_indexer_runtime_plan(
+        &self,
+    ) -> Result<ResolvedIndexerRuntimePlan<'_>, tycho_indexer::extractor::ExtractionError> {
+        self.resolved_indexer_runtime_plan_with_registry(
+            default_family_runtime_registry(),
+        )
+    }
+
+    pub(crate) fn resolved_indexer_runtime_plan_with_registry(
+        &self,
+        registry: FamilyRuntimeRegistry<'static>,
+    ) -> Result<ResolvedIndexerRuntimePlan<'_>, tycho_indexer::extractor::ExtractionError> {
+        Ok(ResolvedIndexerRuntimePlan::new(
+            self.resolved_runtime_targets_with_registry(registry)?,
+            registry,
+        ))
+    }
 }
 
 impl RawExtractorConfigs {
@@ -431,7 +713,7 @@ fn validate_family_member_route_protocol_defaults(
     for (protocol_system, member_defaults) in &defaults.members {
         for route_protocol in &member_defaults.shared_route_protocols {
             let normalized =
-                tycho_indexer::extractor::family_runtime::canonicalize_shared_route_protocol(
+                canonicalize_shared_route_protocol(
                     route_protocol,
                 );
             if normalized.is_empty() {
@@ -538,7 +820,7 @@ impl TryFrom<RawExtractorConfigs> for ExtractorConfigs {
 
     fn try_from(value: RawExtractorConfigs) -> Result<Self, Self::Error> {
         value.try_into_with_registry(
-            tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+            default_family_runtime_registry(),
         )
     }
 }
@@ -650,496 +932,6 @@ fn merge_family_runtime_config(
             None,
         )?)),
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct SubstreamsParamsFile {
-    #[serde(default)]
-    start_block: Option<i64>,
-    #[serde(default)]
-    includes: Vec<String>,
-    #[serde(default)]
-    params: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootstrapParamsFile {
-    #[serde(default)]
-    start_block: Option<i64>,
-    #[serde(default)]
-    includes: Vec<String>,
-    #[serde(default)]
-    params: BootstrapParamsYaml,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct BootstrapParamsYaml {
-    #[serde(default)]
-    bootstrap_block: Option<i64>,
-    #[serde(default)]
-    pools: Vec<String>,
-    #[serde(default)]
-    routes: Vec<BootstrapRouteYaml>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct BootstrapRouteYaml {
-    token0: String,
-    token1: String,
-    #[serde(default)]
-    routers: Vec<BootstrapRouterYaml>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct BootstrapRouterYaml {
-    pool: String,
-    protocol: String,
-}
-
-#[cfg(test)]
-pub(crate) fn parse_substreams_params_yaml(
-    extractor_name: &str,
-    contents: &str,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    let parsed: SubstreamsParamsFile = serde_yaml::from_str(contents)?;
-    let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
-    let allowed_protocols = protocol_filter_for_protocol_system(extractor_name, registry);
-    let (start_block, params) = normalize_substreams_params(allowed_protocols.as_ref(), parsed)?;
-    let mut substreams_params = Vec::with_capacity(params.len());
-
-    for (key, value) in params {
-        let rendered_value = render_substreams_param_value(&value)?;
-        substreams_params.push(format!("{key}={rendered_value}"));
-    }
-
-    Ok((start_block, substreams_params.join("&")))
-}
-
-fn resolve_substreams_params_map(
-    allowed_protocols: Option<&HashSet<String>>,
-    resolved_start_block: &mut Option<i64>,
-    substreams_params: &mut HashMap<String, String>,
-    base_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for (module_name, value) in substreams_params {
-        let Some(path) = value.strip_prefix('@') else {
-            continue;
-        };
-
-        let params_path = base_dir.join(path);
-        let filter_name = render_allowed_protocols_label(allowed_protocols);
-        let (start_block, resolved_params) =
-            parse_substreams_params_file(allowed_protocols, &params_path).map_err(|err| {
-                format!(
-                    "failed to parse substreams config file for extractor `{}` \
-                     module `{module_name}` at `{}`: {err}",
-                    filter_name,
-                    params_path.display()
-                )
-            })?;
-
-        if let Some(start_block) = start_block {
-            if let Some(existing_start_block) = resolved_start_block {
-                if *existing_start_block != start_block {
-                    return Err(format!(
-                        "conflicting start_block values for extractor `{}`: \
-                         {existing_start_block} vs {start_block} from module `{module_name}`",
-                        filter_name
-                    )
-                    .into());
-                }
-            } else {
-                *resolved_start_block = Some(start_block);
-            }
-        }
-
-        *value = resolved_params;
-    }
-
-    Ok(())
-}
-
-fn resolve_bootstrap_params(
-    allowed_protocols: Option<&HashSet<String>>,
-    params_value: &mut String,
-    base_dir: &Path,
-) -> Result<i64, Box<dyn std::error::Error>> {
-    let Some(path) = params_value.strip_prefix('@') else {
-        return extract_bootstrap_block_from_query(params_value).map_err(Into::into);
-    };
-
-    let params_path = base_dir.join(path);
-    let filter_name = render_allowed_protocols_label(allowed_protocols);
-    let (start_block, resolved_params) =
-        parse_bootstrap_params_file(allowed_protocols, &params_path).map_err(|err| {
-            format!(
-                "failed to parse bootstrap config file for extractor `{}` at `{}`: \
-                 {err}",
-                filter_name,
-                params_path.display()
-            )
-        })?;
-
-    let start_block = start_block.ok_or_else(|| {
-        format!(
-            "bootstrap config file for extractor `{}` at `{}` is missing \
-             `start_block` or `params.bootstrap_block`",
-            filter_name,
-            params_path.display()
-        )
-    })?;
-
-    *params_value = resolved_params;
-    Ok(start_block)
-}
-
-#[cfg(test)]
-pub(crate) fn parse_bootstrap_params_yaml(
-    extractor_name: &str,
-    contents: &str,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    parse_bootstrap_params_yaml_with_filter(Some(extractor_name), contents)
-}
-
-#[cfg(test)]
-fn parse_bootstrap_params_yaml_with_filter(
-    route_protocol_filter: Option<&str>,
-    contents: &str,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    parse_bootstrap_params_yaml_with_filter_and_registry(
-        route_protocol_filter,
-        contents,
-        tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
-    )
-}
-
-#[cfg(test)]
-fn parse_bootstrap_params_yaml_with_filter_and_registry(
-    route_protocol_filter: Option<&str>,
-    contents: &str,
-    registry: FamilyRuntimeRegistry<'_>,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    let parsed: BootstrapParamsFile = serde_yaml::from_str(contents)?;
-    let bootstrap_block = match (parsed.start_block, parsed.params.bootstrap_block) {
-        (Some(start_block), Some(bootstrap_block)) => {
-            if start_block != bootstrap_block {
-                return Err(format!(
-                    "`start_block` ({start_block}) must match `params.bootstrap_block` \
-                     ({bootstrap_block})"
-                )
-                .into());
-            }
-            start_block
-        }
-        (Some(start_block), None) => start_block,
-        (None, Some(bootstrap_block)) => bootstrap_block,
-        (None, None) => {
-            return Err(
-                "bootstrap config is missing `start_block` or `params.bootstrap_block`".into()
-            )
-        }
-    };
-
-    let protocol_filter = route_protocol_filter
-        .and_then(|protocol| protocol_filter_for_protocol_system(protocol, registry));
-    let all_pools = collect_bootstrap_pools(&parsed.params, protocol_filter.as_ref())?;
-
-    if all_pools.is_empty() {
-        return Err("bootstrap config is missing `params.pools` or `params.routes`".into());
-    }
-
-    Ok((
-        Some(bootstrap_block),
-        format!("bootstrap_block={bootstrap_block}&pools={}", all_pools.join(",")),
-    ))
-}
-
-fn normalize_substreams_params(
-    allowed_protocols: Option<&HashSet<String>>,
-    mut parsed: SubstreamsParamsFile,
-) -> Result<(Option<i64>, BTreeMap<String, Value>), Box<dyn std::error::Error>> {
-    if parsed.params.contains_key("routes") {
-        let (pools, pool_tokens) =
-            collect_bootstrap_pool_metadata(&parsed.params, allowed_protocols)?;
-        if !pools.is_empty() {
-            parsed.params.insert(
-                "pools".to_string(),
-                Value::Sequence(
-                    pools
-                        .into_iter()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        if !pool_tokens.is_empty() {
-            parsed.params.insert(
-                "pool_tokens".to_string(),
-                Value::Sequence(
-                    pool_tokens
-                        .into_iter()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        parsed.params.remove("routes");
-    }
-
-    let bootstrap_block = parsed
-        .params
-        .get("bootstrap_block")
-        .map(parse_i64_yaml_value)
-        .transpose()?;
-
-    let start_block = match (parsed.start_block, bootstrap_block) {
-        (Some(start_block), Some(bootstrap_block)) => {
-            if start_block != bootstrap_block {
-                return Err(format!(
-                    "`start_block` ({start_block}) must match `params.bootstrap_block` \
-                     ({bootstrap_block})"
-                )
-                .into());
-            }
-            start_block
-        }
-        (Some(start_block), None) => {
-            parsed.params.insert(
-                "bootstrap_block".to_string(),
-                Value::Number(serde_yaml::Number::from(start_block)),
-            );
-            start_block
-        }
-        (None, Some(bootstrap_block)) => bootstrap_block,
-        (None, None) => return Ok((None, parsed.params)),
-    };
-
-    Ok((Some(start_block), parsed.params))
-}
-
-fn parse_substreams_params_file(
-    allowed_protocols: Option<&HashSet<String>>,
-    path: &Path,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    let parsed = load_substreams_params_file(path, &mut HashSet::new())?;
-    let (start_block, params) = normalize_substreams_params(allowed_protocols, parsed)?;
-    let mut substreams_params = Vec::with_capacity(params.len());
-
-    for (key, value) in params {
-        let rendered_value = render_substreams_param_value(&value)?;
-        substreams_params.push(format!("{key}={rendered_value}"));
-    }
-
-    Ok((start_block, substreams_params.join("&")))
-}
-
-fn parse_bootstrap_params_file(
-    allowed_protocols: Option<&HashSet<String>>,
-    path: &Path,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    let parsed = load_bootstrap_params_file(path, &mut HashSet::new())?;
-    let bootstrap_block = match (parsed.start_block, parsed.params.bootstrap_block) {
-        (Some(start_block), Some(bootstrap_block)) => {
-            if start_block != bootstrap_block {
-                return Err(format!(
-                    "`start_block` ({start_block}) must match `params.bootstrap_block` \
-                     ({bootstrap_block})"
-                )
-                .into());
-            }
-            start_block
-        }
-        (Some(start_block), None) => start_block,
-        (None, Some(bootstrap_block)) => bootstrap_block,
-        (None, None) => {
-            return Err(
-                "bootstrap config is missing `start_block` or `params.bootstrap_block`".into()
-            )
-        }
-    };
-
-    let all_pools = collect_bootstrap_pools(&parsed.params, allowed_protocols)?;
-
-    if all_pools.is_empty() {
-        return Err("bootstrap config is missing `params.pools` or `params.routes`".into());
-    }
-
-    Ok((
-        Some(bootstrap_block),
-        format!("bootstrap_block={bootstrap_block}&pools={}", all_pools.join(",")),
-    ))
-}
-
-fn load_substreams_params_file(
-    path: &Path,
-    visited: &mut HashSet<PathBuf>,
-) -> Result<SubstreamsParamsFile, Box<dyn std::error::Error>> {
-    let resolved_path = canonicalize_for_include_tracking(path)?;
-    if !visited.insert(resolved_path.clone()) {
-        return Err(format!(
-            "cyclic substreams config include detected at `{}`",
-            resolved_path.display()
-        )
-        .into());
-    }
-
-    let contents = fs::read_to_string(&resolved_path)?;
-    let parsed: SubstreamsParamsFile = serde_yaml::from_str(&contents)?;
-    let base_dir = resolved_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let mut merged =
-        SubstreamsParamsFile { start_block: None, includes: vec![], params: BTreeMap::new() };
-
-    for include in &parsed.includes {
-        let included =
-            load_substreams_params_file(&base_dir.join(normalize_include_path(include)), visited)?;
-        merge_substreams_params_file(&mut merged, included)?;
-    }
-
-    merge_substreams_params_file(
-        &mut merged,
-        SubstreamsParamsFile {
-            start_block: parsed.start_block,
-            includes: vec![],
-            params: parsed.params,
-        },
-    )?;
-
-    visited.remove(&resolved_path);
-    Ok(merged)
-}
-
-fn load_bootstrap_params_file(
-    path: &Path,
-    visited: &mut HashSet<PathBuf>,
-) -> Result<BootstrapParamsFile, Box<dyn std::error::Error>> {
-    let resolved_path = canonicalize_for_include_tracking(path)?;
-    if !visited.insert(resolved_path.clone()) {
-        return Err(format!(
-            "cyclic bootstrap config include detected at `{}`",
-            resolved_path.display()
-        )
-        .into());
-    }
-
-    let contents = fs::read_to_string(&resolved_path)?;
-    let parsed: BootstrapParamsFile = serde_yaml::from_str(&contents)?;
-    let base_dir = resolved_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let mut merged = BootstrapParamsFile {
-        start_block: None,
-        includes: vec![],
-        params: BootstrapParamsYaml::default(),
-    };
-
-    for include in &parsed.includes {
-        let included =
-            load_bootstrap_params_file(&base_dir.join(normalize_include_path(include)), visited)?;
-        merge_bootstrap_params_file(&mut merged, included)?;
-    }
-
-    merge_bootstrap_params_file(
-        &mut merged,
-        BootstrapParamsFile {
-            start_block: parsed.start_block,
-            includes: vec![],
-            params: parsed.params,
-        },
-    )?;
-
-    visited.remove(&resolved_path);
-    Ok(merged)
-}
-
-fn merge_substreams_params_file(
-    target: &mut SubstreamsParamsFile,
-    incoming: SubstreamsParamsFile,
-) -> Result<(), Box<dyn std::error::Error>> {
-    target.start_block = merge_optional_i64(
-        target.start_block,
-        incoming.start_block,
-        "substreams config start_block",
-    )?;
-
-    for (key, incoming_value) in incoming.params {
-        if let Some(existing_value) = target.params.get_mut(&key) {
-            merge_substreams_param_value(existing_value, incoming_value, &key)?;
-        } else {
-            target
-                .params
-                .insert(key, incoming_value);
-        }
-    }
-
-    Ok(())
-}
-
-fn merge_bootstrap_params_file(
-    target: &mut BootstrapParamsFile,
-    incoming: BootstrapParamsFile,
-) -> Result<(), Box<dyn std::error::Error>> {
-    target.start_block = merge_optional_i64(
-        target.start_block,
-        incoming.start_block,
-        "bootstrap config start_block",
-    )?;
-    target.params.bootstrap_block = merge_optional_i64(
-        target.params.bootstrap_block,
-        incoming.params.bootstrap_block,
-        "bootstrap config params.bootstrap_block",
-    )?;
-    target
-        .params
-        .pools
-        .extend(incoming.params.pools);
-    target
-        .params
-        .routes
-        .extend(incoming.params.routes);
-    Ok(())
-}
-
-fn merge_substreams_param_value(
-    existing: &mut Value,
-    incoming: Value,
-    key: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match (&mut *existing, incoming) {
-        (Value::Sequence(existing_items), Value::Sequence(incoming_items)) => {
-            existing_items.extend(incoming_items);
-            Ok(())
-        }
-        (existing_value, incoming_value) if *existing_value == incoming_value => Ok(()),
-        _ => Err(format!("conflicting substreams param values for key `{key}`").into()),
-    }
-}
-
-fn merge_optional_i64(
-    existing: Option<i64>,
-    incoming: Option<i64>,
-    context: &str,
-) -> Result<Option<i64>, Box<dyn std::error::Error>> {
-    match (existing, incoming) {
-        (Some(existing), Some(incoming)) if existing != incoming => {
-            Err(format!("conflicting values for {context}: {existing} vs {incoming}").into())
-        }
-        (Some(existing), _) => Ok(Some(existing)),
-        (None, Some(incoming)) => Ok(Some(incoming)),
-        (None, None) => Ok(None),
-    }
-}
-
-fn normalize_include_path(include: &str) -> &str {
-    include
-        .strip_prefix('@')
-        .unwrap_or(include)
-}
-
-fn canonicalize_for_include_tracking(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    path.canonicalize()
-        .map_err(|err| format!("failed to resolve config path `{}`: {err}", path.display()).into())
 }
 
 fn load_raw_extractor_configs(
@@ -1318,6 +1110,32 @@ fn merge_raw_family_member_defaults(
     Ok(())
 }
 
+fn merge_optional_i64(
+    existing: Option<i64>,
+    incoming: Option<i64>,
+    context: &str,
+) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) if existing != incoming => {
+            Err(format!("conflicting values for {context}: {existing} vs {incoming}").into())
+        }
+        (Some(existing), _) => Ok(Some(existing)),
+        (None, Some(incoming)) => Ok(Some(incoming)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn normalize_include_path(include: &str) -> &str {
+    include
+        .strip_prefix('@')
+        .unwrap_or(include)
+}
+
+fn canonicalize_for_include_tracking(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    path.canonicalize()
+        .map_err(|err| format!("failed to resolve config path `{}`: {err}", path.display()).into())
+}
+
 fn merge_optional_string(
     existing: Option<String>,
     incoming: Option<String>,
@@ -1343,126 +1161,6 @@ fn merge_required_string(
     } else {
         Err(format!("conflicting values for {context}: `{existing}` vs `{incoming}`").into())
     }
-}
-
-fn render_substreams_param_value(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
-    match value {
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
-        Value::String(value) => Ok(value.clone()),
-        Value::Sequence(values) => values
-            .iter()
-            .map(render_substreams_scalar_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|values| values.join(",")),
-        Value::Null => Err("null is not a supported substreams param value".into()),
-        Value::Mapping(_) | Value::Tagged(_) => {
-            Err("nested YAML objects are not supported in substreams params".into())
-        }
-    }
-}
-
-fn render_substreams_scalar_value(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
-    match value {
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
-        Value::String(value) => Ok(value.clone()),
-        Value::Null => Err("null is not a supported substreams param list item".into()),
-        Value::Sequence(_) | Value::Mapping(_) | Value::Tagged(_) => {
-            Err("substreams param lists may only contain scalar values".into())
-        }
-    }
-}
-
-fn collect_bootstrap_pool_metadata(
-    params: &BTreeMap<String, Value>,
-    allowed_protocols: Option<&HashSet<String>>,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
-    let all_pools = collect_bootstrap_pools_from_parts(
-        params
-            .get("pools")
-            .map(parse_string_sequence_yaml_value)
-            .transpose()?
-            .unwrap_or_default(),
-        params
-            .get("routes")
-            .cloned()
-            .unwrap_or(Value::Sequence(vec![])),
-        allowed_protocols,
-    )?;
-
-    let routes = params
-        .get("routes")
-        .cloned()
-        .unwrap_or(Value::Sequence(vec![]));
-    let routes: Vec<BootstrapRouteYaml> = serde_yaml::from_value(routes)?;
-
-    let mut pool_tokens = Vec::new();
-    let mut seen_pool_tokens = HashSet::new();
-
-    for route in routes {
-        for router in route.routers {
-            if !router_matches_allowed_protocols(router.protocol.as_str(), allowed_protocols) {
-                continue;
-            }
-
-            let pool_token = format!("{}:{}:{}", router.pool, route.token0, route.token1);
-            if seen_pool_tokens.insert(pool_token.clone()) {
-                pool_tokens.push(pool_token);
-            }
-        }
-    }
-
-    Ok((all_pools, pool_tokens))
-}
-
-fn collect_bootstrap_pools(
-    params: &BootstrapParamsYaml,
-    allowed_protocols: Option<&HashSet<String>>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    collect_bootstrap_pools_from_parts(
-        params.pools.clone(),
-        serde_yaml::to_value(&params.routes)?,
-        allowed_protocols,
-    )
-}
-
-fn collect_bootstrap_pools_from_parts(
-    pools: Vec<String>,
-    routes: Value,
-    allowed_protocols: Option<&HashSet<String>>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let routes: Vec<BootstrapRouteYaml> = serde_yaml::from_value(routes)?;
-
-    let mut seen_pools = HashSet::new();
-    let mut all_pools = Vec::new();
-
-    for pool in pools {
-        if seen_pools.insert(pool.clone()) {
-            all_pools.push(pool);
-        }
-    }
-
-    for route in routes {
-        for router in route.routers {
-            let BootstrapRouterYaml { pool, protocol } = router;
-            if !router_matches_allowed_protocols(protocol.as_str(), allowed_protocols) {
-                continue;
-            }
-            if seen_pools.insert(pool.clone()) {
-                all_pools.push(pool);
-            }
-        }
-    }
-
-    Ok(all_pools)
-}
-
-fn protocol_filter_for_protocol_system(
-    protocol_system: &str,
-    registry: FamilyRuntimeRegistry<'_>,
-) -> Option<HashSet<String>> {
-    registry.normalized_shared_route_protocol_filter_for_protocol_system(protocol_system)
 }
 
 fn effective_protocol_filter_for_protocol_system(
@@ -1493,7 +1191,7 @@ fn normalized_shared_route_protocol_filter_for_member_defaults(
             .shared_route_protocols
             .iter()
             .map(|protocol| {
-                tycho_indexer::extractor::family_runtime::canonicalize_shared_route_protocol(
+                canonicalize_shared_route_protocol(
                     protocol,
                 )
             })
@@ -1501,95 +1199,29 @@ fn normalized_shared_route_protocol_filter_for_member_defaults(
     )
 }
 
-fn render_allowed_protocols_label(allowed_protocols: Option<&HashSet<String>>) -> String {
-    let Some(allowed_protocols) = allowed_protocols else {
-        return "<unfiltered>".to_string();
-    };
-
-    let mut labels = allowed_protocols
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    labels.sort();
-    labels.join(",")
-}
-
-fn router_matches_allowed_protocols(
-    router_protocol: &str,
-    allowed_protocols: Option<&HashSet<String>>,
-) -> bool {
-    let Some(allowed_protocols) = allowed_protocols else {
-        return true;
-    };
-
-    allowed_protocols.contains(
-        &tycho_indexer::extractor::family_runtime::canonicalize_shared_route_protocol(
-            router_protocol,
-        ),
-    )
-}
-
-fn parse_i64_yaml_value(value: &Value) -> Result<i64, Box<dyn std::error::Error>> {
-    match value {
-        Value::Number(value) => value
-            .as_i64()
-            .ok_or_else(|| "numeric YAML value does not fit into i64".into()),
-        Value::String(value) => Ok(value.parse()?),
-        Value::Bool(_)
-        | Value::Null
-        | Value::Sequence(_)
-        | Value::Mapping(_)
-        | Value::Tagged(_) => Err("block parameters must be scalar integers".into()),
-    }
-}
-
-fn parse_string_sequence_yaml_value(
-    value: &Value,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    match value {
-        Value::Sequence(values) => values
-            .iter()
-            .map(|value| match value {
-                Value::String(value) => Ok(value.clone()),
-                _ => Err("pool parameters must be string values".into()),
-            })
-            .collect(),
-        _ => Err("pool parameters must be a list of strings".into()),
-    }
-}
-
-fn extract_bootstrap_block_from_query(params: &str) -> Result<i64, Box<dyn std::error::Error>> {
-    for pair in params
-        .split('&')
-        .filter(|part| !part.is_empty())
-    {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err(format!("invalid bootstrap param `{pair}`").into());
-        };
-
-        if key == "bootstrap_block" {
-            return Ok(value.parse()?);
-        }
-    }
-
-    Err("bootstrap params must include `bootstrap_block`".into())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, process};
 
     use super::*;
+    use crate::testing::{
+        family_runtime_config_for_tests, swap_extractor_config_for_tests,
+        write_temp_substreams_package_for_tests,
+    };
+    use mockito::Server;
     use tycho_common::models::FinancialType;
     use tycho_ethereum::rpc::EthereumRpcClient;
-    use tycho_indexer::extractor::family_registry::shared_family_runtime_spec;
-    use tycho_indexer::extractor::family_runtime::{
-        FamilyMemberSpec, FamilyRuntimeSpec, SharedBootstrapMemberRuntime,
-        SharedBootstrapParamsParser,
+    use tycho_indexer::extractor::family_bootstrap_registry::{
+        SharedBootstrapMemberRuntime, SharedBootstrapParamsParser,
+    };
+    use tycho_indexer::extractor::family_registry::{
+        default_family_runtime_registry, shared_family_runtime_spec, FamilyMemberSpec,
+        FamilyRuntimeRegistry, FamilyRuntimeSpec,
     };
     use tycho_indexer::extractor::models::BlockChanges;
     use tycho_indexer::extractor::shared_bootstrap::BootstrapBranchDescriptor;
     use tycho_indexer::extractor::ExtractionError;
+    use tycho_storage::postgres::testing::run_against_db;
 
     fn future_materialize_branch<'a>(
         _: &'a EthereumRpcClient,
@@ -1611,14 +1243,14 @@ mod tests {
     }
 
     fn test_uniswap_shared_module() -> &'static str {
-        tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+        default_family_runtime_registry()
             .shared_runtime_metadata_for_family("uniswap")
             .map(|metadata| metadata.output_module)
             .expect("registered uniswap output module")
     }
 
     fn test_uniswap_durability_scope() -> &'static str {
-        tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+        default_family_runtime_registry()
             .shared_runtime_metadata_for_family("uniswap")
             .map(|metadata| metadata.durability_scope)
             .expect("registered uniswap durability scope")
@@ -2031,6 +1663,78 @@ extractors:
     }
 
     #[test]
+    fn resolved_indexer_runtime_plan_keeps_service_and_runtime_views_in_sync() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2_alias".to_string(),
+                ExtractorConfig::new(
+                    "uniswap_v2_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![],
+                    "protocols/substreams/test-v2.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    Some(DCIType::RPC),
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("uniswap_v2"),
+            ),
+            (
+                "curve_alias".to_string(),
+                ExtractorConfig::new(
+                    "curve_alias".to_string(),
+                    Chain::Ethereum,
+                    ImplementationType::Vm,
+                    10,
+                    42,
+                    None,
+                    vec![],
+                    "protocols/substreams/test-curve.spkg".to_string(),
+                    "map_events".to_string(),
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .with_protocol_system("curve"),
+            ),
+        ]);
+        let extractors_config = ExtractorConfigs::new(extractors);
+
+        let runtime_plan = extractors_config
+            .resolved_indexer_runtime_plan()
+            .expect("resolved runtime plan");
+
+        assert_eq!(
+            runtime_plan
+                .service_config()
+                .protocol_systems(),
+            &["curve".to_string(), "uniswap_v2".to_string()]
+        );
+        assert_eq!(
+            runtime_plan
+                .service_config()
+                .dci_protocol_systems(),
+            &["uniswap_v2".to_string()]
+        );
+        assert_eq!(
+            runtime_plan
+                .into_runtime_targets()
+                .protocol_systems(),
+            vec!["curve".to_string(), "uniswap_v2".to_string()]
+        );
+    }
+
+    #[test]
     fn resolved_service_launch_config_formats_server_url() {
         let launch_config = ResolvedServiceLaunchConfig::new_for_tests(
             "test-api-key",
@@ -2041,6 +1745,199 @@ extractors:
         );
 
         assert_eq!(launch_config.server_url(), "http://127.0.0.1:4242");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_indexing_tasks_builds_one_extraction_task_for_uniswap_family_runtime() {
+        let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:mypassword@localhost:5431/tycho_indexer_0".to_string()
+        });
+        std::env::set_var("DATABASE_URL", &db_url);
+
+        run_against_db(|_| async move {
+            let mut rpc_server = Server::new_async().await;
+            let _block_number_mock = rpc_server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"jsonrpc":"2.0","id":0,"result":"0x1"}"#)
+                .create_async()
+                .await;
+
+            let chain = Chain::Ethereum;
+            let shared_spkg_path =
+                write_temp_substreams_package_for_tests("config-start-indexing-tasks-family");
+
+            let extractors = HashMap::from([
+                (
+                    "uniswap_v2".to_string(),
+                    swap_extractor_config_for_tests(
+                        "uniswap_v2",
+                        "uniswap_v2",
+                        chain,
+                        ImplementationType::Custom,
+                        42,
+                        "uniswap_v2_pool",
+                        "/tmp/uniswap-v2-member-only.spkg",
+                        "v2_map_pool_events",
+                        Some(family_runtime_config_for_tests("uniswap", shared_spkg_path.clone())),
+                    ),
+                ),
+                (
+                    "uniswap_v3".to_string(),
+                    swap_extractor_config_for_tests(
+                        "uniswap_v3",
+                        "uniswap_v3",
+                        chain,
+                        ImplementationType::Custom,
+                        42,
+                        "uniswap_v3_pool",
+                        "/tmp/uniswap-v3-member-only.spkg",
+                        "v3_map_protocol_changes",
+                        Some(family_runtime_config_for_tests("uniswap", shared_spkg_path.clone())),
+                    ),
+                ),
+            ]);
+            let extractors_config = ExtractorConfigs::new(extractors);
+            let runtime_targets = extractors_config
+                .resolved_runtime_targets()
+                .expect("resolved runtime targets");
+            let service_config =
+                ResolvedIndexerServiceConfig::from_runtime_targets(&runtime_targets);
+            let launch_config = ResolvedServiceLaunchConfig::new_for_tests(
+                "test-api-key",
+                "v1",
+                "127.0.0.1",
+                0,
+                PlansConfig::default(),
+            );
+            let rpc_client =
+                EthereumRpcClient::new(&rpc_server.url()).expect("create mock RPC client");
+
+            let managed_indexer = launch_config
+                .start_indexing_tasks(
+                    &service_config,
+                    runtime_targets,
+                    rpc_client,
+                    ResolvedIndexerTaskContext {
+                        database_url: &db_url,
+                        chains: &[chain],
+                        retention_horizon: chrono::Utc::now().naive_utc(),
+                        endpoint_url: "http://127.0.0.1:1",
+                        s3_bucket: None,
+                        substreams_api_token: "",
+                        database_insert_batch_size: 1000,
+                        settlement_contract: alloy::primitives::Address::ZERO,
+                        extraction_runtime: None,
+                        partial_blocks: false,
+                        family_runtime_registry:
+                            default_family_runtime_registry(),
+                    },
+                )
+                .await
+                .expect("start indexing tasks");
+
+            assert_eq!(managed_indexer.extraction_tasks.len(), 1);
+            assert_eq!(managed_indexer.service_tasks.len(), 2);
+
+            managed_indexer.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_indexing_runtime_plan_builds_one_extraction_task_for_uniswap_family_runtime() {
+        let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:mypassword@localhost:5431/tycho_indexer_0".to_string()
+        });
+        std::env::set_var("DATABASE_URL", &db_url);
+
+        run_against_db(|_| async move {
+            let mut rpc_server = Server::new_async().await;
+            let _block_number_mock = rpc_server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"jsonrpc":"2.0","id":0,"result":"0x1"}"#)
+                .create_async()
+                .await;
+
+            let chain = Chain::Ethereum;
+            let shared_spkg_path =
+                write_temp_substreams_package_for_tests("config-start-indexing-runtime-plan-family");
+
+            let extractors = HashMap::from([
+                (
+                    "uniswap_v2".to_string(),
+                    swap_extractor_config_for_tests(
+                        "uniswap_v2",
+                        "uniswap_v2",
+                        chain,
+                        ImplementationType::Custom,
+                        42,
+                        "uniswap_v2_pool",
+                        "/tmp/uniswap-v2-member-only.spkg",
+                        "v2_map_pool_events",
+                        Some(family_runtime_config_for_tests("uniswap", shared_spkg_path.clone())),
+                    ),
+                ),
+                (
+                    "uniswap_v3".to_string(),
+                    swap_extractor_config_for_tests(
+                        "uniswap_v3",
+                        "uniswap_v3",
+                        chain,
+                        ImplementationType::Custom,
+                        42,
+                        "uniswap_v3_pool",
+                        "/tmp/uniswap-v3-member-only.spkg",
+                        "v3_map_protocol_changes",
+                        Some(family_runtime_config_for_tests("uniswap", shared_spkg_path.clone())),
+                    ),
+                ),
+            ]);
+            let extractors_config = ExtractorConfigs::new(extractors);
+            let runtime_plan = extractors_config
+                .resolved_indexer_runtime_plan()
+                .expect("resolved runtime plan");
+            let family_runtime_registry = runtime_plan.family_runtime_registry();
+            let launch_config = ResolvedServiceLaunchConfig::new_for_tests(
+                "test-api-key",
+                "v1",
+                "127.0.0.1",
+                0,
+                PlansConfig::default(),
+            );
+            let rpc_client =
+                EthereumRpcClient::new(&rpc_server.url()).expect("create mock RPC client");
+
+            let managed_indexer = launch_config
+                .start_indexing_runtime_plan(
+                    runtime_plan,
+                    rpc_client,
+                    ResolvedIndexerTaskContext {
+                        database_url: &db_url,
+                        chains: &[chain],
+                        retention_horizon: chrono::Utc::now().naive_utc(),
+                        endpoint_url: "http://127.0.0.1:1",
+                        s3_bucket: None,
+                        substreams_api_token: "",
+                        database_insert_batch_size: 1000,
+                        settlement_contract: alloy::primitives::Address::ZERO,
+                        extraction_runtime: None,
+                        partial_blocks: false,
+                        family_runtime_registry,
+                    },
+                )
+                .await
+                .expect("start indexing runtime plan");
+
+            assert_eq!(managed_indexer.extraction_tasks.len(), 1);
+            assert_eq!(managed_indexer.service_tasks.len(), 2);
+
+            managed_indexer.shutdown().await;
+        })
+        .await;
     }
 
     #[test]
@@ -2073,7 +1970,7 @@ extractors:
                             .to_string(),
                     ),
                     shared_module: Some(
-                        tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+                        default_family_runtime_registry()
                             .output_module_for_family("uniswap")
                             .expect("registered uniswap output module")
                             .to_string(),
@@ -2108,7 +2005,7 @@ extractors:
                             .to_string(),
                     ),
                     shared_module: Some(
-                        tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+                        default_family_runtime_registry()
                             .output_module_for_family("uniswap")
                             .expect("registered uniswap output module")
                             .to_string(),
@@ -2533,7 +2430,7 @@ includes:
         )
         .expect("write shared include");
 
-        let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
+        let registry = default_family_runtime_registry();
         let v2_allowed = protocol_filter_for_protocol_system("uniswap_v2", registry);
         let (v2_start_block, v2_params) =
             parse_bootstrap_params_file(v2_allowed.as_ref(), &temp_root.join("config/shared.yaml"))
@@ -2585,7 +2482,7 @@ params:
         )
         .expect("write v2 overlay");
 
-        let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
+        let registry = default_family_runtime_registry();
         let allowed = protocol_filter_for_protocol_system("uniswap_v2", registry);
         let (start_block, params) = parse_substreams_params_file(
             allowed.as_ref(),
@@ -2605,7 +2502,7 @@ params:
     #[test]
     fn bootstrap_config_supports_route_format() {
         let (start_block, params) = parse_bootstrap_params_yaml(
-            "test_protocol",
+            Some("test_protocol"),
             r#"
 start_block: 25377208
 params:
@@ -2688,10 +2585,10 @@ params:
           protocol: uniswap_v3
 "#;
 
-        let (_, v2_params) =
-            parse_bootstrap_params_yaml("uniswap_v2", contents).expect("v2 bootstrap should parse");
-        let (_, v3_params) =
-            parse_bootstrap_params_yaml("uniswap_v3", contents).expect("v3 bootstrap should parse");
+        let (_, v2_params) = parse_bootstrap_params_yaml(Some("uniswap_v2"), contents)
+            .expect("v2 bootstrap should parse");
+        let (_, v3_params) = parse_bootstrap_params_yaml(Some("uniswap_v3"), contents)
+            .expect("v3 bootstrap should parse");
 
         assert_eq!(
             v2_params,
@@ -3091,7 +2988,7 @@ params:
             .expect("parse v2 bootstrap config")
             .0
             .expect("v2 bootstrap start_block present");
-        let v3_start_block = parse_bootstrap_params_yaml("uniswap_v3", &v3_bootstrap)
+        let v3_start_block = parse_bootstrap_params_yaml(Some("uniswap_v3"), &v3_bootstrap)
             .expect("parse v3 bootstrap config")
             .0
             .expect("v3 bootstrap start_block present");
@@ -3115,11 +3012,11 @@ params:
         )
         .expect("load standard combined extractors config");
 
-        let combined_plan = tycho_indexer::extractor::family_runtime::build_family_runtime_plan(
+        let combined_plan = build_family_runtime_plan(
             &combined_config.extractors,
         )
         .expect("combined config should build a family runtime plan");
-        let standard_plan = tycho_indexer::extractor::family_runtime::build_family_runtime_plan(
+        let standard_plan = build_family_runtime_plan(
             &standard_config.extractors,
         )
         .expect("standard config should build a runtime plan");
@@ -3141,7 +3038,7 @@ params:
             .contains("ethereum-uniswap-v2-v3-combined"));
         assert_eq!(
             combined_plan.families[0].output_module(),
-            tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+            default_family_runtime_registry()
                 .output_module_for_family("uniswap")
                 .expect("registered uniswap output module")
         );
@@ -3149,12 +3046,9 @@ params:
             .standalone_protocol_systems
             .is_empty());
         assert_eq!(combined_targets.len(), 1);
-        let tycho_indexer::extractor::family_runtime::ResolvedRuntimeTarget::Family(
-            combined_family,
-        ) = &combined_targets.as_slice()[0]
-        else {
-            panic!("combined config should resolve to one shared family runtime target");
-        };
+        let combined_family = combined_targets.as_slice()[0]
+            .family()
+            .expect("combined config should resolve to one shared family runtime target");
         assert_eq!(combined_family.family.family_name, "uniswap");
         assert_eq!(
             combined_family
@@ -3220,10 +3114,7 @@ params:
         assert_eq!(standard_targets.len(), 2);
         assert!(standard_targets
             .iter()
-            .all(|target| matches!(
-                target,
-                tycho_indexer::extractor::family_runtime::ResolvedRuntimeTarget::Standalone(_)
-            )));
+            .all(|target| target.standalone().is_some()));
     }
 
     #[test]
@@ -3344,7 +3235,7 @@ extractors:
         );
         assert_eq!(
             family_runtime.shared_module.as_deref(),
-            tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+            default_family_runtime_registry()
                 .output_module_for_family("uniswap")
         );
         assert_eq!(
@@ -3420,11 +3311,9 @@ extractors:
             .expect("aliased family members should resolve runtime targets");
 
         assert_eq!(resolved_targets.len(), 1);
-        let tycho_indexer::extractor::family_runtime::ResolvedRuntimeTarget::Family(family) =
-            &resolved_targets.as_slice()[0]
-        else {
-            panic!("aliased family members should collapse to one shared family target");
-        };
+        let family = resolved_targets.as_slice()[0]
+            .family()
+            .expect("aliased family members should collapse to one shared family target");
 
         assert_eq!(family.family.family_name, "uniswap");
         assert_eq!(
@@ -3449,7 +3338,7 @@ extractors:
         );
         assert_eq!(
             family.execution.shared_stream.module,
-            tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+            default_family_runtime_registry()
                 .output_module_for_family("uniswap")
                 .expect("registered uniswap output module")
         );
@@ -3487,7 +3376,7 @@ extractors:
                     shared_module: None,
                     durability_scope: None,
                 },
-                tycho_indexer::extractor::family_runtime::default_family_runtime_registry(),
+                default_family_runtime_registry(),
             )
             .expect("top-level defaults should resolve member runtime");
 
@@ -3497,7 +3386,7 @@ extractors:
         );
         assert_eq!(
             resolved.shared_module.as_deref(),
-            tycho_indexer::extractor::family_runtime::default_family_runtime_registry()
+            default_family_runtime_registry()
                 .output_module_for_family("uniswap")
         );
         assert_eq!(resolved.durability_scope.as_deref(), Some(test_uniswap_durability_scope()));
@@ -3558,7 +3447,7 @@ extractors:
         )
         .expect("load config");
         let plan =
-            tycho_indexer::extractor::family_runtime::build_family_runtime_plan(&config.extractors)
+            build_family_runtime_plan(&config.extractors)
                 .expect("build runtime plan");
 
         assert!(
@@ -3897,8 +3786,8 @@ extractors:
 
     #[test]
     fn extractor_config_inherits_family_member_substreams_params_from_top_level() {
-        let v2_substreams_config = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("config/uniswap_v2_substreams.yaml");
+        let v2_substreams_config =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("config/uniswap_v2_substreams.yaml");
         let config_path = std::env::temp_dir().join(format!(
             "tycho-indexer-family-member-substreams-{}-{}.yaml",
             std::process::id(),
@@ -4570,7 +4459,7 @@ extractors:
 
     #[test]
     fn protocol_filter_for_protocol_system_comes_from_family_registry() {
-        let registry = tycho_indexer::extractor::family_runtime::default_family_runtime_registry();
+        let registry = default_family_runtime_registry();
         assert_eq!(
             protocol_filter_for_protocol_system("uniswap_v2", registry),
             Some(HashSet::from(["uniswapv2".to_string()]))
@@ -4824,6 +4713,68 @@ extractors: {}
                 .params
                 .contains(unexpected_pool));
         }
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn resolved_indexer_runtime_plan_preserves_custom_family_registry_for_startup() {
+        const FUTURE_FAMILY_MEMBERS: &[FamilyMemberSpec] = &[
+            FamilyMemberSpec {
+                protocol_system: "future_v1",
+                shared_route_protocols: &["futurev1"],
+                shared_bootstrap: Some(SharedBootstrapMemberRuntime {
+                    strategy: BootstrapStrategy::UniswapV2Rpc,
+                    params_parser: SharedBootstrapParamsParser::PoolList,
+                    materialize_branch: future_materialize_branch,
+                }),
+            },
+            FamilyMemberSpec {
+                protocol_system: "future_v2",
+                shared_route_protocols: &["futurev2"],
+                shared_bootstrap: Some(SharedBootstrapMemberRuntime {
+                    strategy: BootstrapStrategy::UniswapV2Rpc,
+                    params_parser: SharedBootstrapParamsParser::PoolList,
+                    materialize_branch: future_materialize_branch,
+                }),
+            },
+        ];
+        const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
+            "future_swap",
+            FUTURE_FAMILY_MEMBERS,
+            "map_future_swap_family_protocol_changes",
+            "future_swap_family",
+            "family::future_swap_runtime",
+            None,
+        );
+
+        let registry = test_registry_with_future_family(FUTURE_FAMILY);
+        let temp_root = write_future_family_yaml_fixture_for_tests();
+        let config = ExtractorConfigs::from_yaml_with_registry(
+            temp_root
+                .join("extractors.yaml")
+                .to_str()
+                .expect("utf8 temp path"),
+            registry,
+        )
+        .expect("load future family config");
+
+        let runtime_plan = config
+            .resolved_indexer_runtime_plan_with_registry(registry)
+            .expect("build runtime plan with custom registry");
+
+        runtime_plan
+            .family_runtime_registry()
+            .require_family_spec("future_swap", "runtime plan startup registry")
+            .expect("runtime plan should preserve the custom family registry used for planning");
+
+        assert_eq!(
+            runtime_plan
+                .into_runtime_targets()
+                .protocol_systems(),
+            vec!["future_v1".to_string(), "future_v2".to_string()],
+            "resolved runtime targets should still reflect the future family members planned through the preserved registry"
+        );
 
         let _ = fs::remove_dir_all(temp_root);
     }

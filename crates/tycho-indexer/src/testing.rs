@@ -1,25 +1,43 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    process,
+};
 
 #[cfg(test)]
 use crate::config::ExtractorConfigs;
 #[cfg(test)]
+use crate::extractor::chain_state::ChainState;
+#[cfg(test)]
 use crate::extractor::family_registry::{
-    shared_bootstrap_member_runtime, shared_family_member_spec, shared_family_runtime_spec,
+    default_family_runtime_registry, shared_bootstrap_member_runtime, shared_family_member_spec,
+    shared_family_runtime_spec, FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec,
 };
 #[cfg(test)]
-use crate::extractor::family_runtime::{
-    default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec,
-    SharedBootstrapParamsParser,
-};
+use crate::extractor::family_bootstrap_registry::SharedBootstrapParamsParser;
 #[cfg(test)]
-use crate::extractor::family_runtime::FamilyRuntimeConfig;
+use crate::extractor::family_runtime_metadata::FamilyRuntimeConfig;
 #[cfg(test)]
 use crate::extractor::shared_bootstrap::BootstrapBranchDescriptor;
 #[cfg(test)]
-use crate::extractor::{models::BlockChanges, runner::BootstrapStrategy, ExtractionError};
+use crate::extractor::family_runtime_metadata::ResolvedSharedFamilyStream;
+#[cfg(test)]
+use crate::extractor::family_runtime_planning::{
+    detect_family_runtimes_with_registry, DetectedFamilyRuntime,
+};
+#[cfg(test)]
+use crate::extractor::startup::ResolvedRuntimeTargetsBuildContext;
+#[cfg(test)]
+use crate::extractor::runtime_target_planning::ResolvedRuntimeTarget;
+#[cfg(test)]
+use crate::extractor::{
+    control::ExtractorHandle, extractor_config::BootstrapStrategy, models::BlockChanges,
+    runner::ManagedRunner, ExtractionError,
+};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use mockall::mock;
+#[cfg(test)]
+use prost::Message;
 #[cfg(test)]
 use serde::Deserialize;
 #[cfg(test)]
@@ -48,6 +66,10 @@ use tycho_common::{
 };
 #[cfg(test)]
 use tycho_ethereum::rpc::EthereumRpcClient;
+#[cfg(test)]
+use tycho_ethereum::services::token_pre_processor::EthereumTokenPreProcessor;
+#[cfg(test)]
+use tycho_storage::postgres::cache::CachedGateway;
 
 mock! {
     pub Gateway {}
@@ -746,7 +768,7 @@ pub fn scripted_undo_response(
 
 #[cfg(test)]
 pub fn family_output_module_for_tests(family_name: &str) -> String {
-    crate::extractor::family_runtime::default_family_runtime_registry()
+    default_family_runtime_registry()
         .shared_runtime_metadata_for_family(family_name)
         .map(|metadata| metadata.output_module.to_string())
         .unwrap_or_else(|| format!("map_{family_name}_family_protocol_changes"))
@@ -754,7 +776,7 @@ pub fn family_output_module_for_tests(family_name: &str) -> String {
 
 #[cfg(test)]
 pub fn family_shared_stream_name_for_tests(family_name: &str) -> String {
-    crate::extractor::family_runtime::default_family_runtime_registry()
+    default_family_runtime_registry()
         .shared_runtime_metadata_for_family(family_name)
         .map(|metadata| metadata.shared_stream_name.to_string())
         .unwrap_or_else(|| format!("{family_name}_family"))
@@ -762,7 +784,7 @@ pub fn family_shared_stream_name_for_tests(family_name: &str) -> String {
 
 #[cfg(test)]
 pub fn family_durability_scope_for_tests(family_name: &str) -> String {
-    crate::extractor::family_runtime::default_family_runtime_registry()
+    default_family_runtime_registry()
         .shared_runtime_metadata_for_family(family_name)
         .map(|metadata| metadata.durability_scope.to_string())
         .unwrap_or_else(|| format!("family::{family_name}"))
@@ -770,7 +792,7 @@ pub fn family_durability_scope_for_tests(family_name: &str) -> String {
 
 #[cfg(test)]
 pub fn family_shared_extractor_id_for_tests(family_name: &str, chain: Chain) -> String {
-    crate::extractor::family_runtime::default_family_runtime_registry()
+    default_family_runtime_registry()
         .shared_stream_identity_for_family(chain, family_name)
         .map(|identity| identity.extractor_id)
         .unwrap_or_else(|| format!("{chain}:{}", family_shared_stream_name_for_tests(family_name)))
@@ -778,7 +800,7 @@ pub fn family_shared_extractor_id_for_tests(family_name: &str, chain: Chain) -> 
 
 #[cfg(test)]
 pub fn family_member_protocol_systems_for_tests(family_name: &str) -> Vec<String> {
-    crate::extractor::family_runtime::default_family_runtime_registry()
+    default_family_runtime_registry()
         .member_protocol_systems_for_family(family_name)
         .unwrap_or_else(|| {
             panic!(
@@ -796,8 +818,8 @@ pub fn family_detected_runtime_for_tests(
     family_name: &str,
     chain: Chain,
     shared_spkg: impl Into<String>,
-) -> crate::extractor::family_runtime::DetectedFamilyRuntime {
-    crate::extractor::family_runtime::default_family_runtime_registry()
+) -> DetectedFamilyRuntime {
+    default_family_runtime_registry()
         .detected_family_runtime(family_name, chain, shared_spkg)
         .unwrap_or_else(|_| {
             panic!("family `{family_name}` must resolve a detected runtime in the registry")
@@ -807,20 +829,16 @@ pub fn family_detected_runtime_for_tests(
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn family_detected_runtime_from_configs_for_tests(
-    extractor_configs: &[&crate::extractor::runner::ExtractorConfig],
+    extractor_configs: &[&crate::extractor::extractor_config::ExtractorConfig],
     shared_spkg: impl Into<String>,
-) -> crate::extractor::family_runtime::DetectedFamilyRuntime {
-    let registry = crate::extractor::family_runtime::default_family_runtime_registry();
+) -> DetectedFamilyRuntime {
+    let registry = default_family_runtime_registry();
     let shared_spkg = shared_spkg.into();
     let extractors = extractor_configs
         .iter()
         .map(|config| (config.protocol_system().to_string(), (*config).clone()))
         .collect::<HashMap<_, _>>();
-    let detected = crate::extractor::family_runtime::detect_family_runtimes_with_registry(
-        &extractors,
-        registry,
-    )
-    .unwrap_or_else(|err| {
+    let detected = detect_family_runtimes_with_registry(&extractors, registry).unwrap_or_else(|err| {
         panic!(
             "family test configs must resolve detected runtime through production detection: {err}"
         )
@@ -857,7 +875,7 @@ pub fn family_detected_runtime_from_configs_for_tests(
                 (cloned.protocol_system().to_string(), cloned)
             })
             .collect::<HashMap<_, _>>();
-        crate::extractor::family_runtime::detect_family_runtimes_with_registry(&enriched, registry)
+        detect_family_runtimes_with_registry(&enriched, registry)
             .unwrap_or_else(|err| {
                 panic!(
                     "family test configs must resolve detected runtime after shared-family enrichment: {err}"
@@ -884,7 +902,7 @@ pub fn family_detected_runtime_with_members_for_tests(
     chain: Chain,
     shared_spkg: impl Into<String>,
     member_protocol_systems: impl IntoIterator<Item = impl Into<String>>,
-) -> crate::extractor::family_runtime::DetectedFamilyRuntime {
+) -> DetectedFamilyRuntime {
     let mut family = family_detected_runtime_for_tests(family_name, chain, shared_spkg);
     family.member_protocol_systems = member_protocol_systems
         .into_iter()
@@ -899,7 +917,7 @@ pub fn family_resolved_shared_stream_for_tests(
     family_name: &str,
     chain: Chain,
     shared_spkg: impl Into<String>,
-) -> crate::extractor::family_runtime::ResolvedSharedFamilyStream {
+) -> ResolvedSharedFamilyStream {
     family_detected_runtime_for_tests(family_name, chain, shared_spkg).resolved_shared_stream()
 }
 
@@ -1171,6 +1189,187 @@ pub fn family_runtime_config_for_tests(
 }
 
 #[cfg(test)]
+pub fn uniswap_family_shared_module_for_tests() -> String {
+    family_shared_module_for_tests("uniswap")
+}
+
+#[cfg(test)]
+pub fn uniswap_family_runtime_config_for_tests(
+    shared_spkg: impl Into<String>,
+) -> FamilyRuntimeConfig {
+    family_runtime_config_for_tests("uniswap", shared_spkg)
+}
+
+#[cfg(test)]
+pub fn uniswap_family_protocol_systems_for_tests() -> Vec<String> {
+    family_member_protocol_systems_for_tests("uniswap")
+}
+
+#[cfg(test)]
+pub fn uniswap_family_durability_scope_for_tests() -> String {
+    family_durability_scope_for_tests("uniswap")
+}
+
+#[cfg(test)]
+pub fn write_uniswap_family_defaults_config_for_tests(
+    file_prefix: &str,
+    unique: &str,
+    shared_spkg_path: &str,
+    start_block: i64,
+    stop_block: Option<i64>,
+) -> std::path::PathBuf {
+    write_uniswap_family_defaults_config(
+        file_prefix,
+        unique,
+        shared_spkg_path,
+        start_block,
+        stop_block,
+    )
+}
+
+#[cfg(test)]
+pub fn write_uniswap_family_defaults_config_with_member_names_for_tests(
+    file_prefix: &str,
+    unique: &str,
+    shared_spkg_path: &str,
+    start_block: i64,
+    stop_block: Option<i64>,
+    v2_name: &str,
+    v3_name: &str,
+) -> std::path::PathBuf {
+    write_uniswap_family_defaults_config_with_member_names(
+        file_prefix,
+        unique,
+        shared_spkg_path,
+        start_block,
+        stop_block,
+        v2_name,
+        v3_name,
+    )
+}
+
+#[cfg(test)]
+pub fn unique_test_suffix() -> String {
+    format!(
+        "{}-{}",
+        process::id(),
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+    )
+}
+
+#[cfg(test)]
+pub fn write_temp_substreams_package_for_tests(label: &str) -> String {
+    let shared_spkg_path = std::env::temp_dir().join(format!(
+        "tycho-indexer-{label}-{}-{}.spkg",
+        process::id(),
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+    ));
+    std::fs::write(
+        &shared_spkg_path,
+        crate::pb::sf::substreams::v1::Package::default().encode_to_vec(),
+    )
+    .expect("write temp spkg");
+    shared_spkg_path
+        .to_str()
+        .expect("utf8 spkg path")
+        .to_string()
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct BuildExtractorsTestContext<'a> {
+    pub chain_state: ChainState,
+    pub endpoint_url: &'a str,
+    pub s3_bucket: Option<&'a str>,
+    pub substreams_api_token: &'a str,
+    pub cached_gw: &'a CachedGateway,
+    pub database_insert_batch_size: usize,
+    pub token_pre_processor: &'a EthereumTokenPreProcessor,
+    pub rpc_client: &'a EthereumRpcClient,
+    pub runtime: Option<&'a tokio::runtime::Handle>,
+    pub partial_blocks: bool,
+    pub family_runtime_registry: FamilyRuntimeRegistry<'static>,
+}
+
+#[cfg(test)]
+impl<'a> BuildExtractorsTestContext<'a> {
+    pub(crate) fn runtime_targets_build_context<'b>(
+        &'b self,
+    ) -> ResolvedRuntimeTargetsBuildContext<'b> {
+        ResolvedRuntimeTargetsBuildContext::new(
+            self.chain_state,
+            self.endpoint_url,
+            self.s3_bucket,
+            self.substreams_api_token,
+            self.cached_gw,
+            self.database_insert_batch_size,
+            self.token_pre_processor,
+            self.rpc_client,
+            self.runtime.cloned(),
+            false,
+            self.partial_blocks,
+            self.family_runtime_registry,
+        )
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn build_all_extractors_for_tests(
+    config: &ExtractorConfigs,
+    context: BuildExtractorsTestContext<'_>,
+) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
+    let runtime_targets =
+        config.resolved_runtime_targets_with_registry(context.family_runtime_registry)?;
+
+    runtime_targets
+        .build_managed_runners(context.runtime_targets_build_context())
+        .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn swap_extractor_config_for_tests(
+    extractor_name: impl Into<String>,
+    protocol_system: impl Into<String>,
+    chain: Chain,
+    implementation_type: ImplementationType,
+    start_block: i64,
+    protocol_type_name: impl Into<String>,
+    spkg: impl Into<String>,
+    module_name: impl Into<String>,
+    family_runtime: Option<FamilyRuntimeConfig>,
+) -> crate::extractor::extractor_config::ExtractorConfig {
+    crate::extractor::extractor_config::ExtractorConfig::new(
+        extractor_name.into(),
+        chain,
+        implementation_type,
+        1,
+        start_block,
+        None,
+        vec![crate::extractor::extractor_config::ProtocolTypeConfig::new(
+            protocol_type_name.into(),
+            tycho_common::models::FinancialType::Swap,
+        )],
+        spkg.into(),
+        module_name.into(),
+        vec![],
+        0,
+        None,
+        None,
+        HashMap::new(),
+        None,
+    )
+    .with_protocol_system(protocol_system)
+    .with_family_runtime(family_runtime)
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct RecordSubstreamsFixtureMemberSpec<'a> {
     protocol_system: &'a str,
@@ -1257,10 +1456,7 @@ fn write_record_substreams_combined_family_fixture_inputs(
     let shared_module = registry
         .output_module_for_family(spec.family_name)
         .unwrap_or_else(|| {
-            panic!(
-                "expected registered family runtime output module for `{}`",
-                spec.family_name
-            )
+            panic!("expected registered family runtime output module for `{}`", spec.family_name)
         });
     let extractors_config = root.join(spec.extractors_file_name);
     std::fs::write(
@@ -1342,6 +1538,17 @@ params:
 pub fn write_record_substreams_future_family_fixture_inputs(
     shared_spkg_path: &std::path::Path,
 ) -> std::path::PathBuf {
+    write_record_substreams_future_family_fixture_inputs_with_registry(
+        shared_spkg_path,
+        future_family_runtime_registry_for_record_substreams_tests(),
+    )
+}
+
+#[cfg(test)]
+pub fn write_record_substreams_future_family_fixture_inputs_with_registry(
+    shared_spkg_path: &std::path::Path,
+    registry: FamilyRuntimeRegistry<'static>,
+) -> std::path::PathBuf {
     const MEMBERS: &[RecordSubstreamsFixtureMemberSpec<'_>] = &[
         RecordSubstreamsFixtureMemberSpec {
             protocol_system: "future_v1",
@@ -1391,7 +1598,7 @@ params:
 "#,
             members: MEMBERS,
         },
-        future_family_runtime_registry_for_record_substreams_tests(),
+        registry,
     )
 }
 
@@ -1470,6 +1677,47 @@ const FUTURE_FAMILY_RUNTIME_SPEC: FamilyRuntimeSpec = shared_family_runtime_spec
 pub fn future_family_runtime_registry_for_record_substreams_tests() -> FamilyRuntimeRegistry<'static>
 {
     FamilyRuntimeRegistry::new(&[FUTURE_FAMILY_RUNTIME_SPEC])
+}
+
+#[cfg(test)]
+pub fn future_family_runtime_registry_for_record_substreams_tests_with_durability_scope(
+    durability_scope: impl Into<String>,
+) -> FamilyRuntimeRegistry<'static> {
+    fn leak_str(value: String) -> &'static str {
+        Box::leak(value.into_boxed_str())
+    }
+
+    let leaked_scope = leak_str(durability_scope.into());
+    let members: &'static [FamilyMemberSpec] = Box::leak(Box::new([
+        shared_family_member_spec(
+            "future_v1",
+            &["futurev1"],
+            Some(shared_bootstrap_member_runtime(
+                BootstrapStrategy::UniswapV2Rpc,
+                SharedBootstrapParamsParser::PoolList,
+                future_family_branch_materializer,
+            )),
+        ),
+        shared_family_member_spec(
+            "future_v2",
+            &["futurev2"],
+            Some(shared_bootstrap_member_runtime(
+                BootstrapStrategy::UniswapV2Rpc,
+                SharedBootstrapParamsParser::PoolList,
+                future_family_branch_materializer,
+            )),
+        ),
+    ]));
+    let specs: &'static [FamilyRuntimeSpec] = Box::leak(Box::new([shared_family_runtime_spec(
+        "future_swap",
+        members,
+        "map_future_swap_family_protocol_changes",
+        "future_swap_family",
+        leaked_scope,
+        None,
+    )]));
+
+    FamilyRuntimeRegistry::new(specs)
 }
 
 #[cfg(test)]
@@ -1705,7 +1953,7 @@ pub fn shared_bootstrap_seed_universe_spec_from_config_path_with_registry_for_te
 
 #[cfg(test)]
 pub fn shared_bootstrap_seed_universe_spec_from_runtime_target_for_tests(
-    runtime_target: &crate::extractor::family_runtime::ResolvedRuntimeTarget<'_>,
+    runtime_target: &ResolvedRuntimeTarget<'_>,
     config_label: &str,
 ) -> SharedBootstrapSeedUniverseSpec {
     let mut seeds = Vec::new();
@@ -1760,7 +2008,7 @@ pub fn shared_bootstrap_seed_universe_spec_from_runtime_target_for_tests(
                     || bootstrap_params.contains("includes:")
                 {
                     Some(
-                        crate::config::parse_substreams_params_yaml(
+                        crate::extractor::shared_config::parse_substreams_params_yaml(
                             &protocol_system,
                             &bootstrap_params,
                         )
@@ -1820,16 +2068,15 @@ pub fn shared_bootstrap_seed_universe_spec_from_runtime_target_for_tests(
     seeds.sort_by(|left, right| {
         left.protocol_system
             .cmp(&right.protocol_system)
-            .then_with(|| left.component_id.cmp(&right.component_id))
+            .then_with(|| {
+                left.component_id
+                    .cmp(&right.component_id)
+            })
     });
     seeds.dedup_by(|left, right| {
         left.protocol_system == right.protocol_system && left.component_id == right.component_id
     });
-    SharedBootstrapSeedUniverseSpec {
-        chain: runtime_target.chain(),
-        protocol_types,
-        pools: seeds,
-    }
+    SharedBootstrapSeedUniverseSpec { chain: runtime_target.chain(), protocol_types, pools: seeds }
 }
 
 #[cfg(test)]
@@ -1871,8 +2118,9 @@ pub async fn seed_repo_runtime_target_shared_bootstrap_universe_for_tests(
         ChangeType,
     };
 
-    let seed_spec =
-        repo_unique_runtime_target_shared_bootstrap_seed_universe_spec_for_tests(extractors_file_name);
+    let seed_spec = repo_unique_runtime_target_shared_bootstrap_seed_universe_spec_for_tests(
+        extractors_file_name,
+    );
     let chain = seed_spec.chain;
 
     let seed_block = Block::new(
@@ -1965,7 +2213,9 @@ pub async fn seed_repo_runtime_target_shared_bootstrap_universe_for_tests(
         ));
     }
 
-    let tokens = tokens_by_address.into_values().collect::<Vec<_>>();
+    let tokens = tokens_by_address
+        .into_values()
+        .collect::<Vec<_>>();
     direct_gw
         .add_tokens(&tokens)
         .await
