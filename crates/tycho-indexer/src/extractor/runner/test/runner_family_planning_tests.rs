@@ -1,5 +1,4 @@
 use super::*;
-use crate::extractor::family_runtime_metadata::ResolvedSharedFamilyStream;
 
 #[test]
 fn test_resolved_family_execution_config_rejects_partial_shared_bootstrap_config() {
@@ -33,7 +32,10 @@ fn test_resolved_family_execution_config_rejects_partial_shared_bootstrap_config
         },
     ];
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let err = resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
+    let err = try_resolved_family_runtime_from_configs_for_tests(
+        &config_refs,
+        "/tmp/partial-shared-bootstrap.spkg",
+    )
         .expect_err("partial shared bootstrap config should fail");
 
     let err_text = err.to_string();
@@ -72,28 +74,31 @@ fn test_resolved_family_execution_config_derives_shared_branch_and_stream_settin
         ..Default::default()
     };
 
-    let execution = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-        .expect("family execution config derives");
-    let shared_stream = uniswap_shared_stream_for_tests("/tmp/shared-family.spkg");
-    let expected_shared_stream = ResolvedSharedFamilyStream {
-        spkg: "/tmp/shared-family.spkg".to_string(),
-        ..shared_stream
-    };
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&[&v2, &v3], "/tmp/shared-family.spkg");
+    let expected_shared_stream = uniswap_shared_stream_for_tests("/tmp/shared-family.spkg");
 
-    assert_eq!(execution.stop_block, 120);
-    assert_eq!(execution.configured_start_block, 0);
-    assert!(execution.bootstrap_plan.is_none());
-    assert_eq!(execution.shared_stream.module, expected_shared_stream.module);
-    assert_eq!(execution.shared_stream.extractor_id, expected_shared_stream.extractor_id);
-    assert_eq!(execution.shared_stream.durability_scope, expected_shared_stream.durability_scope);
+    assert_eq!(resolved_family.stop_block(), 120);
+    assert_eq!(resolved_family.configured_start_block(), 0);
+    assert!(resolved_family
+        .shared_bootstrap_plan()
+        .is_none());
+    assert_eq!(resolved_family.family.output_module(), expected_shared_stream.module);
+    assert_eq!(resolved_family.shared_extractor_id(), expected_shared_stream.extractor_id);
     assert_eq!(
-        FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
+        resolved_family
+            .family
+            .durability_scope(),
+        expected_shared_stream.durability_scope
+    );
+    assert_eq!(
+        FamilyBranchSpec::protocol_system_set(resolved_family.branch_specs().iter()),
         HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
     );
-    assert_eq!(execution.branch_specs.len(), 2);
+    assert_eq!(resolved_family.branch_specs().len(), 2);
     assert_eq!(
-        execution.merged_substreams_params,
-        HashMap::from([
+        resolved_family.merged_substreams_params(),
+        &HashMap::from([
             ("map_pool_events".to_string(), "factory=0x01".to_string()),
             ("map_events".to_string(), "factory=0x02".to_string()),
         ])
@@ -128,28 +133,31 @@ fn test_resolved_family_execution_config_uses_protocol_systems_for_aliased_membe
         ..Default::default()
     };
 
-    let execution = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-        .expect("aliased family execution config derives");
-    let shared_stream = uniswap_shared_stream_for_tests("/tmp/shared-family.spkg");
-    let expected_shared_stream = ResolvedSharedFamilyStream {
-        spkg: "/tmp/shared-family.spkg".to_string(),
-        ..shared_stream
-    };
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&[&v2, &v3], "/tmp/shared-family.spkg");
+    let expected_shared_stream = uniswap_shared_stream_for_tests("/tmp/shared-family.spkg");
 
-    assert_eq!(execution.stop_block, 120);
-    assert_eq!(execution.configured_start_block, 0);
-    assert!(execution.bootstrap_plan.is_none());
-    assert_eq!(execution.shared_stream.module, expected_shared_stream.module);
-    assert_eq!(execution.shared_stream.extractor_id, expected_shared_stream.extractor_id);
-    assert_eq!(execution.shared_stream.durability_scope, expected_shared_stream.durability_scope);
+    assert_eq!(resolved_family.stop_block(), 120);
+    assert_eq!(resolved_family.configured_start_block(), 0);
+    assert!(resolved_family
+        .shared_bootstrap_plan()
+        .is_none());
+    assert_eq!(resolved_family.family.output_module(), expected_shared_stream.module);
+    assert_eq!(resolved_family.shared_extractor_id(), expected_shared_stream.extractor_id);
     assert_eq!(
-        FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
+        resolved_family
+            .family
+            .durability_scope(),
+        expected_shared_stream.durability_scope
+    );
+    assert_eq!(
+        FamilyBranchSpec::protocol_system_set(resolved_family.branch_specs().iter()),
         HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
     );
-    assert_eq!(execution.branch_specs.len(), 2);
+    assert_eq!(resolved_family.branch_specs().len(), 2);
     assert_eq!(
-        execution.merged_substreams_params,
-        HashMap::from([
+        resolved_family.merged_substreams_params(),
+        &HashMap::from([
             ("map_pool_events".to_string(), "factory=0x01".to_string()),
             ("map_events".to_string(), "factory=0x02".to_string()),
         ])
@@ -187,19 +195,19 @@ fn test_resolved_family_execution_config_is_reused_from_resolved_family_runtime(
     let resolved_family =
         resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/uniswap-family.spkg");
 
-    let execution = &resolved_family.execution;
-
-    assert_eq!(execution.stop_block, 120);
-    assert_eq!(execution.configured_start_block, 0);
-    assert!(execution.bootstrap_plan.is_none());
+    assert_eq!(resolved_family.stop_block(), 120);
+    assert_eq!(resolved_family.configured_start_block(), 0);
+    assert!(resolved_family
+        .shared_bootstrap_plan()
+        .is_none());
     assert_eq!(
-        FamilyBranchSpec::protocol_system_set(execution.branch_specs.iter()),
+        FamilyBranchSpec::protocol_system_set(resolved_family.branch_specs().iter()),
         HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
     );
-    assert_eq!(execution.branch_specs.len(), 2);
+    assert_eq!(resolved_family.branch_specs().len(), 2);
     assert_eq!(
-        execution.merged_substreams_params,
-        HashMap::from([
+        resolved_family.merged_substreams_params(),
+        &HashMap::from([
             ("map_pool_events".to_string(), "factory=0x01".to_string()),
             ("map_events".to_string(), "factory=0x02".to_string()),
         ])
@@ -207,7 +215,7 @@ fn test_resolved_family_execution_config_is_reused_from_resolved_family_runtime(
 }
 
 #[test]
-fn test_resolved_family_execution_config_precomputes_shared_bootstrap_plan_and_start_block() {
+fn test_resolved_family_runtime_precomputes_shared_bootstrap_plan_and_start_block() {
     let v2 = ExtractorConfig {
         name: "uniswap_v2".to_owned(),
         protocol_system: "uniswap_v2".to_string(),
@@ -241,13 +249,12 @@ fn test_resolved_family_execution_config_precomputes_shared_bootstrap_plan_and_s
         ..Default::default()
     };
 
-    let execution = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
-        .expect("family execution config derives");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&[&v2, &v3], "/tmp/shared-family.spkg");
 
-    assert_eq!(execution.configured_start_block, 43);
-    let bootstrap_plan = execution
-        .bootstrap_plan
-        .as_ref()
+    assert_eq!(resolved_family.configured_start_block(), 43);
+    let bootstrap_plan = resolved_family
+        .shared_bootstrap_plan()
         .expect("shared bootstrap plan should be precomputed");
     assert_eq!(bootstrap_plan.bootstrap_block, 42);
     assert_eq!(bootstrap_plan.branches.len(), 2);
@@ -277,12 +284,15 @@ fn test_resolved_family_execution_config_rejects_conflicting_stop_blocks() {
         ..Default::default()
     };
 
-    let err = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
+    let err = try_resolved_family_runtime_from_configs_for_tests(
+        &[&v2, &v3],
+        "/tmp/conflicting-stop-blocks.spkg",
+    )
         .expect_err("conflicting stop blocks should fail");
 
     assert!(err
         .to_string()
-        .contains("family runner requires one shared stop_block"));
+        .contains("family `uniswap` requires one shared stop_block"));
 }
 
 #[test]
@@ -314,7 +324,10 @@ fn test_resolved_family_execution_config_rejects_conflicting_substreams_params()
         ..Default::default()
     };
 
-    let err = resolved_family_execution_config_from_extractor_configs_for_tests(&[&v2, &v3])
+    let err = try_resolved_family_runtime_from_configs_for_tests(
+        &[&v2, &v3],
+        "/tmp/conflicting-substreams-params.spkg",
+    )
         .expect_err("conflicting family params should fail");
 
     assert!(err
@@ -324,14 +337,16 @@ fn test_resolved_family_execution_config_rejects_conflicting_substreams_params()
 
 #[test]
 fn test_validate_family_progress_consistency_allows_all_resumed_or_all_fresh() {
-    validate_family_progress_consistency(
+    validate_shared_progress_consistency(
+        "family runner",
         &[("uniswap_v2".to_string(), 100), ("uniswap_v3".to_string(), 100)],
         &[],
         "before stream start",
     )
     .expect("all resumed should be allowed");
 
-    validate_family_progress_consistency(
+    validate_shared_progress_consistency(
+        "family runner",
         &[],
         &["uniswap_v2".to_string(), "uniswap_v3".to_string()],
         "before bootstrap",
@@ -341,7 +356,8 @@ fn test_validate_family_progress_consistency_allows_all_resumed_or_all_fresh() {
 
 #[test]
 fn test_validate_family_progress_consistency_rejects_mixed_progress() {
-    let err = validate_family_progress_consistency(
+    let err = validate_shared_progress_consistency(
+        "family runner",
         &[("uniswap_v2".to_string(), 100)],
         &["uniswap_v3".to_string()],
         "before stream start",
@@ -375,12 +391,12 @@ fn test_validate_family_runner_membership_accepts_exact_member_set() {
         )],
         ..Default::default()
     };
-    let family = family_detected_runtime_from_configs_for_tests(
+    let resolved_family = resolved_family_runtime_from_configs_for_tests(
         &[&v2, &v3],
         "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
     );
 
-    validate_family_runner_membership(&family, &[&v2, &v3])
+    validate_family_runner_membership(&resolved_family.family, &[&v2, &v3])
         .expect("exact family members should be accepted");
 }
 
@@ -416,18 +432,18 @@ fn test_validate_family_runner_membership_rejects_missing_or_extra_members() {
         )],
         ..Default::default()
     };
-    let family = family_detected_runtime_from_configs_for_tests(
+    let resolved_family = resolved_family_runtime_from_configs_for_tests(
         &[&only_v2, &v3],
         "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
     );
 
-    let missing_err = validate_family_runner_membership(&family, &[&only_v2])
+    let missing_err = validate_family_runner_membership(&resolved_family.family, &[&only_v2])
         .expect_err("missing member should fail");
     assert!(missing_err
         .to_string()
         .contains("requires exact member protocol systems"));
 
-    let extra_err = validate_family_runner_membership(&family, &[&only_v2, &curve])
+    let extra_err = validate_family_runner_membership(&resolved_family.family, &[&only_v2, &curve])
         .expect_err("extra non-family member should fail");
     assert!(extra_err
         .to_string()
@@ -436,11 +452,29 @@ fn test_validate_family_runner_membership_rejects_missing_or_extra_members() {
 
 #[test]
 fn test_validate_family_runner_membership_rejects_chain_mismatch() {
-    let family = family_detected_runtime_with_members_for_tests(
-        "uniswap",
-        Chain::Ethereum,
+    let eth_v2_seed = ExtractorConfig {
+        name: "eth_v2_seed".to_string(),
+        chain: Chain::Ethereum,
+        protocol_system: "uniswap_v2".to_string(),
+        protocol_types: vec![ProtocolTypeConfig::new(
+            "uniswap_v2_pool".to_string(),
+            FinancialType::Swap,
+        )],
+        ..Default::default()
+    };
+    let eth_v3_seed = ExtractorConfig {
+        name: "eth_v3_seed".to_string(),
+        chain: Chain::Ethereum,
+        protocol_system: "uniswap_v3".to_string(),
+        protocol_types: vec![ProtocolTypeConfig::new(
+            "uniswap_v3_pool".to_string(),
+            FinancialType::Swap,
+        )],
+        ..Default::default()
+    };
+    let resolved_family = resolved_family_runtime_from_configs_for_tests(
+        &[&eth_v2_seed, &eth_v3_seed],
         "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-        ["uniswap_v2"],
     );
     let base_v2 = ExtractorConfig {
         name: "base_v2".to_string(),
@@ -449,7 +483,7 @@ fn test_validate_family_runner_membership_rejects_chain_mismatch() {
         ..Default::default()
     };
 
-    let err = validate_family_runner_membership(&family, &[&base_v2])
+    let err = validate_family_runner_membership(&resolved_family.family, &[&base_v2])
         .expect_err("chain mismatch should fail");
     assert!(err
         .to_string()
@@ -458,11 +492,29 @@ fn test_validate_family_runner_membership_rejects_chain_mismatch() {
 
 #[test]
 fn test_validate_family_runner_membership_rejects_explicit_family_mismatch() {
-    let family = family_detected_runtime_with_members_for_tests(
-        "uniswap",
-        Chain::Ethereum,
+    let eth_v2_seed = ExtractorConfig {
+        name: "eth_v2_seed".to_string(),
+        chain: Chain::Ethereum,
+        protocol_system: "uniswap_v2".to_string(),
+        protocol_types: vec![ProtocolTypeConfig::new(
+            "uniswap_v2_pool".to_string(),
+            FinancialType::Swap,
+        )],
+        ..Default::default()
+    };
+    let eth_v3_seed = ExtractorConfig {
+        name: "eth_v3_seed".to_string(),
+        chain: Chain::Ethereum,
+        protocol_system: "uniswap_v3".to_string(),
+        protocol_types: vec![ProtocolTypeConfig::new(
+            "uniswap_v3_pool".to_string(),
+            FinancialType::Swap,
+        )],
+        ..Default::default()
+    };
+    let resolved_family = resolved_family_runtime_from_configs_for_tests(
+        &[&eth_v2_seed, &eth_v3_seed],
         "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-        ["uniswap_v2"],
     );
     let wrong_family_v2 = ExtractorConfig {
         name: "wrong_family_v2".to_string(),
@@ -474,7 +526,7 @@ fn test_validate_family_runner_membership_rejects_explicit_family_mismatch() {
         ..Default::default()
     };
 
-    let err = validate_family_runner_membership(&family, &[&wrong_family_v2])
+    let err = validate_family_runner_membership(&resolved_family.family, &[&wrong_family_v2])
         .expect_err("explicit family mismatch should fail");
     assert!(err
         .to_string()
@@ -483,11 +535,29 @@ fn test_validate_family_runner_membership_rejects_explicit_family_mismatch() {
 
 #[test]
 fn test_validate_family_runner_membership_rejects_missing_protocol_types() {
-    let family = family_detected_runtime_with_members_for_tests(
-        "uniswap",
-        Chain::Ethereum,
+    let eth_v2_seed = ExtractorConfig {
+        name: "eth_v2_seed".to_string(),
+        chain: Chain::Ethereum,
+        protocol_system: "uniswap_v2".to_string(),
+        protocol_types: vec![ProtocolTypeConfig::new(
+            "uniswap_v2_pool".to_string(),
+            FinancialType::Swap,
+        )],
+        ..Default::default()
+    };
+    let eth_v3_seed = ExtractorConfig {
+        name: "eth_v3_seed".to_string(),
+        chain: Chain::Ethereum,
+        protocol_system: "uniswap_v3".to_string(),
+        protocol_types: vec![ProtocolTypeConfig::new(
+            "uniswap_v3_pool".to_string(),
+            FinancialType::Swap,
+        )],
+        ..Default::default()
+    };
+    let resolved_family = resolved_family_runtime_from_configs_for_tests(
+        &[&eth_v2_seed, &eth_v3_seed],
         "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
-        ["uniswap_v2"],
     );
     let typeless_v2 = ExtractorConfig {
         name: "typeless_v2".to_string(),
@@ -496,7 +566,7 @@ fn test_validate_family_runner_membership_rejects_missing_protocol_types() {
         ..Default::default()
     };
 
-    let err = validate_family_runner_membership(&family, &[&typeless_v2])
+    let err = validate_family_runner_membership(&resolved_family.family, &[&typeless_v2])
         .expect_err("missing protocol types should fail");
     assert!(err.to_string().contains(
         "requires extractor `typeless_v2` to declare at least one protocol type for branch routing"

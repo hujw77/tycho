@@ -1,11 +1,6 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use async_trait::async_trait;
-use tycho_ethereum::rpc::EthereumRpcClient;
 use tycho_common::{
     models::{
         protocol::{ComponentBalance, ProtocolComponent},
@@ -13,25 +8,22 @@ use tycho_common::{
     },
     Bytes,
 };
+use tycho_ethereum::rpc::EthereumRpcClient;
 
-use crate::extractor::{
-    models::BlockChanges,
-    ExtractionError,
-};
 use crate::extractor::family_registry::FamilyRuntimeRegistry;
+use crate::extractor::{models::BlockChanges, ExtractionError};
 
 pub(crate) type AuxiliaryProtocolMessageBuildFuture<'a> =
     Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'a>>;
 
-pub(crate) type AuxiliaryProtocolStateHydrationFuture<'a> =
-    Pin<
-        Box<
-            dyn Future<
-                    Output = Result<HashMap<ComponentId, ChainHydratedComponentState>, ExtractionError>,
-                > + Send
-                + 'a,
-        >,
-    >;
+pub(crate) type AuxiliaryProtocolStateHydrationFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<HashMap<ComponentId, ChainHydratedComponentState>, ExtractionError>,
+            > + Send
+            + 'a,
+    >,
+>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChainHydratedComponentState {
@@ -97,10 +89,14 @@ pub(crate) fn auxiliary_protocol_message_decoder_for(
     decoders: &[AuxiliaryProtocolMessageDecoder],
     protocol_system: &str,
     type_url: &str,
-    ) -> Option<AuxiliaryProtocolMessageDecoder> {
-    decoders.iter().find(|decoder| {
-        decoder.protocol_system == protocol_system && type_url.ends_with(decoder.type_url_suffix)
-    }).copied()
+) -> Option<AuxiliaryProtocolMessageDecoder> {
+    decoders
+        .iter()
+        .find(|decoder| {
+            decoder.protocol_system == protocol_system
+                && type_url.ends_with(decoder.type_url_suffix)
+        })
+        .copied()
 }
 
 pub(crate) fn default_auxiliary_protocol_message_decoders_for_protocol_system(
@@ -109,7 +105,11 @@ pub(crate) fn default_auxiliary_protocol_message_decoders_for_protocol_system(
 ) -> Vec<AuxiliaryProtocolMessageDecoder> {
     registry
         .registered_protocol_system_defaults(protocol_system)
-        .map(|defaults| defaults.auxiliary_protocol_message_decoders().to_vec())
+        .map(|defaults| {
+            defaults
+                .auxiliary_protocol_message_decoders()
+                .to_vec()
+        })
         .unwrap_or_default()
 }
 
@@ -119,7 +119,11 @@ pub(crate) fn default_auxiliary_protocol_state_hydrators_for_protocol_system(
 ) -> Vec<AuxiliaryProtocolStateHydrator> {
     registry
         .registered_protocol_system_defaults(protocol_system)
-        .map(|defaults| defaults.auxiliary_protocol_state_hydrators().to_vec())
+        .map(|defaults| {
+            defaults
+                .auxiliary_protocol_state_hydrators()
+                .to_vec()
+        })
         .unwrap_or_default()
 }
 

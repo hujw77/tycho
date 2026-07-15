@@ -231,13 +231,23 @@ fn normalize_substreams_params(
         if !pools.is_empty() {
             parsed.params.insert(
                 "pools".to_string(),
-                Value::Sequence(pools.into_iter().map(Value::String).collect()),
+                Value::Sequence(
+                    pools
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
             );
         }
         if !pool_tokens.is_empty() {
             parsed.params.insert(
                 "pool_tokens".to_string(),
-                Value::Sequence(pool_tokens.into_iter().map(Value::String).collect()),
+                Value::Sequence(
+                    pool_tokens
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
             );
         }
         parsed.params.remove("routes");
@@ -342,7 +352,9 @@ fn load_substreams_params_file(
 
     let contents = fs::read_to_string(&resolved_path)?;
     let parsed: SubstreamsParamsFile = serde_yaml::from_str(&contents)?;
-    let base_dir = resolved_path.parent().unwrap_or_else(|| Path::new("."));
+    let base_dir = resolved_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
     let mut merged =
         SubstreamsParamsFile { start_block: None, includes: vec![], params: BTreeMap::new() };
 
@@ -380,7 +392,9 @@ fn load_bootstrap_params_file(
 
     let contents = fs::read_to_string(&resolved_path)?;
     let parsed: BootstrapParamsFile = serde_yaml::from_str(&contents)?;
-    let base_dir = resolved_path.parent().unwrap_or_else(|| Path::new("."));
+    let base_dir = resolved_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
     let mut merged = BootstrapParamsFile {
         start_block: None,
         includes: vec![],
@@ -420,7 +434,9 @@ fn merge_substreams_params_file(
         if let Some(existing_value) = target.params.get_mut(&key) {
             merge_substreams_param_value(existing_value, incoming_value, &key)?;
         } else {
-            target.params.insert(key, incoming_value);
+            target
+                .params
+                .insert(key, incoming_value);
         }
     }
 
@@ -441,8 +457,14 @@ fn merge_bootstrap_params_file(
         incoming.params.bootstrap_block,
         "bootstrap config params.bootstrap_block",
     )?;
-    target.params.pools.extend(incoming.params.pools);
-    target.params.routes.extend(incoming.params.routes);
+    target
+        .params
+        .pools
+        .extend(incoming.params.pools);
+    target
+        .params
+        .routes
+        .extend(incoming.params.routes);
     Ok(())
 }
 
@@ -477,7 +499,9 @@ fn merge_optional_i64(
 }
 
 fn normalize_include_path(include: &str) -> &str {
-    include.strip_prefix('@').unwrap_or(include)
+    include
+        .strip_prefix('@')
+        .unwrap_or(include)
 }
 
 fn canonicalize_for_include_tracking(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -603,7 +627,10 @@ fn render_allowed_protocols_label(allowed_protocols: Option<&HashSet<String>>) -
         return "<unfiltered>".to_string();
     };
 
-    let mut labels = allowed_protocols.iter().cloned().collect::<Vec<_>>();
+    let mut labels = allowed_protocols
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     labels.sort();
     labels.join(",")
 }

@@ -42,6 +42,19 @@ Current Phase 3 operator entrypoint:
     `TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE` values are now scrubbed with `env -u` before the
     live Fynd test command is launched, so shell-exported empty overrides cannot silently poison
     the managed or manual combined-family live gate
+  - the live gate doctor now also verifies `/v1/tokens` under the exact configured
+    `min_token_quality` and `traded_n_days_ago` filters before reporting readiness, so a local
+    catch-up indexer can no longer look "ready" while Fynd would immediately fail with
+    all-token-filtered-out snapshot decoding
+  - the live gate default token profile is now aligned with local catch-up validation rather than
+    near-head production strictness:
+    `FYND_E2E_MIN_TOKEN_QUALITY=10` and `FYND_E2E_TRADED_N_DAYS_AGO=42` are the default live
+    validation values, while stricter near-tip validation remains available through explicit
+    environment overrides
+  - the live gate now also defaults `TYCHO_STREAM_WS_BUFFER_SIZE=4096` and
+    `TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE=4096`, because the combined-family settlement path
+    was able to overrun the smaller default websocket/subscription buffers during live catch-up
+    validation even after the underlying route-path correctness issues were fixed
 - combined-family V3 auxiliary decoding now reloads full tip state for existing pools instead of
   only the current block's touched keys:
   `ProtocolExtractor::get_protocol_states_at_tip(...)` merges DB state with reorg/in-flight
@@ -93,6 +106,45 @@ Current Phase 3 operator entrypoint:
   family-level hooks when a member does not override them, and the built-in Uniswap defaults now
   source the V3-specific auxiliary decoder/hydrator wiring directly from the V3 member
   registration; this removes another family-local special case from the extensibility surface
+
+## Current Audit Run (2026-07-15)
+
+- repo-local shared-runtime acceptance remains green:
+  `scripts/check-combined-family-extensibility.sh run` and
+  `scripts/check-combined-family-db.sh run` had already passed before this audit slice
+- shared bootstrap branch token propagation had a real bug and is now fixed:
+  branch-local `new_tokens` are preserved even when a merged bootstrap block introduces tokens
+  only through protocol components and not through balance changes
+- that regression is now covered by
+  `cargo test -p tycho-indexer split_plan_block_preserves_new_tokens_for_component_only_branches -- --nocapture`
+- live Tycho RPC semantics are back on the combined-family path after that fix:
+  `/v1/tokens` once again returns token metadata for combined-family local runs, and
+  `/v1/protocol_state` is queryable for both Uniswap V2 and Uniswap V3 branches
+- the previous live-gate false negative was caused by validation defaults, not by the combined
+  architecture:
+  `FYND_E2E_MIN_TOKEN_QUALITY=100` and `FYND_E2E_TRADED_N_DAYS_AGO=3` produced an empty
+  `/v1/tokens` result set against a local indexer that was still far behind chain head, which in
+  turn made Fynd skip every pool because no token metadata could be loaded
+- with catch-up-aligned live defaults (`min_token_quality=10`, `traded_n_days_ago=42`), the
+  combined-family live route gate now succeeds end-to-end:
+  `scripts/check-combined-family-fynd-live-e2e.sh run-route` completed successfully and returned
+  a real quote route on the shared V2/V3 runtime
+- remaining live work is narrower now:
+  confirm the settlement gate under the same catch-up-aligned profile, and then decide whether
+  the stricter near-tip token profile should remain an explicit override or graduate into a
+  separate operator mode
+- the remaining settlement instability is now isolated more precisely too:
+  the failing `find token balance slot` path lives in the Fynd live E2E dry-run harness rather
+  than in the combined-family indexer itself, and the live gate now exposes
+  `FYND_E2E_TOKEN_BALANCE_SLOT` / `FYND_E2E_TOKEN_ALLOWANCE_SLOT` so operators can pin known
+  ERC20 storage slots when RPC rate limiting makes repeated slot probing too expensive
+- the repo-local operator contract around that live gate is now re-verified too:
+  `cargo test -p tycho-indexer combined_family_fynd_live_e2e_script_forwards_token_slot_overrides -- --nocapture`
+  and
+  `cargo test -p tycho-indexer combined_family_fynd_live_e2e_script_command_all_renders_stable_commands -- --nocapture`
+  both pass against a temporary target directory, so the remaining Phase 3 proof gap is no
+  longer the shell entrypoint or manifest wiring, but the external networked live settlement run
+  itself
 
 ## Goal Lock
 
@@ -608,9 +660,11 @@ Current implementation status:
   default-registry free-function path
 - the residual compatibility wrappers for that old path are gone as well: `shared_bootstrap.rs`
   no longer exports separate default-registry `materialize_*_block(...)` entrypoints, and the
-  registry-owned `materialize_shared_bootstrap_plan(...)` path now reuses the same resolved
-  execution object instead of reassembling plan-materializer and branch-runtime state a second
-  time
+  family registry no longer keeps separate `resolve_shared_bootstrap_plan_materializer(...)` and
+  `materialize_shared_bootstrap_plan(...)` wrapper layers either; callers now resolve one
+  `ResolvedSharedBootstrapExecution` object and invoke `materialize_plan(...)` directly, so the
+  plan-materializer and branch-runtime pair is no longer reassembled through parallel registry
+  entrypoints
 - startup orchestration is narrower now too: `ResolvedRuntimeTarget` first resolves one target-
   owned prepared Substreams request shape and then loads the stream through one shared startup
   conversion path, while family startup now carries its `family_execution` metadata inside the
@@ -754,6 +808,26 @@ Current implementation status:
   `cursor` together instead of validating them through separate helper passes, which reduces the
   chance that future family runtimes drift on restart/resume semantics inside the shared-stream
   orchestration layer
+- shared-stream request ownership is narrower too: family runtime planning now materializes one
+  `FamilySharedSubstreamsRequest` template that owns the shared stream's
+  `spkg/module/stop_block/params/extractor_id` contract, and runtime-target planning derives
+  concrete requests by varying only `start_block`; future family runtimes no longer need to
+  reassemble the same shared stream request fields at each planning/startup call site
+- shared bootstrap commit-target ownership is narrower too: family managed startup now resolves
+  one `FamilyBootstrapCommitWiring` from the runtime contract plus built extractors, and the
+  family lifecycle consumes that prepared wiring when it needs to apply a materialized bootstrap
+  block; shared bootstrap commit no longer decides branch targets or the shared completion writer
+  by rescanning the extractor map during request preparation
+- bootstrap decision orchestration is narrower across runtime shapes too: standalone and family
+  lifecycle paths now share one `execute_bootstrap_run_decision_with_progress_reload(...)`
+  helper for the `decision -> run bootstrap if needed -> reload progress iff a run happened`
+  sequence, so future runtime shapes do not need to open-code that same shared bootstrap
+  progression pattern just to preserve their own stream-position logic
+- persisted-state scope validation is narrower too: extractor-level helpers now own the
+  `legacy fallback` detection for cursor-vs-bootstrap progress provenance through
+  `PersistedExtractorStateKind`, so shared-family lifecycle code no longer hand-rolls separate
+  scans for `cursor_scope` and `completed_bootstrap_scope` when enforcing the shared durability
+  boundary
 - family lifecycle progress loading is narrower at startup too: resume/cursor/bootstrap decisions
   now hydrate one per-branch progress snapshot and derive consistency/completion checks from that
   shared snapshot shape, instead of re-reading branch progress, cursors, and bootstrap markers
@@ -1138,6 +1212,24 @@ The core Phase 3 runtime architecture is now in place:
   `extractor/single_runtime_execution.rs`, which makes the single-runner path structurally mirror
   `family_runtime_execution.rs` and reduces the remaining surface area that still needs a shared
   execution abstraction
+- branch-payload execution ownership is narrower now too:
+  the family runner no longer owns a second local
+  `branch payloads -> block-data processing -> pending-message propagation` scaffold; that loop
+  now lives in `extractor/execution_loop.rs` beside the other shared managed-runtime helpers, so
+  future family runtimes can reuse the same branch fan-out execution shell instead of copying
+  another family-local processing loop
+- shared bootstrap execution semantics are narrower now too:
+  standalone and family startup paths now both drive `Skip / AlreadyCompleted / Run` bootstrap
+  actions through one `execute_bootstrap_run_decision(...)` helper in
+  `extractor/bootstrap_lifecycle.rs`, which means SIGINT interruption handling and the
+  already-completed vs run-now startup contract no longer diverge between standalone and
+  shared-family bootstrap flows
+- standalone lifecycle progress ownership is narrower now too:
+  the standalone path no longer re-derives progress scalars at each call site through loose
+  helper functions; it now has a dedicated `StandaloneLifecycleProgress` owner in
+  `extractor/extractor_lifecycle.rs`, and both standalone bootstrap execution and prepared
+  Substreams request logging resolve resume state through that owner, which makes the standalone
+  lifecycle surface structurally closer to `FamilyLifecycleProgress`
 - the runtime-step branch contract is narrower now too:
   `extractor/execution_loop.rs` now owns the shared “control action -> continue/stop” and
   “stream action + block number -> continue/stop + tracing fields” mapping helpers, while both
@@ -1179,6 +1271,41 @@ The core Phase 3 runtime architecture is now in place:
   one `Send`-safe prepared-runner interface, so the runtime-target startup layer no longer
   re-encodes a second explicit `Family | Standalone` dispatch step just to turn already-prepared
   startup state into managed runners
+- the managed-startup draft container is narrower now too:
+  family and standalone startup planning now both use the shared
+  `PreparedManagedStartupDraft<P>` contract in `extractor/runtime_targets_startup.rs`, so the
+  common “runtime-specific payload + prepared Substreams request” draft lifecycle is no longer
+  duplicated across two separate draft container types before stream loading
+- the managed-startup draft fan-out is narrower now too:
+  `PreparedRuntimeTargetDraftEnvelope` no longer carries an explicit `Family | Standalone`
+  enum branch once a runtime target has already produced a draft; instead it wraps one
+  `PreparedRuntimeTargetDraftView`, so stream loading and draft-to-startup conversion now reuse
+  the same object-safe handoff regardless of whether the underlying runtime target was family or
+  standalone
+- the runtime-target-to-startup handoff is narrower now too:
+  `ResolvedRuntimeTarget` no longer directly matches on `Family | Standalone` just to reach the
+  managed-startup draft builder; instead it resolves one `RuntimeTargetManagedStartupView`, so
+  the runtime-target layer now treats managed-startup draft preparation as another shared runtime
+  contract rather than a second explicit protocol-shaped branch
+- the managed-startup draft assembly template is narrower now too:
+  family and standalone runtime builders no longer each own the common “payload + prepared
+  request -> `PreparedManagedStartupDraft`” assembly step; that wrapping now lives once in the
+  shared `ManagedStartupDraftFactory` contract, while each runtime-specific implementation only
+  provides its payload-and-request construction logic
+- the stream-position contract is narrower now too:
+  family and standalone lifecycle resolution now share one `ResolvedStreamPosition` shape for the
+  “start block + optional cursor” result, instead of maintaining parallel family/standalone
+  structs for the same concept
+- the request-wrapping step is narrower now too:
+  family and standalone substreams-request preparation now reuse the same shared
+  `prepared_substreams_request_from_stream_position(...)` helper, so the final
+  “resolved stream position -> prepared request” handoff no longer lives as duplicated
+  boilerplate in both runtime paths
+- the resume-to-stream-position step is narrower now too:
+  family and standalone lifecycle resolution now also reuse the same shared
+  `resolved_stream_position_from_resume(...)` helper for the common
+  “last processed block + configured/default start block + optional cursor -> stream position”
+  mapping, so that piece of resume logic no longer lives as duplicated lifecycle scaffolding
 - protocol-level family defaults are converging on one registry-owned view as well:
   bootstrap lookup, auxiliary decoder lookup, and shared-route alias lookup can now reuse one
   registered protocol-defaults surface instead of separately re-deriving family name, member
@@ -1974,6 +2101,22 @@ partially evidenced or still missing a dedicated regression.
   all `ticks/*/net-liquidity` attributes; this keeps the repo-local history-slice gate aligned
   with the same "non-zero liquidity requires a tick map" runtime invariant enforced by the live
   auxiliary hydrator path
+
+### Current Audit Run (2026-07-15)
+
+- repo-local extensibility acceptance is currently green:
+  `scripts/check-combined-family-extensibility.sh run` passed after aligning the custom-family
+  protocol-extractor tests with the current persisted-scope startup contract
+- repo-local DB-backed shared-runtime acceptance is currently green:
+  `scripts/check-combined-family-db.sh run` passed all 9 manifest-backed close-out tests against
+  local Postgres
+- the top-level combined-family doctor can still report `repo_ready=false` in restricted
+  environments that cannot reach local Postgres from the current shell/sandbox; that is an
+  environment visibility issue, not current evidence of a shared-runtime regression
+- the remaining unproven item in this audit run is still the live combined-family Fynd gate:
+  `scripts/check-combined-family-fynd-live-e2e.sh doctor` currently reports
+  `tycho_health=unreachable` / `tycho_protocols_ready=unreachable` when no local Tycho instance is
+  serving the combined-family RPC on `127.0.0.1:4242`
 
 ### Not Yet Proven Enough To Close The Goal
 
@@ -2876,3 +3019,187 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   to skip shared bootstrap or resume the shared family stream; this closes a remaining phase-3
   gap where the combined-family runtime could still inherit old per-extractor durability state
   while appearing to run under one shared bootstrap / one shared stream model
+- family lifecycle progress ownership is narrower now too:
+  `family_lifecycle.rs` now loads branch progress once into a shared `FamilyLifecycleProgress`
+  context that owns resume-block collection, bootstrap-completion snapshot derivation, shared
+  cursor/bootstrap scope checks, bootstrap-run decisions, and resolved stream-position shaping;
+  both the production `ResolvedFamilyRuntime` methods and the lifecycle regression helpers now
+  delegate through that same owner-side context instead of reassembling slightly different
+  progress/bootstrap/resume views, which reduces another family-specific orchestration seam that
+  future shared-stream protocol families would otherwise have to duplicate
+- managed-startup draft ownership is narrower now too:
+  `runtime_targets_startup.rs` now owns one shared managed-startup lifecycle contract for
+  `build payload -> prepare substreams request -> materialize startup draft`, while
+  `family_managed_startup.rs` and `standalone_managed_startup.rs` each keep only their
+  runtime-specific payload construction and request hooks; this removes another startup-layer
+  orchestration seam that future shared-stream protocol families would otherwise need to
+  reassemble around the same draft/request shape
+- runtime-target startup ownership is narrower now too:
+  `ResolvedRuntimeTarget` now resolves managed-startup drafts directly into one
+  `PreparedRuntimeTargetStartup` owner surface, while the underlying prepared startup types only
+  need to implement one shared `PreparedManagedRunnerStartup` contract for
+  `prepared startup -> managed runner + handles`; this removes another startup-layer fork where
+  future shared-family runtimes would otherwise need to extend parallel
+  family-vs-standalone prepared-startup enums just to preserve the same final runner assembly
+  semantics
+- runtime-target draft ownership is narrower now too:
+  `ResolvedRuntimeTarget::prepare_managed_startup_draft(...)` no longer widens the common
+  `PreparedManagedStartupDraft<_>` surface back into a family-vs-standalone enum before stream
+  loading; it now returns one boxed draft owner contract with the common
+  `prepared_request() -> load stream -> into_prepared_startup(...)` lifecycle, so future
+  shared-family runtimes do not need to participate in yet another outer draft enum just to reuse
+  the same stream-loading boundary
+- startup orchestration ownership is narrower now too:
+  the top-level `build protocol cache -> initialize accounts -> prepare per-target startup`
+  sequence now lives under `ResolvedRuntimeTargetsBuildContext` in
+  `runtime_targets_startup.rs`, while `ResolvedRuntimeTargets::prepare_startup(...)` in
+  `startup.rs` is reduced to a thin public entrypoint that delegates to that owner; this removes
+  another piece of startup coordination from the outer module boundary and keeps more of the real
+  production startup lifecycle alongside the runtime-target startup types it actually prepares
+- prepared-request lifecycle ownership is narrower one step further too:
+  `managed_substreams_request.rs` no longer orchestrates
+  `run bootstrap if needed -> reload progress -> resolve stream position` as separate runtime hook
+  calls; instead, family and standalone runtimes now expose one combined
+  `prepare_stream_position_after_bootstrap(...)`-style lifecycle owner that can reuse already
+  loaded progress when bootstrap does not run and only reload after an actual bootstrap mutation,
+  which removes another piece of duplicated request-preparation sequencing from the shared-family
+  production path
+- lifecycle test-boundary ownership is narrower now too:
+  the old test-only `run_bootstrap_if_needed(...)` / `resolve_stream_position(...)` entrypoints no
+  longer hang off the production family/standalone runtime impl blocks; tests now exercise the
+  narrower progress helpers or explicit test helper functions instead, which keeps the live
+  runtime surface aligned with the combined lifecycle owners that the production request path
+  actually uses
+- partial-block execution semantics are now shared one layer deeper too:
+  `execution_loop.rs` now owns a reusable `PartialBlockTracker` state machine for
+  `is_partial` / `partial_index` / `is_last_partial` handling, and both
+  `single_runtime_execution.rs` and `family_runtime_execution.rs` delegate their loop-local
+  partial-block counters and reset behavior through that same helper instead of carrying separate
+  ad hoc counter/reset logic; this narrows another residual execution-layer fork in the shared
+  Substreams orchestration path before future protocol families plug into it
+- subscriber control-plane ownership is narrower now too:
+  `control.rs` now owns shared subscriber-id allocation, subscription registration, and
+  new-subscription logging helpers, and both the standalone runtime and family runtime delegate
+  those mechanics through the same control-plane surface instead of each keeping their own local
+  `next_subscriber_id += 1` / `insert(sender)` / tracing sequence; this removes another small but
+  recurring execution/control seam that future shared-family runtimes would otherwise repeat when
+  preserving stable downstream handle semantics
+- revert and stream-end flush ownership are narrower now too:
+  `execution_loop.rs` now owns shared helpers for per-extractor `handle_revert(...)` invocation
+  and multi-extractor `flush()` fan-out, and both `single_runtime_execution.rs` and
+  `family_runtime_execution.rs` delegate those lifecycle steps through that same helper layer
+  instead of each open-coding the underlying extractor call pattern; the remaining difference is
+  now primarily runtime-local log/context handling, not how the shared stream loop performs the
+  underlying revert/flush lifecycle work
+- downstream subscriber propagation ownership is narrower now too:
+  `control.rs` now owns the concrete subscription-map broadcast loop
+  (`propagate_subscription_message(...)`), and both the standalone runtime and family runtime
+  delegate downstream message delivery through that shared control-plane helper instead of the
+  family path depending on `ExtractorRunner::propagate_msg(...)`; this further isolates the
+  remaining family-specific execution logic to branch selection/fanout rather than generic
+  subscriber-map delivery mechanics
+- runtime-step execution ownership is narrower now too:
+  `execution_loop.rs` now owns one reusable `run_managed_runtime_step(...)` shell for
+  `tokio::select!` over control-vs-stream progress plus the shared
+  `continue_after_control_action(...)` / `continue_after_stream_action(...)` transition logic,
+  while `single_runtime_execution.rs` and `family_runtime_execution.rs` only provide the
+  runtime-local step context and branch-specific handlers; this removes another production-path
+  orchestration seam where future shared-stream families would otherwise have to reassemble the
+  same control/stream loop shell around different branch handlers
+- runtime-loop state ownership is narrower now too:
+  `execution_loop.rs` now owns one shared `ManagedRuntimeLoopState` for the common
+  `loop_id + PartialBlockTracker` state carried by both runtime loop variants, while
+  `single_runtime_execution.rs` and `family_runtime_execution.rs` reuse that same state owner
+  instead of each maintaining their own near-identical `SingleRuntimeLoopState` /
+  `FamilyRuntimeLoopState` wrappers; this removes another small but recurring execution-layer
+  fork before future shared-stream protocol families plug into the same runtime loop surface
+- wrapper-only execution helper ownership is narrower now too:
+  `execution_loop.rs` now owns the shared `stream_ended_error(...)` constructor directly, while
+  the standalone and family runtime paths no longer keep thin wrapper-only helpers like
+  `ExtractorRunner::propagate_msg(...)`, `family_stream_ended_error(...)`, or
+  `flush_family_extractors(...)` around the same shared control/flush/error surfaces; this trims
+  another layer of non-semantic runtime indirection from the production shared-stream path and
+  keeps the remaining family-specific execution code focused on real branch routing behavior
+- control-plane subscription ownership is narrower now too:
+  `control.rs` now owns a shared `register_logged_subscription(...)` /
+  `allocate_logged_subscription_id(...)` surface for the common
+  `allocate subscriber id -> log subscription -> register sender` mechanics, while the standalone
+  runtime and family runtime only provide the subscription target resolution and protocol-specific
+  warning behavior; this removes another small control-plane seam from the production shared-stream
+  path without changing the current family-vs-standalone subscription semantics
+- stream-termination error ownership is narrower now too:
+  `execution_loop.rs` now owns a shared `handle_logged_runtime_stream_item(...)` surface for the
+  common `stream ended vs gRPC error -> build SubstreamsError -> emit termination log` shell,
+  while the standalone and family runtime paths now only provide their runtime-local error message
+  text and response handlers; this removes another residual execution-layer difference that was
+  still duplicating the same shared-stream termination wrapper in two places
+- subscription-message pipeline ownership is narrower now too:
+  `execution_loop.rs` now owns a shared
+  `collect_subscription_messages_for_extractor(...) -> propagate_pending_subscription_messages(...)`
+  pipeline for the common `process extractor block data -> pair messages with subscriber set ->
+  fan out pending notifications` flow, while the single runtime and family runtime now both reuse
+  that same pending-message surface instead of each carrying their own local
+  `msgs -> subscribers -> propagate` orchestration shell
+- revert-notification pipeline ownership is narrower now too:
+  `execution_loop.rs` now owns the matching revert-side
+  `collect_revert_subscription_messages_for_extractor(...) ->
+  process_reverts_for_extractors(...) -> propagate_pending_subscription_messages(...)` pipeline,
+  so standalone and family runtimes both follow the same `handle revert -> pair emitted undo
+  messages with subscriber sets -> fan out pending notifications` execution shape instead of the
+  family path keeping a separate `handle_family_revert(...)` orchestration shell
+- future-family test-fixture ownership is narrower now too:
+  custom-registry/shared-stream regressions no longer have to re-declare ad hoc `FUTURE_FAMILY`
+  specs and repeated `FamilyRuntimeConfig` blocks at each call site; `extractor/test_support.rs`
+  now owns reusable future-family registry/config builders for plain custom families, family-level
+  auxiliary decoders, and member-scoped auxiliary-decoder coverage, and the metadata/startup/
+  wiring regressions reuse that surface directly instead of repeating slightly different
+  future-family scaffolding in each module
+- extractor-initialization ownership is narrower on the production path too:
+  `managed_extractor_initialization.rs` now owns one runtime-target-local build contract for
+  `runtime target -> protocol-system keyed initialized extractor map`, and both standalone startup
+  and family startup delegate through that same builder surface instead of each keeping their own
+  parallel extractor-initialization path; the remaining difference is now the runtime target's
+  resolved auxiliary-runtime metadata, not a duplicated build pipeline for single-vs-family
+  managed startup
+- runtime-target extractor-build entrypoints are narrower now too:
+  startup code no longer depends on separate `build_standalone_extractor(...)` and
+  `build_family_extractors(...)` wrapper entrypoints just to reach the same underlying
+  initialization path; `ManagedExtractorBuildContext` now exposes one shared
+  `build_runtime_target_extractors(...)` contract plus a narrow
+  `build_unique_runtime_target_extractor(...)` helper for true single-extractor targets, which
+  keeps future shared-family runtimes from reintroducing a fresh pair of family-vs-standalone
+  wrapper methods around the same protocol-system keyed extractor build owner
+- prepared-request lifecycle ownership is narrower on the production path too:
+  `managed_substreams_request.rs` now owns one runtime-target-local lifecycle contract for
+  `run bootstrap -> resolve shared stream position -> shape prepared request`, and both
+  standalone startup and family startup delegate through that same owner surface instead of each
+  open-coding their own request-preparation shell; the remaining difference is now the
+  runtime-target-specific lifecycle context (single extractor vs protocol-system keyed branch
+  extractors), not a duplicated bootstrap/resume/request assembly flow
+- prepared-startup request-hook ownership is narrower one step further too:
+  startup wiring no longer keeps extra compatibility entrypoints on `ResolvedFamilyRuntime` and
+  `ResolvedStandaloneRuntime` just to bridge `payload -> request context -> prepared request`;
+  `runtime_targets_startup.rs` now owns that common bridge through
+  `ManagedStartupPreparedRequestPayload` and
+  `prepare_managed_startup_request_from_payload(...)`, while payload types contribute only the
+  runtime-target-specific context materialization needed by the shared
+  `managed_substreams_request.rs` lifecycle
+- shared bootstrap param parsing is less protocol-shaped too:
+  `uniswap_v2_bootstrap.rs` and `uniswap_v3_bootstrap.rs` no longer each keep their own copy of
+  the same pool-list bootstrap param parser and result struct just to feed identical
+  `bootstrap_block + pools` semantics; both bootstrap builders now reuse
+  `shared_bootstrap::parse_pool_list_bootstrap_params(...)` and the shared
+  `SharedBootstrapParams` shape directly, which narrows the remaining protocol-specific surface to
+  actual chain materialization behavior rather than repeated bootstrap config parsing
+- family shared-stream params now have an explicit owner too:
+  family runtime planning no longer treats merged shared-stream params as an unstructured
+  `HashMap` assembled through free helper functions; `FamilySharedSubstreamsParams` now owns the
+  merge-and-conflict contract for `ExtractorConfig::substreams_params`, and
+  `ResolvedFamilyStreamRuntime` carries that value object directly so future family runtimes can
+  extend the shared-stream input contract without reintroducing another round of ad hoc
+  `HashMap`-merging helpers
+- shared resume/progress validation is narrower too:
+  the extractor module now owns one reusable `validate_shared_progress_consistency(...)`
+  contract for mixed fresh-vs-resumed branch rejection and aligned resume-block enforcement, and
+  both family lifecycle validation and shared resume-state parsing delegate through that helper
+  instead of keeping separate copies of the same branch-progress rules in the family path

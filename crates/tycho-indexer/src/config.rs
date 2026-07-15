@@ -23,28 +23,29 @@ use tycho_ethereum::{
 use tycho_indexer::extractor::extractor_config::{
     BootstrapConfig, BootstrapStrategy, DCIType, ExtractorConfig, ProtocolTypeConfig,
 };
-use tycho_indexer::extractor::ExtractionError;
-use tycho_indexer::extractor::{
-    chain_state::ChainState, control::ExtractorHandle,
-    family_registry::default_family_runtime_registry,
-    family_registry::FamilyRuntimeRegistry,
-    family_runtime_metadata::{canonicalize_shared_route_protocol, FamilyRuntimeConfig},
-    family_runtime_planning::build_resolved_runtime_targets_with_registry,
-    shared_config::{
-        protocol_filter_for_protocol_system, resolve_bootstrap_params,
-        resolve_substreams_params_map,
-    },
-    runtime_target_planning::{
-        ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets, ResolvedSubstreamsExecutionRequest,
-    },
-    startup::ResolvedRuntimeTargetsBuildContext,
-};
 #[cfg(test)]
 use tycho_indexer::extractor::family_runtime_planning::build_family_runtime_plan;
 #[cfg(test)]
 use tycho_indexer::extractor::shared_config::{
     parse_bootstrap_params_file, parse_bootstrap_params_yaml, parse_substreams_params_file,
     parse_substreams_params_yaml,
+};
+use tycho_indexer::extractor::ExtractionError;
+use tycho_indexer::extractor::{
+    chain_state::ChainState,
+    control::ExtractorHandle,
+    family_registry::default_family_runtime_registry,
+    family_registry::FamilyRuntimeRegistry,
+    family_runtime_metadata::{canonicalize_shared_route_protocol, FamilyRuntimeConfig},
+    family_runtime_planning::build_resolved_runtime_targets_with_registry,
+    runtime_target_planning::{
+        ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets, ResolvedSubstreamsExecutionRequest,
+    },
+    shared_config::{
+        protocol_filter_for_protocol_system, resolve_bootstrap_params,
+        resolve_substreams_params_map,
+    },
+    startup::ResolvedRuntimeTargetsBuildContext,
 };
 use tycho_indexer::services::PlansConfig;
 use tycho_indexer::services::ServicesBuilder;
@@ -220,8 +221,8 @@ impl LoadedIndexerRuntimePlan {
         path: &str,
         registry: FamilyRuntimeRegistry<'static>,
     ) -> Result<Self, tycho_indexer::extractor::ExtractionError> {
-        let extractors_config = ExtractorConfigs::from_yaml_with_registry(path, registry)
-            .map_err(|err| {
+        let extractors_config =
+            ExtractorConfigs::from_yaml_with_registry(path, registry).map_err(|err| {
                 tycho_indexer::extractor::ExtractionError::Setup(format!(
                     "Failed to load extractors config. {err}"
                 ))
@@ -248,8 +249,7 @@ impl LoadedIndexerRuntimePlan {
         start_block: Option<i64>,
         stop_block: Option<i64>,
         params_overrides: &HashMap<String, String>,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, tycho_indexer::extractor::ExtractionError>
-    {
+    ) -> Result<ResolvedSubstreamsExecutionRequest, tycho_indexer::extractor::ExtractionError> {
         self.extractors_config
             .resolve_substreams_execution_request_with_registry(
                 self.family_runtime_registry,
@@ -284,7 +284,8 @@ impl<'a> ResolvedIndexerRuntimePlan<'a> {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn dci_protocol_systems(&self) -> &[String] {
-        self.service_config.dci_protocol_systems()
+        self.service_config
+            .dci_protocol_systems()
     }
 
     pub(crate) fn family_runtime_registry(&self) -> FamilyRuntimeRegistry<'static> {
@@ -300,8 +301,10 @@ impl<'a> ResolvedIndexerRuntimePlan<'a> {
     pub(crate) fn into_unique_runtime_target(
         self,
         context: &str,
-    ) -> Result<tycho_indexer::extractor::runtime_target_planning::ResolvedRuntimeTarget<'a>, ExtractionError>
-    {
+    ) -> Result<
+        tycho_indexer::extractor::runtime_target_planning::ResolvedRuntimeTarget<'a>,
+        ExtractionError,
+    > {
         self.runtime_targets
             .into_unique(context)
     }
@@ -316,17 +319,13 @@ impl<'a> ResolvedIndexerRuntimePlan<'a> {
         self,
         context: ResolvedRuntimeTargetsBuildContext<'_>,
     ) -> Result<
-        (
-            Vec<tycho_indexer::extractor::runner::ManagedRunner>,
-            Vec<ExtractorHandle>,
-        ),
+        (Vec<tycho_indexer::extractor::runner::ManagedRunner>, Vec<ExtractorHandle>),
         ExtractionError,
     > {
         self.runtime_targets
             .build_managed_runners(context)
             .await
     }
-
 }
 
 impl ResolvedServiceLaunchConfig {
@@ -646,16 +645,11 @@ impl ExtractorConfigs {
     pub(crate) fn resolved_runtime_targets(
         &self,
     ) -> Result<ResolvedRuntimeTargets<'_>, tycho_indexer::extractor::ExtractionError> {
-        self.resolved_runtime_targets_with_registry(
-            default_family_runtime_registry(),
-        )
+        self.resolved_runtime_targets_with_registry(default_family_runtime_registry())
     }
 
     pub(crate) fn from_yaml(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::from_yaml_with_registry(
-            path,
-            default_family_runtime_registry(),
-        )
+        Self::from_yaml_with_registry(path, default_family_runtime_registry())
     }
 
     pub(crate) fn from_yaml_with_registry(
@@ -693,8 +687,7 @@ impl ExtractorConfigs {
         start_block: Option<i64>,
         stop_block: Option<i64>,
         params_overrides: &HashMap<String, String>,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, tycho_indexer::extractor::ExtractionError>
-    {
+    ) -> Result<ResolvedSubstreamsExecutionRequest, tycho_indexer::extractor::ExtractionError> {
         self.resolve_substreams_execution_request_with_registry(
             default_family_runtime_registry(),
             selector,
@@ -715,8 +708,7 @@ impl ExtractorConfigs {
         start_block: Option<i64>,
         stop_block: Option<i64>,
         params_overrides: &HashMap<String, String>,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, tycho_indexer::extractor::ExtractionError>
-    {
+    ) -> Result<ResolvedSubstreamsExecutionRequest, tycho_indexer::extractor::ExtractionError> {
         self.resolved_runtime_targets_with_registry(registry)?
             .resolve_substreams_execution_request(
                 selector,
@@ -731,9 +723,7 @@ impl ExtractorConfigs {
     pub(crate) fn resolved_indexer_runtime_plan(
         &self,
     ) -> Result<ResolvedIndexerRuntimePlan<'_>, tycho_indexer::extractor::ExtractionError> {
-        self.resolved_indexer_runtime_plan_with_registry(
-            default_family_runtime_registry(),
-        )
+        self.resolved_indexer_runtime_plan_with_registry(default_family_runtime_registry())
     }
 
     pub(crate) fn resolved_indexer_runtime_plan_with_registry(
@@ -852,10 +842,7 @@ fn validate_family_member_route_protocol_defaults(
 
     for (protocol_system, member_defaults) in &defaults.members {
         for route_protocol in &member_defaults.shared_route_protocols {
-            let normalized =
-                canonicalize_shared_route_protocol(
-                    route_protocol,
-                );
+            let normalized = canonicalize_shared_route_protocol(route_protocol);
             if normalized.is_empty() {
                 return Err(format!(
                     "family_runtime `{family_name}` member `{protocol_system}` declares an empty shared_route_protocol"
@@ -959,9 +946,7 @@ impl TryFrom<RawExtractorConfigs> for ExtractorConfigs {
     type Error = Box<dyn std::error::Error>;
 
     fn try_from(value: RawExtractorConfigs) -> Result<Self, Self::Error> {
-        value.try_into_with_registry(
-            default_family_runtime_registry(),
-        )
+        value.try_into_with_registry(default_family_runtime_registry())
     }
 }
 
@@ -1330,11 +1315,7 @@ fn normalized_shared_route_protocol_filter_for_member_defaults(
         defaults
             .shared_route_protocols
             .iter()
-            .map(|protocol| {
-                canonicalize_shared_route_protocol(
-                    protocol,
-                )
-            })
+            .map(|protocol| canonicalize_shared_route_protocol(protocol))
             .collect(),
     )
 }
@@ -1396,8 +1377,9 @@ mod tests {
 
     fn test_uniswap_shared_start_block() -> i64 {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let shared_bootstrap = fs::read_to_string(root.join("config/shared_uniswap_bootstrap.yaml"))
-            .expect("read repo shared bootstrap config");
+        let shared_bootstrap =
+            fs::read_to_string(root.join("config/shared_uniswap_bootstrap.yaml"))
+                .expect("read repo shared bootstrap config");
         parse_substreams_params_yaml("uniswap_v2", &shared_bootstrap)
             .expect("parse repo shared bootstrap config for v2")
             .0
@@ -1856,10 +1838,7 @@ extractors:
             runtime_plan.protocol_systems(),
             &["curve".to_string(), "uniswap_v2".to_string()]
         );
-        assert_eq!(
-            runtime_plan.dci_protocol_systems(),
-            &["uniswap_v2".to_string()]
-        );
+        assert_eq!(runtime_plan.dci_protocol_systems(), &["uniswap_v2".to_string()]);
     }
 
     #[test]
@@ -1958,8 +1937,7 @@ extractors:
                         settlement_contract: alloy::primitives::Address::ZERO,
                         extraction_runtime: None,
                         partial_blocks: false,
-                        family_runtime_registry:
-                            default_family_runtime_registry(),
+                        family_runtime_registry: default_family_runtime_registry(),
                     },
                 )
                 .await
@@ -1991,8 +1969,9 @@ extractors:
                 .await;
 
             let chain = Chain::Ethereum;
-            let shared_spkg_path =
-                write_temp_substreams_package_for_tests("config-start-indexing-runtime-plan-family");
+            let shared_spkg_path = write_temp_substreams_package_for_tests(
+                "config-start-indexing-runtime-plan-family",
+            );
 
             let extractors = HashMap::from([
                 (
@@ -3107,8 +3086,9 @@ params:
     #[test]
     fn repo_shared_uniswap_bootstrap_is_materialized_and_legacy_wrappers_remain_compatible() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let shared_bootstrap = fs::read_to_string(root.join("config/shared_uniswap_bootstrap.yaml"))
-            .expect("read shared bootstrap config");
+        let shared_bootstrap =
+            fs::read_to_string(root.join("config/shared_uniswap_bootstrap.yaml"))
+                .expect("read shared bootstrap config");
         let registry = default_family_runtime_registry();
         let v2_allowed = protocol_filter_for_protocol_system("uniswap_v2", registry);
         let v3_allowed = protocol_filter_for_protocol_system("uniswap_v3", registry);
@@ -3214,8 +3194,7 @@ params:
             "v3 substreams wrapper should preserve the factory filter"
         );
         let mut expected_v3_parts = split_params(&shared_v3_params);
-        expected_v3_parts
-            .insert("factory=0x1F98431c8aD98523631AE4a59f267346ea31F984".to_string());
+        expected_v3_parts.insert("factory=0x1F98431c8aD98523631AE4a59f267346ea31F984".to_string());
         assert_eq!(expected_v3_parts, split_params(&v3_wrapper_params));
         assert_eq!(v2_wrapper_start_block, v3_wrapper_start_block);
         assert!(
@@ -3252,14 +3231,10 @@ params:
         )
         .expect("load standard combined extractors config");
 
-        let combined_plan = build_family_runtime_plan(
-            &combined_config.extractors,
-        )
-        .expect("combined config should build a family runtime plan");
-        let standard_plan = build_family_runtime_plan(
-            &standard_config.extractors,
-        )
-        .expect("standard config should build a runtime plan");
+        let combined_plan = build_family_runtime_plan(&combined_config.extractors)
+            .expect("combined config should build a family runtime plan");
+        let standard_plan = build_family_runtime_plan(&standard_config.extractors)
+            .expect("standard config should build a runtime plan");
         let combined_targets = combined_config
             .resolved_runtime_targets()
             .expect("combined config should build resolved runtime targets");
@@ -3475,8 +3450,7 @@ extractors:
         );
         assert_eq!(
             family_runtime.shared_module.as_deref(),
-            default_family_runtime_registry()
-                .output_module_for_family("uniswap")
+            default_family_runtime_registry().output_module_for_family("uniswap")
         );
         assert_eq!(
             family_runtime
@@ -3577,16 +3551,15 @@ extractors:
             vec!["uniswap_v2".to_string(), "uniswap_v3".to_string()]
         );
         assert_eq!(
-            family.execution.shared_stream.module,
+            family.family.output_module(),
             default_family_runtime_registry()
                 .output_module_for_family("uniswap")
                 .expect("registered uniswap output module")
         );
         assert!(
             family
-                .execution
-                .shared_stream
-                .spkg
+                .family
+                .shared_spkg()
                 .contains("ethereum-uniswap-v2-v3-combined"),
             "shared family runtime should still use the combined shared spkg"
         );
@@ -3626,8 +3599,7 @@ extractors:
         );
         assert_eq!(
             resolved.shared_module.as_deref(),
-            default_family_runtime_registry()
-                .output_module_for_family("uniswap")
+            default_family_runtime_registry().output_module_for_family("uniswap")
         );
         assert_eq!(resolved.durability_scope.as_deref(), Some(test_uniswap_durability_scope()));
     }
@@ -3686,9 +3658,7 @@ extractors:
                 .expect("utf8 config path"),
         )
         .expect("load config");
-        let plan =
-            build_family_runtime_plan(&config.extractors)
-                .expect("build runtime plan");
+        let plan = build_family_runtime_plan(&config.extractors).expect("build runtime plan");
 
         assert!(
             plan.families.is_empty(),

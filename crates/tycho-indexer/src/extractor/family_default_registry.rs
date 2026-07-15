@@ -8,8 +8,7 @@ use crate::extractor::{
     },
     family_uniswap::{
         materialize_uniswap_v2_branch, materialize_uniswap_v3_branch,
-        AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
-        AUXILIARY_PROTOCOL_STATE_HYDRATORS,
+        AUXILIARY_PROTOCOL_MESSAGE_DECODERS, AUXILIARY_PROTOCOL_STATE_HYDRATORS,
     },
 };
 
@@ -21,21 +20,18 @@ const UNISWAP_V2_MEMBER: FamilyMemberSpec = canonical_pool_list_shared_family_me
 
 const UNISWAP_V3_MEMBER_WITH_AUXILIARY_RUNTIME_HOOKS: FamilyMemberSpec =
     canonical_pool_list_shared_family_member_with_auxiliary_runtime_hooks(
-    "uniswap_v3",
-    BootstrapStrategy::UniswapV3Rpc,
-    materialize_uniswap_v3_branch,
-    AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
-    AUXILIARY_PROTOCOL_STATE_HYDRATORS,
-);
+        "uniswap_v3",
+        BootstrapStrategy::UniswapV3Rpc,
+        materialize_uniswap_v3_branch,
+        AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
+        AUXILIARY_PROTOCOL_STATE_HYDRATORS,
+    );
 
 const UNISWAP_V2_V3_MEMBERS: &[FamilyMemberSpec] =
     &[UNISWAP_V2_MEMBER, UNISWAP_V3_MEMBER_WITH_AUXILIARY_RUNTIME_HOOKS];
 
-const UNISWAP_V2_V3_FAMILY: FamilyRuntimeSpec = canonical_shared_family_runtime_spec!(
-    "uniswap",
-    UNISWAP_V2_V3_MEMBERS,
-    None,
-);
+const UNISWAP_V2_V3_FAMILY: FamilyRuntimeSpec =
+    canonical_shared_family_runtime_spec!("uniswap", UNISWAP_V2_V3_MEMBERS, None,);
 
 const DEFAULT_FAMILY_RUNTIME_SPECS: &[FamilyRuntimeSpec] = &[UNISWAP_V2_V3_FAMILY];
 
@@ -84,15 +80,15 @@ mod tests {
     fn default_uniswap_family_uses_generic_shared_bootstrap_plan_materializer() {
         let families = default_family_runtime_specs();
         assert_eq!(families.len(), 1);
-        assert!(families[0].shared_bootstrap_runtime().is_none());
+        assert!(families[0]
+            .shared_bootstrap_runtime()
+            .is_none());
 
         let materializer = default_family_runtime_registry()
-            .resolve_shared_bootstrap_plan_materializer("uniswap")
-            .expect("resolve uniswap bootstrap materializer");
+            .resolve_shared_bootstrap_execution("uniswap")
+            .expect("resolve uniswap bootstrap execution")
+            .plan_materializer;
 
-        assert_eq!(
-            materializer as usize,
-            default_shared_bootstrap_plan_materializer() as usize
-        );
+        assert_eq!(materializer as usize, default_shared_bootstrap_plan_materializer() as usize);
     }
 }

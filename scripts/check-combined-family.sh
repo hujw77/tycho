@@ -18,8 +18,8 @@ Modes:
   doctor    Report whether the combined-family validation surface is ready.
             With `--strict`, exits non-zero when any required dependency is not ready.
   command   Print the exact command for the selected validation mode.
-            `acceptance` runs the repo-local extensibility contract gate plus the DB-backed
-            shared-runtime acceptance gate.
+            `acceptance` runs the repo-local extensibility contract gate, the repo-local Fynd
+            replay contract gate, and the DB-backed shared-runtime acceptance gate.
             `repo` runs the repo-local DB-backed regression gate.
             `live` runs the live combined-family Fynd E2E gate.
             `live-managed` starts the combined-family indexer, waits for health, then runs the
@@ -27,15 +27,17 @@ Modes:
             `full` runs `acceptance` first, then `live`.
             `full-managed` runs `acceptance` first, then `live-managed`.
             `all` runs `repo` first, then `live`.
-  run-acceptance Execute the repo-local extensibility contract gate, then the DB-backed
-                 shared-runtime acceptance gate.
+  run-acceptance Execute the repo-local extensibility contract gate, the repo-local Fynd replay
+                 contract gate, then the DB-backed shared-runtime acceptance gate.
   run-repo  Execute the repo-local DB-backed regression gate.
   run-live  Execute the live combined-family Fynd E2E gate.
   run-live-managed Start the combined-family indexer, then execute the live Fynd E2E gate.
-  run-full  Execute the repo-local extensibility contract gate, then the DB-backed
-            shared-runtime acceptance gate, then the live Fynd E2E gate.
-  run-full-managed Execute the repo-local extensibility contract gate, then the DB-backed
-                   shared-runtime acceptance gate, then the managed live Fynd E2E gate.
+  run-full  Execute the repo-local extensibility contract gate, the repo-local Fynd replay
+            contract gate, then the DB-backed shared-runtime acceptance gate, then the live
+            Fynd E2E gate.
+  run-full-managed Execute the repo-local extensibility contract gate, the repo-local Fynd replay
+                   contract gate, then the DB-backed shared-runtime acceptance gate, then the
+                   managed live Fynd E2E gate.
   run-all   Execute the repo-local DB gate, then the live Fynd E2E gate.
 
 Environment:
@@ -44,6 +46,8 @@ Environment:
                          Forwarded to `check-combined-family-db.sh`
   TYCHO_COMBINED_FAMILY_EXTENSIBILITY_TEST_MANIFEST
                          Forwarded to `check-combined-family-extensibility.sh`
+  TYCHO_COMBINED_FAMILY_FYND_REPLAY_TEST_MANIFEST
+                         Forwarded to `check-combined-family-fynd-replay.sh`
   TYCHO_COMBINED_FAMILY_LIVE_SELECTION
                          Default: all
                          One of: route, settlement, all
@@ -93,6 +97,7 @@ shell_escape() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-db.sh"
 EXTENSIBILITY_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-extensibility.sh"
+FYND_REPLAY_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-fynd-replay.sh"
 LIVE_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-fynd-live-e2e.sh"
 INDEXER_RUN_SCRIPT="${SCRIPT_DIR}/run-combined-family-indexer.sh"
 
@@ -284,8 +289,10 @@ doctor() {
   local repo_output
   local extensibility_output
   local live_output
+  local fynd_replay_output
   local operator_output
   local extensibility_ready
+  local fynd_replay_ready
   local repo_ready
   local live_ready
   local operator_ready
@@ -298,10 +305,12 @@ doctor() {
   local ready="true"
 
   extensibility_output="$(run_doctor_capture "${EXTENSIBILITY_GATE_SCRIPT}")"
+  fynd_replay_output="$(run_doctor_capture "${FYND_REPLAY_GATE_SCRIPT}")"
   repo_output="$(run_doctor_capture "${DB_GATE_SCRIPT}")"
   live_output="$(run_doctor_capture "${LIVE_GATE_SCRIPT}")"
   operator_output="$(run_doctor_capture "${INDEXER_RUN_SCRIPT}")"
   extensibility_ready="$(readiness_from_output "${extensibility_output}")"
+  fynd_replay_ready="$(readiness_from_output "${fynd_replay_output}")"
   repo_ready="$(readiness_from_output "${repo_output}")"
   live_ready="$(readiness_from_output "${live_output}")"
   operator_ready="$(readiness_from_output "${operator_output}")"
@@ -310,7 +319,7 @@ doctor() {
   live_test_mapping_ready="$(field_from_output "${live_output}" "live_test_mapping_ready")"
   live_curl_available="$(field_from_output "${live_output}" "curl_available")"
 
-  if [[ "${extensibility_ready}" != "true" || "${repo_ready}" != "true" || "${live_ready}" != "true" ]]; then
+  if [[ "${extensibility_ready}" != "true" || "${fynd_replay_ready}" != "true" || "${repo_ready}" != "true" || "${live_ready}" != "true" ]]; then
     ready="false"
   fi
 
@@ -324,15 +333,16 @@ doctor() {
   fi
 
   managed_full_ready="false"
-  if [[ "${extensibility_ready}" == "true" && "${repo_ready}" == "true" && "${managed_live_ready}" == "true" ]]; then
+  if [[ "${extensibility_ready}" == "true" && "${fynd_replay_ready}" == "true" && "${repo_ready}" == "true" && "${managed_live_ready}" == "true" ]]; then
     managed_full_ready="true"
   fi
 
   cat <<EOF
 ready=${ready}
-acceptance_ready=$([[ "${extensibility_ready}" == "true" && "${repo_ready}" == "true" ]] && printf 'true' || printf 'false')
+acceptance_ready=$([[ "${extensibility_ready}" == "true" && "${fynd_replay_ready}" == "true" && "${repo_ready}" == "true" ]] && printf 'true' || printf 'false')
 full_ready=${ready}
 extensibility_ready=${extensibility_ready}
+fynd_replay_ready=${fynd_replay_ready}
 repo_ready=${repo_ready}
 live_ready=${live_ready}
 operator_ready=${operator_ready}
@@ -343,16 +353,19 @@ live_fynd_test_exists=${live_fynd_test_exists}
 live_test_mapping_ready=${live_test_mapping_ready}
 live_curl_available=${live_curl_available}
 extensibility_gate_script=${EXTENSIBILITY_GATE_SCRIPT}
+fynd_replay_gate_script=${FYND_REPLAY_GATE_SCRIPT}
 db_gate_script=${DB_GATE_SCRIPT}
 live_gate_script=${LIVE_GATE_SCRIPT}
 indexer_run_script=${INDEXER_RUN_SCRIPT}
 extensibility_doctor_command=$(printf '%s doctor' "$(shell_escape "${EXTENSIBILITY_GATE_SCRIPT}")")
+fynd_replay_doctor_command=$(printf '%s doctor' "$(shell_escape "${FYND_REPLAY_GATE_SCRIPT}")")
 repo_doctor_command=$(printf '%s doctor' "$(shell_escape "${DB_GATE_SCRIPT}")")
 live_doctor_command=$(printf '%s doctor' "$(shell_escape "${LIVE_GATE_SCRIPT}")")
 operator_doctor_command=$(printf '%s doctor' "$(shell_escape "${INDEXER_RUN_SCRIPT}")")
 acceptance_run_command=$(
   {
     "${EXTENSIBILITY_GATE_SCRIPT}" command
+    "${FYND_REPLAY_GATE_SCRIPT}" command
     "${DB_GATE_SCRIPT}" command
   } | flatten_output
 )
@@ -363,6 +376,7 @@ operator_run_command=$("${INDEXER_RUN_SCRIPT}" command | flatten_output)
 full_run_command=$(
   {
     "${EXTENSIBILITY_GATE_SCRIPT}" command
+    "${FYND_REPLAY_GATE_SCRIPT}" command
     "${DB_GATE_SCRIPT}" command
     "${LIVE_GATE_SCRIPT}" command "${LIVE_SELECTION}"
   } | flatten_output
@@ -382,6 +396,7 @@ render_command() {
     acceptance)
       cat <<EOF
 $("${EXTENSIBILITY_GATE_SCRIPT}" command)
+$("${FYND_REPLAY_GATE_SCRIPT}" command)
 $("${DB_GATE_SCRIPT}" command)
 EOF
       ;;
@@ -399,6 +414,7 @@ EOF
     full)
       cat <<EOF
 $("${EXTENSIBILITY_GATE_SCRIPT}" command)
+$("${FYND_REPLAY_GATE_SCRIPT}" command)
 $("${DB_GATE_SCRIPT}" command)
 $("${LIVE_GATE_SCRIPT}" command "${LIVE_SELECTION}")
 EOF
@@ -427,6 +443,7 @@ run_repo() {
 
 run_acceptance() {
   "${EXTENSIBILITY_GATE_SCRIPT}" run
+  "${FYND_REPLAY_GATE_SCRIPT}" run
   run_repo
 }
 

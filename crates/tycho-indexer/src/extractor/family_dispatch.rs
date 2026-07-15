@@ -12,6 +12,7 @@ use crate::{
         },
         family_dispatch_registry::{FamilyDispatchRegistry, FamilyDispatcherSeed},
         family_dispatch_splitter::split_family_block_changes,
+        family_runtime_planning::ResolvedFamilyRuntimeContract,
         protocol_cache::ProtocolMemoryCache,
         ExtractionError,
     },
@@ -115,6 +116,12 @@ pub struct FamilyBlockChangesDispatcher {
 }
 
 impl FamilyBlockChangesDispatcher {
+    pub fn new_for_runtime_contract(
+        contract: &ResolvedFamilyRuntimeContract,
+    ) -> Result<Self, ExtractionError> {
+        Self::new(contract.branch_specs().iter().cloned())
+    }
+
     pub fn new(
         branches: impl IntoIterator<Item = FamilyBranchSpec>,
     ) -> Result<Self, ExtractionError> {
@@ -139,6 +146,13 @@ impl FamilyBlockChangesDispatcher {
         Ok(dispatcher)
     }
 
+    pub fn new_with_seed_for_runtime_contract(
+        contract: &ResolvedFamilyRuntimeContract,
+        seed: FamilyDispatcherSeed,
+    ) -> Result<Self, ExtractionError> {
+        Self::new_with_seed(contract.branch_specs().iter().cloned(), seed)
+    }
+
     pub async fn from_protocol_cache(
         branches: &[FamilyBranchSpec],
         protocol_cache: &ProtocolMemoryCache,
@@ -146,6 +160,18 @@ impl FamilyBlockChangesDispatcher {
         let seed =
             FamilyBranchSpec::dispatcher_seed_from_protocol_cache(branches, protocol_cache).await;
         Self::new_with_seed(branches.iter().cloned(), seed?)
+    }
+
+    pub async fn from_protocol_cache_for_runtime_contract(
+        contract: &ResolvedFamilyRuntimeContract,
+        protocol_cache: &ProtocolMemoryCache,
+    ) -> Result<Self, ExtractionError> {
+        let seed = FamilyBranchSpec::dispatcher_seed_from_protocol_cache(
+            contract.branch_specs(),
+            protocol_cache,
+        )
+        .await?;
+        Self::new_with_seed_for_runtime_contract(contract, seed)
     }
 
     pub async fn hydrate_from_protocol_cache_by_component_ids(
@@ -298,6 +324,7 @@ mod tests {
 
     use crate::extractor::{
         extractor_config::{ExtractorConfig, ProtocolTypeConfig},
+        family_runtime_planning::ResolvedFamilyRuntimeContract,
         protocol_cache::{ProtocolDataCache, ProtocolMemoryCache},
     };
     use crate::pb::sf::substreams::{
@@ -496,6 +523,63 @@ mod tests {
         assert_eq!(branches.len(), 2);
         assert_eq!(
             FamilyBranchSpec::protocol_system_set(branches.iter()),
+            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
+        );
+    }
+
+    #[test]
+    fn builds_dispatcher_from_runtime_contract() {
+        let contract = ResolvedFamilyRuntimeContract {
+            shared_extractor_id: "ethereum:uniswap_family".to_string(),
+            branch_specs: vec![
+                branch("uniswap_v2", "uniswap_v2_pool"),
+                branch("uniswap_v3", "uniswap_v3_pool"),
+            ],
+        };
+
+        let mut dispatcher = FamilyBlockChangesDispatcher::new_for_runtime_contract(&contract)
+            .expect("dispatcher builds from runtime contract");
+
+        let input = substreams::BlockChanges {
+            block: Some(test_block()),
+            changes: vec![substreams::TransactionChanges {
+                tx: Some(test_tx()),
+                contract_changes: vec![],
+                entity_changes: vec![],
+                component_changes: vec![
+                    substreams::ProtocolComponent {
+                        id: "v2-pool".to_string(),
+                        protocol_type: Some(substreams::ProtocolType {
+                            name: "uniswap_v2_pool".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    substreams::ProtocolComponent {
+                        id: "v3-pool".to_string(),
+                        protocol_type: Some(substreams::ProtocolType {
+                            name: "uniswap_v3_pool".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                balance_changes: vec![],
+                entrypoints: vec![],
+                entrypoint_params: vec![],
+            }],
+            storage_changes: vec![],
+        };
+
+        let split = dispatcher
+            .dispatch_block_changes(input)
+            .expect("runtime-contract dispatcher should route both branches");
+
+        assert_eq!(
+            split
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
             HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
         );
     }

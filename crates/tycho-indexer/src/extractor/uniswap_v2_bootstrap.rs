@@ -18,7 +18,12 @@ use tycho_common::{
 };
 use tycho_ethereum::{rpc::EthereumRpcClient, BytesCodec};
 
-use crate::extractor::{models::BlockChanges, u256_num::bytes_to_f64, ExtractionError};
+use crate::extractor::{
+    models::BlockChanges,
+    shared_bootstrap::{parse_pool_list_bootstrap_params, SharedBootstrapParams},
+    u256_num::bytes_to_f64,
+    ExtractionError,
+};
 
 sol! {
     struct Multicall3Call {
@@ -47,11 +52,7 @@ const STATIC_RPC_BATCH_SIZE: usize = 1_000;
 const POOL_STATIC_CALLS_PER_POOL: usize = 3;
 const TRADING_FEE_BPS: i32 = 30;
 
-#[derive(Debug, Clone)]
-pub struct BootstrapParams {
-    pub bootstrap_block: u64,
-    pub pools: Vec<Bytes>,
-}
+pub type BootstrapParams = SharedBootstrapParams;
 
 #[derive(Clone, Debug)]
 struct PoolSnapshotSeed {
@@ -64,43 +65,7 @@ struct PoolSnapshotSeed {
 }
 
 pub fn parse_bootstrap_params(params: &str) -> Result<BootstrapParams, ExtractionError> {
-    let mut bootstrap_block = None;
-    let mut pools = Vec::new();
-
-    for pair in params
-        .split('&')
-        .filter(|part| !part.is_empty())
-    {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err(ExtractionError::Setup(format!("invalid bootstrap param `{pair}`")));
-        };
-
-        match key {
-            "bootstrap_block" => {
-                bootstrap_block = Some(value.parse::<u64>().map_err(|err| {
-                    ExtractionError::Setup(format!("parse bootstrap_block: {err}"))
-                })?);
-            }
-            "pool" => pools.push(parse_address(value)?),
-            "pools" => {
-                for pool in value
-                    .split(',')
-                    .filter(|pool| !pool.is_empty())
-                {
-                    pools.push(parse_address(pool)?);
-                }
-            }
-            _ => return Err(ExtractionError::Setup(format!("unknown bootstrap param `{key}`"))),
-        }
-    }
-
-    let bootstrap_block = bootstrap_block
-        .ok_or_else(|| ExtractionError::Setup("missing `bootstrap_block`".to_string()))?;
-    if pools.is_empty() {
-        return Err(ExtractionError::Setup("missing `pool` or `pools`".to_string()));
-    }
-
-    Ok(BootstrapParams { bootstrap_block, pools })
+    parse_pool_list_bootstrap_params(params)
 }
 
 pub async fn build_uniswap_v2_bootstrap_block(
@@ -303,15 +268,6 @@ fn read_call_request(to: AlloyAddress, calldata: Vec<u8>) -> TransactionRequest 
     TransactionRequest::default()
         .to(to)
         .input(TransactionInput::both(calldata.into()))
-}
-
-fn parse_address(value: &str) -> Result<Bytes, ExtractionError> {
-    let address = Bytes::from_str(value)
-        .map_err(|err| ExtractionError::Setup(format!("parse address `{value}`: {err}")))?;
-    if address.len() != 20 {
-        return Err(ExtractionError::Setup(format!("address `{value}` is not 20 bytes")));
-    }
-    Ok(address)
 }
 
 fn to_alloy_address(address: &Bytes) -> Result<AlloyAddress, ExtractionError> {

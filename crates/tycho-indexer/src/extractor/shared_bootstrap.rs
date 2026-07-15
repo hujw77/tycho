@@ -15,6 +15,7 @@ use tycho_ethereum::rpc::EthereumRpcClient;
 use crate::extractor::{
     extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
     family_bootstrap_registry::ResolvedSharedBootstrapBranchRuntime,
+    family_bootstrap_registry::ResolvedSharedBootstrapExecution,
     family_registry::default_family_runtime_registry,
     family_registry::FamilyRuntimeRegistry,
     models::{BlockChanges, TxWithContractChanges},
@@ -216,6 +217,109 @@ pub(crate) async fn commit_materialized_bootstrap(
         .await
 }
 
+#[derive(Clone)]
+pub(crate) enum MaterializedBootstrapCommitTarget {
+    WholeBlock { extractor: Arc<dyn Extractor> },
+    ProtocolSystemBranch { protocol_system: String, extractor: Arc<dyn Extractor> },
+}
+
+impl MaterializedBootstrapCommitTarget {
+    pub(crate) fn whole_block(extractor: Arc<dyn Extractor>) -> Self {
+        Self::WholeBlock { extractor }
+    }
+
+    pub(crate) fn protocol_system_branch(
+        protocol_system: impl Into<String>,
+        extractor: Arc<dyn Extractor>,
+    ) -> Self {
+        Self::ProtocolSystemBranch { protocol_system: protocol_system.into(), extractor }
+    }
+}
+
+pub(crate) async fn execute_materialized_bootstrap_plan(
+    rpc: &EthereumRpcClient,
+    plan: &SharedBootstrapPlan,
+    execution: &ResolvedSharedBootstrapExecution,
+    branch_targets: Vec<MaterializedBootstrapCommitTarget>,
+    completion_extractor: Arc<dyn Extractor>,
+) -> Result<(), ExtractionError> {
+    let merged_changes = execution
+        .materialize_plan(rpc, plan)
+        .await?;
+    let bootstrap_block_hash = merged_changes.block.hash.clone();
+    let commit_targets =
+        resolve_materialized_bootstrap_commit_targets(branch_targets, merged_changes)?;
+
+    commit_materialized_bootstrap(
+        commit_targets,
+        completion_extractor,
+        plan.bootstrap_block,
+        bootstrap_block_hash,
+    )
+    .await
+}
+
+pub(crate) fn resolve_materialized_bootstrap_commit_targets(
+    branch_targets: Vec<MaterializedBootstrapCommitTarget>,
+    merged_changes: BlockChanges,
+) -> Result<Vec<(Arc<dyn Extractor>, BlockChanges)>, ExtractionError> {
+    if branch_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let has_whole_block_targets = branch_targets
+        .iter()
+        .any(|target| matches!(target, MaterializedBootstrapCommitTarget::WholeBlock { .. }));
+    let has_protocol_targets = branch_targets.iter().any(|target| {
+        matches!(target, MaterializedBootstrapCommitTarget::ProtocolSystemBranch { .. })
+    });
+
+    if has_whole_block_targets && has_protocol_targets {
+        return Err(ExtractionError::Setup(
+            "materialized bootstrap commit targets cannot mix whole-block and protocol-system branches"
+                .to_string(),
+        ));
+    }
+
+    if has_whole_block_targets {
+        let mut whole_block_targets = branch_targets.into_iter();
+        let Some(MaterializedBootstrapCommitTarget::WholeBlock { extractor }) =
+            whole_block_targets.next()
+        else {
+            unreachable!("whole-block bootstrap target detection should match first target")
+        };
+        if whole_block_targets.next().is_some() {
+            return Err(ExtractionError::Setup(
+                "whole-block bootstrap commit targets require exactly one extractor".to_string(),
+            ));
+        }
+        return Ok(vec![(extractor, merged_changes)]);
+    }
+
+    let split_changes = split_plan_block_by_protocol_system(merged_changes)?;
+    let mut commit_targets = Vec::with_capacity(branch_targets.len());
+    for target in branch_targets {
+        let MaterializedBootstrapCommitTarget::ProtocolSystemBranch { protocol_system, extractor } =
+            target
+        else {
+            unreachable!(
+                "protocol-system bootstrap target detection should exclude whole-block targets"
+            );
+        };
+        let changes = split_changes
+            .get(&protocol_system)
+            .cloned()
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
+                    "shared bootstrap plan did not produce branch block for {protocol_system}"
+                ))
+            })?;
+        commit_targets.push((extractor, changes));
+    }
+
+    Ok(commit_targets)
+}
+
 pub(crate) async fn materialize_plan_by_branch_runtimes(
     rpc: &EthereumRpcClient,
     plan: &SharedBootstrapPlan,
@@ -268,10 +372,19 @@ pub fn split_plan_block_by_protocol_system(
     for tx_with_changes in block_changes.txs_with_update {
         let split = split_tx_with_changes_by_protocol_system(tx_with_changes)?;
         for (protocol_system, split_tx) in split {
-            let touched_tokens = split_tx
+            let component_tokens = split_tx
+                .protocol_components
+                .values()
+                .flat_map(|component| component.tokens.iter().cloned())
+                .collect::<HashSet<_>>();
+            let balance_tokens = split_tx
                 .balance_changes
                 .values()
                 .flat_map(|balances| balances.keys().cloned())
+                .collect::<HashSet<_>>();
+            let touched_tokens = component_tokens
+                .into_iter()
+                .chain(balance_tokens.into_iter())
                 .collect::<HashSet<_>>();
             tokens_by_system
                 .entry(protocol_system.clone())
@@ -723,14 +836,15 @@ mod tests {
     use crate::extractor::{
         extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
         family_bootstrap_registry::SharedBootstrapParamsParser,
-        family_registry::{shared_family_member_with_bootstrap, shared_family_runtime_spec},
         family_registry::{
             default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec,
         },
+        family_registry::{shared_family_member_with_bootstrap, shared_family_runtime_spec},
         family_runtime_metadata::FamilyRuntimeConfig,
         models::{BlockChanges, TxWithContractChanges},
         ExtractionError,
     };
+    use crate::testing;
 
     use super::{
         decide_bootstrap_completion, merge_family_block_changes,
@@ -1706,6 +1820,82 @@ mod tests {
             vec![v3_contract.clone()]
         );
         assert_eq!(split["uniswap_v2"].trace_results[0].entry_point_id(), v2_entrypoint_id);
+    }
+
+    #[test]
+    fn split_plan_block_preserves_new_tokens_for_component_only_branches() {
+        let v2_token0 = Bytes::from(vec![0x21; 20]);
+        let v2_token1 = Bytes::from(vec![0x22; 20]);
+        let v3_token0 = Bytes::from(vec![0x31; 20]);
+        let v3_token1 = Bytes::from(vec![0x32; 20]);
+
+        let mut merged = BlockChanges::new(
+            "uniswap_family".to_string(),
+            Chain::Ethereum,
+            testing::block(2300),
+            2300,
+            false,
+            vec![TxWithChanges {
+                tx: Transaction {
+                    hash: Bytes::from(vec![0xab; 32]),
+                    block_hash: testing::block(2300).hash,
+                    from: Bytes::from(vec![0xcd; 20]),
+                    to: None,
+                    index: 0,
+                },
+                protocol_components: HashMap::from([
+                    (
+                        "v2-pool".to_string(),
+                        ProtocolComponent {
+                            id: "v2-pool".to_string(),
+                            protocol_system: "uniswap_v2".to_string(),
+                            tokens: vec![v2_token0.clone(), v2_token1.clone()],
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "v3-pool".to_string(),
+                        ProtocolComponent {
+                            id: "v3-pool".to_string(),
+                            protocol_system: "uniswap_v3".to_string(),
+                            tokens: vec![v3_token0.clone(), v3_token1.clone()],
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+                ..Default::default()
+            }],
+            vec![],
+        );
+        merged.new_tokens = HashMap::from([
+            (
+                v2_token0.clone(),
+                Token::new(&v2_token0, "TKA", 18, 0, &[Some(2300)], Chain::Ethereum, 100),
+            ),
+            (
+                v2_token1.clone(),
+                Token::new(&v2_token1, "TKB", 18, 0, &[Some(2300)], Chain::Ethereum, 100),
+            ),
+            (
+                v3_token0.clone(),
+                Token::new(&v3_token0, "TKC", 18, 0, &[Some(2300)], Chain::Ethereum, 100),
+            ),
+            (
+                v3_token1.clone(),
+                Token::new(&v3_token1, "TKD", 18, 0, &[Some(2300)], Chain::Ethereum, 100),
+            ),
+        ]);
+
+        let split = split_plan_block_by_protocol_system(merged).expect("split succeeds");
+
+        assert_eq!(
+            split["uniswap_v2"].new_tokens.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([v2_token0, v2_token1])
+        );
+        assert_eq!(
+            split["uniswap_v3"].new_tokens.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([v3_token0, v3_token1])
+        );
     }
 
     #[test]

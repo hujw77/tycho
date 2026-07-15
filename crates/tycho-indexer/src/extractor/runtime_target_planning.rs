@@ -1,14 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 
 use serde::Serialize;
-use tycho_common::models::{Chain, ExtractorIdentity};
 use tycho_common::models::Address;
+use tycho_common::models::{Chain, ExtractorIdentity};
 
 use crate::extractor::{
-    extractor_config::configured_stream_start_block,
-    extractor_config::ExtractorConfig,
+    extractor_config::configured_stream_start_block, extractor_config::ExtractorConfig,
     family_runtime_planning::ResolvedFamilyRuntime,
-    ExtractionError,
+    managed_substreams_request::PreparedSubstreamsRequest, ExtractionError,
 };
 
 #[derive(Clone, Debug)]
@@ -69,6 +68,17 @@ trait RuntimeTargetPlanningView<'a> {
         start_block: i64,
     ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError>;
 
+    fn prepared_substreams_request_with_stream_position(
+        &self,
+        start_block: i64,
+        cursor: Option<String>,
+    ) -> Result<PreparedSubstreamsRequest, ExtractionError> {
+        Ok(PreparedSubstreamsRequest {
+            request: self.substreams_execution_request_with_start_block(start_block)?,
+            cursor,
+        })
+    }
+
     fn initialized_accounts_requests(&self) -> Vec<ResolvedInitializedAccountsRequest> {
         initialized_accounts_requests_for_configs(self.chain(), self.extractor_configs())
     }
@@ -110,36 +120,26 @@ impl<'a> ResolvedFamilyRuntime<'a> {
     pub fn substreams_execution_request(
         &self,
     ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        self.substreams_execution_request_with_start_block(self.execution.configured_start_block)
+        self.substreams_execution_request_with_start_block(self.configured_start_block())
     }
 
     pub fn substreams_execution_request_with_start_block(
         &self,
         start_block: i64,
     ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        Ok(ResolvedSubstreamsExecutionRequest {
-            spkg: self
-                .execution
-                .shared_stream
-                .spkg
-                .clone(),
-            module: self
-                .execution
-                .shared_stream
-                .module
-                .clone(),
+        Ok(self.shared_stream_runtime.request.with_start_block(start_block))
+    }
+
+    pub fn prepared_substreams_request_with_stream_position(
+        &self,
+        start_block: i64,
+        cursor: Option<String>,
+    ) -> Result<PreparedSubstreamsRequest, ExtractionError> {
+        <Self as RuntimeTargetPlanningView>::prepared_substreams_request_with_stream_position(
+            self,
             start_block,
-            stop_block: self.execution.stop_block,
-            params: self
-                .execution
-                .merged_substreams_params
-                .clone(),
-            extractor_id: self
-                .execution
-                .shared_stream
-                .extractor_id
-                .clone(),
-        })
+            cursor,
+        )
     }
 }
 
@@ -176,6 +176,18 @@ impl<'a> ResolvedStandaloneRuntime<'a> {
             )
             .to_string(),
         })
+    }
+
+    pub fn prepared_substreams_request_with_stream_position(
+        &self,
+        start_block: i64,
+        cursor: Option<String>,
+    ) -> Result<PreparedSubstreamsRequest, ExtractionError> {
+        <Self as RuntimeTargetPlanningView>::prepared_substreams_request_with_stream_position(
+            self,
+            start_block,
+            cursor,
+        )
     }
 }
 
@@ -272,6 +284,15 @@ impl<'a> ResolvedRuntimeTarget<'a> {
 
     pub fn chain(&self) -> Chain {
         self.planning_view().chain()
+    }
+
+    pub fn prepared_substreams_request_with_stream_position(
+        &self,
+        start_block: i64,
+        cursor: Option<String>,
+    ) -> Result<PreparedSubstreamsRequest, ExtractionError> {
+        self.planning_view()
+            .prepared_substreams_request_with_stream_position(start_block, cursor)
     }
 
     pub fn extractor_configs(&self) -> Vec<&'a ExtractorConfig> {
@@ -532,17 +553,22 @@ impl<'a> ResolvedRuntimeTargets<'a> {
 mod tests {
     use std::collections::HashMap;
 
-    use tycho_common::Bytes;
     use tycho_common::models::{Chain, FinancialType, ImplementationType};
+    use tycho_common::Bytes;
 
     use crate::extractor::{
-        extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig},
+        extractor_config::{
+            BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig,
+        },
         family_registry::default_family_runtime_registry,
         family_runtime_metadata::{FamilyRuntimeConfig, ResolvedSharedFamilyStream},
         family_runtime_planning::build_resolved_runtime_targets,
     };
 
-    use super::{ResolvedRuntimeTarget, ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets, ResolvedStandaloneRuntime};
+    use super::{
+        ResolvedRuntimeTarget, ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets,
+        ResolvedStandaloneRuntime,
+    };
 
     fn family_shared_stream(
         chain: Chain,
@@ -839,6 +865,92 @@ mod tests {
                 ("map_events".to_string(), "factory=0x02".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn resolved_runtime_target_derives_family_prepared_substreams_request_with_cursor() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let family_target = targets
+            .into_iter()
+            .find(|target| matches!(target, ResolvedRuntimeTarget::Family(_)))
+            .expect("family target present");
+
+        let prepared_request = family_target
+            .prepared_substreams_request_with_stream_position(
+                88,
+                Some("cursor:shared-family".to_string()),
+            )
+            .expect("family prepared request derives with cursor");
+
+        assert_eq!(
+            prepared_request.request.spkg,
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
+        );
+        assert_eq!(prepared_request.request.start_block, 88);
+        assert_eq!(prepared_request.request.extractor_id, "ethereum:uniswap_family");
+        assert_eq!(prepared_request.cursor, Some("cursor:shared-family".to_string()));
+    }
+
+    #[test]
+    fn resolved_runtime_target_derives_standalone_prepared_substreams_request_with_cursor() {
+        let curve = ExtractorConfig::new(
+            "curve".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            100,
+            Some(150),
+            vec![ProtocolTypeConfig::new("curve_pool".to_string(), FinancialType::Swap)],
+            "protocols/substreams/curve/curve.spkg".to_string(),
+            "map_curve".to_string(),
+            vec![],
+            0,
+            None,
+            None,
+            HashMap::from([("curve_events".to_string(), "factory=0x03".to_string())]),
+            Some(BootstrapConfig {
+                strategy: BootstrapStrategy::UniswapV2Rpc,
+                start_block: 100,
+                params: "bootstrap_block=100&pools=0x03".to_string(),
+            }),
+        );
+        let target = ResolvedRuntimeTarget::Standalone(ResolvedStandaloneRuntime {
+            protocol_system: "curve",
+            extractor_config: &curve,
+        });
+
+        let prepared_request = target
+            .prepared_substreams_request_with_stream_position(111, Some("cursor:curve".to_string()))
+            .expect("standalone prepared request derives with cursor");
+
+        assert_eq!(prepared_request.request.spkg, "protocols/substreams/curve/curve.spkg");
+        assert_eq!(prepared_request.request.module, "map_curve");
+        assert_eq!(prepared_request.request.start_block, 111);
+        assert_eq!(prepared_request.request.extractor_id, "ethereum:curve");
+        assert_eq!(prepared_request.cursor, Some("cursor:curve".to_string()));
     }
 
     #[test]
@@ -1215,9 +1327,15 @@ mod tests {
             .into_unique("test-runtime-targets should contain exactly one target")
             .expect_err("multiple targets should fail unique selection");
 
-        assert!(err.to_string().contains("available targets:"));
-        assert!(err.to_string().contains("family:uniswap"));
-        assert!(err.to_string().contains("protocol_system:curve"));
+        assert!(err
+            .to_string()
+            .contains("available targets:"));
+        assert!(err
+            .to_string()
+            .contains("family:uniswap"));
+        assert!(err
+            .to_string()
+            .contains("protocol_system:curve"));
     }
 
     #[test]

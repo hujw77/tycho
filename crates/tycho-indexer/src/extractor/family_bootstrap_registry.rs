@@ -120,41 +120,16 @@ impl<'a> FamilyRuntimeRegistry<'a> {
         Ok(())
     }
 
-    pub fn materialize_shared_bootstrap_plan<'b>(
-        &'b self,
-        family_name: &str,
-        rpc: &'b EthereumRpcClient,
-        plan: &'b SharedBootstrapPlan,
-    ) -> Result<
-        Pin<Box<dyn Future<Output = Result<BlockChanges, ExtractionError>> + Send + 'b>>,
-        ExtractionError,
-    > {
-        let execution = self.resolve_shared_bootstrap_execution(family_name)?;
-        Ok(Box::pin(async move {
-            execution
-                .materialize_plan(rpc, plan)
-                .await
-        }))
-    }
-
-    pub fn resolve_shared_bootstrap_plan_materializer(
-        &self,
-        family_name: &str,
-    ) -> Result<MaterializeBootstrapPlanFn, ExtractionError> {
-        let spec =
-            self.require_family_spec(family_name, "shared bootstrap plan materializer for")?;
-        Ok(spec
-            .shared_bootstrap_runtime()
-            .map(|runtime| runtime.materialize_plan)
-            .unwrap_or_else(default_shared_bootstrap_plan_materializer))
-    }
-
     pub fn resolve_shared_bootstrap_execution(
         &self,
         family_name: &str,
     ) -> Result<ResolvedSharedBootstrapExecution, ExtractionError> {
+        let spec = self.validate_shared_bootstrap_support_for_family(family_name)?;
         Ok(ResolvedSharedBootstrapExecution {
-            plan_materializer: self.resolve_shared_bootstrap_plan_materializer(family_name)?,
+            plan_materializer: spec
+                .shared_bootstrap_runtime()
+                .map(|runtime| runtime.materialize_plan)
+                .unwrap_or_else(default_shared_bootstrap_plan_materializer),
             branch_runtimes: self.resolve_shared_bootstrap_branch_runtimes(family_name)?,
         })
     }
@@ -446,19 +421,21 @@ impl<'a> FamilyRuntimeRegistry<'a> {
 mod tests {
     use std::collections::HashMap;
 
-    use tycho_common::models::{Chain, FinancialType, ImplementationType};
     use std::{future::Future, pin::Pin};
+    use tycho_common::models::{Chain, FinancialType, ImplementationType};
 
     use tycho_common::Bytes;
     use tycho_ethereum::rpc::EthereumRpcClient;
 
     use crate::extractor::{
-        extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig},
+        extractor_config::{
+            BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig,
+        },
         family_registry::{
             canonical_shared_family_runtime_spec, default_family_runtime_registry,
             pool_list_bootstrap_member_runtime, shared_family_member_spec,
-            shared_family_member_with_bootstrap, shared_family_runtime_spec,
-            FamilyRuntimeRegistry, FamilyRuntimeSpec,
+            shared_family_member_with_bootstrap, shared_family_runtime_spec, FamilyRuntimeRegistry,
+            FamilyRuntimeSpec,
         },
         family_runtime_metadata::FamilyRuntimeConfig,
         models::BlockChanges,
@@ -569,7 +546,10 @@ mod tests {
         };
 
         let family_name = registry
-            .resolve_shared_bootstrap_plan_family_name(&[(&v2, &v2_bootstrap), (&v3, &v3_bootstrap)])
+            .resolve_shared_bootstrap_plan_family_name(&[
+                (&v2, &v2_bootstrap),
+                (&v3, &v3_bootstrap),
+            ])
             .expect("family name should resolve");
 
         assert_eq!(family_name, Some("uniswap".to_string()));
@@ -748,8 +728,9 @@ mod tests {
         };
 
         let err = registry
-            .materialize_shared_bootstrap_plan("future_swap", &rpc, &plan)
-            .expect("registry should resolve default plan materializer")
+            .resolve_shared_bootstrap_execution("future_swap")
+            .expect("registry should resolve default bootstrap execution")
+            .materialize_plan(&rpc, &plan)
             .await
             .expect_err("default branch-level materializer should run");
 
@@ -863,6 +844,62 @@ mod tests {
 
         assert!(err.to_string().contains(
             "family bootstrap defaults for `partial_swap` requires protocol system `partial_v2` to declare a shared bootstrap strategy"
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_shared_bootstrap_execution_when_family_membership_exceeds_bootstrap_support() {
+        const PARTIAL_FAMILY: FamilyRuntimeSpec = canonical_shared_family_runtime_spec!(
+            "partial_swap",
+            &[
+                shared_family_member_spec(
+                    "partial_v1",
+                    &["partialv1"],
+                    Some(pool_list_bootstrap_member_runtime(
+                        BootstrapStrategy::UniswapV2Rpc,
+                        noop_materialize_branch,
+                    )),
+                ),
+                shared_family_member_spec("partial_v2", &["partialv2"], None),
+            ],
+            None,
+        );
+        let registry = FamilyRuntimeRegistry::new(&[PARTIAL_FAMILY]);
+
+        let err = registry
+            .resolve_shared_bootstrap_execution("partial_swap")
+            .expect_err("shared bootstrap execution should reject partial family bootstrap support");
+
+        assert!(err.to_string().contains(
+            "family bootstrap defaults for `partial_swap` require every member to declare a shared bootstrap strategy"
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_shared_bootstrap_execution_for_protocol_system_when_family_is_partial() {
+        const PARTIAL_FAMILY: FamilyRuntimeSpec = canonical_shared_family_runtime_spec!(
+            "partial_swap",
+            &[
+                shared_family_member_spec(
+                    "partial_v1",
+                    &["partialv1"],
+                    Some(pool_list_bootstrap_member_runtime(
+                        BootstrapStrategy::UniswapV2Rpc,
+                        noop_materialize_branch,
+                    )),
+                ),
+                shared_family_member_spec("partial_v2", &["partialv2"], None),
+            ],
+            None,
+        );
+        let registry = FamilyRuntimeRegistry::new(&[PARTIAL_FAMILY]);
+
+        let err = registry
+            .resolve_shared_bootstrap_execution_for_protocol_system("partial_v1")
+            .expect_err("protocol-scoped shared bootstrap execution should reject partial family support");
+
+        assert!(err.to_string().contains(
+            "family bootstrap defaults for `partial_swap` require every member to declare a shared bootstrap strategy"
         ));
     }
 

@@ -1,9 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::*;
-use crate::extractor::family_runtime_planning::resolved_family_execution_config_from_extractor_configs_for_tests;
 use crate::extractor::managed_stream_startup::build_substreams_stream_from_prepared_request;
-use crate::extractor::managed_substreams_request::PreparedSubstreamsRequest;
+use crate::extractor::managed_substreams_request::{
+    prepare_substreams_request_for_runtime_target, FamilyPreparedRequestContext,
+    PreparedSubstreamsRequest,
+};
 use crate::extractor::runtime_target_planning::ResolvedRuntimeTarget;
 use crate::extractor::substreams_package_loader::LoadedSubstreamsPackage;
 use crate::extractor::{Extractor, PersistedExtractorStateScope};
@@ -13,14 +15,14 @@ use futures03::StreamExt;
 use tycho_ethereum::rpc::EthereumRpcClient;
 
 #[tokio::test]
-async fn test_resolve_family_stream_start_uses_next_aligned_resume_block() {
+async fn test_resolve_family_stream_position_uses_next_aligned_resume_block() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
     v2.expect_supports_persisted_state_scope()
         .once()
-        .return_const(true);
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
@@ -33,7 +35,7 @@ async fn test_resolve_family_stream_start_uses_next_aligned_resume_block() {
         .returning(|| Some(Block { number: 100, ..Default::default() }));
     v3.expect_supports_persisted_state_scope()
         .once()
-        .return_const(true);
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
@@ -47,23 +49,28 @@ async fn test_resolve_family_stream_start_uses_next_aligned_resume_block() {
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for aligned resume start");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let start = resolve_family_stream_start(&extractors, &family_execution)
+    let position = resolve_family_stream_position(&extractors, &resolved_family)
         .await
         .expect("aligned progress should resolve");
 
-    assert_eq!(start, 101);
+    assert_eq!(
+        position,
+        ResolvedFamilyStreamPosition { start_block: 101, cursor: Some("cursor-100".to_string()) }
+    );
 }
 
 #[tokio::test]
-async fn test_resolve_family_stream_cursor_rejects_misaligned_resumed_branch_cursors() {
+async fn test_resolve_family_stream_position_rejects_misaligned_resumed_branch_cursors() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-v2".to_string());
@@ -75,6 +82,9 @@ async fn test_resolve_family_stream_cursor_rejects_misaligned_resumed_branch_cur
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-v3".to_string());
@@ -89,13 +99,12 @@ async fn test_resolve_family_stream_cursor_rejects_misaligned_resumed_branch_cur
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
 
-    let err = resolve_family_stream_cursor(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for cursor mismatch"),
-    )
-    .await
-    .expect_err("misaligned resumed branch cursors should fail");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
+
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect_err("misaligned resumed branch cursors should fail");
     assert!(err
         .to_string()
         .contains("family runner requires aligned branch cursors"));
@@ -107,6 +116,9 @@ async fn test_resolve_family_stream_position_returns_aligned_resume_start_and_cu
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
@@ -118,6 +130,9 @@ async fn test_resolve_family_stream_position_returns_aligned_resume_start_and_cu
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-100".to_string());
@@ -132,13 +147,12 @@ async fn test_resolve_family_stream_position_returns_aligned_resume_start_and_cu
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
 
-    let position = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for aligned position"),
-    )
-    .await
-    .expect("aligned resumed family stream position should resolve");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
+
+    let position = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect("aligned resumed family stream position should resolve");
 
     assert_eq!(
         position,
@@ -188,14 +202,12 @@ async fn test_resolve_family_stream_position_rejects_legacy_fallback_cursor_scop
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let err = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for legacy fallback cursor scope"),
-    )
-    .await
-    .expect_err("legacy fallback cursor scope should fail shared family resume");
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect_err("legacy fallback cursor scope should fail shared family resume");
 
     assert!(err
         .to_string()
@@ -208,6 +220,9 @@ async fn test_resolve_family_stream_position_uses_shared_cursor_for_alias_named_
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-100-shared".to_string());
@@ -219,6 +234,9 @@ async fn test_resolve_family_stream_position_uses_shared_cursor_for_alias_named_
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-100-shared".to_string());
@@ -232,14 +250,12 @@ async fn test_resolve_family_stream_position_uses_shared_cursor_for_alias_named_
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let position = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for alias-keyed position"),
-    )
-    .await
-    .expect("aligned resumed alias family stream position should resolve");
+    let position = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect("aligned resumed alias family stream position should resolve");
 
     assert_eq!(
         position,
@@ -256,6 +272,9 @@ async fn test_resolve_family_stream_position_rejects_empty_resumed_shared_cursor
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .times(0..=1)
         .returning(String::new);
@@ -267,6 +286,9 @@ async fn test_resolve_family_stream_position_rejects_empty_resumed_shared_cursor
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .times(0..=1)
         .returning(String::new);
@@ -280,14 +302,12 @@ async fn test_resolve_family_stream_position_rejects_empty_resumed_shared_cursor
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let err = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for empty cursor rejection"),
-    )
-    .await
-    .expect_err("empty resumed shared cursor should fail");
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect_err("empty resumed shared cursor should fail");
 
     assert!(err
         .to_string()
@@ -300,6 +320,9 @@ async fn test_resolve_family_stream_position_treats_bootstrap_marker_as_no_resum
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 42, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@42".to_string());
@@ -311,6 +334,9 @@ async fn test_resolve_family_stream_position_treats_bootstrap_marker_as_no_resum
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 42, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@42".to_string());
@@ -324,14 +350,12 @@ async fn test_resolve_family_stream_position_treats_bootstrap_marker_as_no_resum
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let position = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for bootstrap-only marker resume"),
-    )
-    .await
-    .expect("bootstrap-only marker cursors should resolve as no shared stream cursor");
+    let position = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect("bootstrap-only marker cursors should resolve as no shared stream cursor");
 
     assert_eq!(position, ResolvedFamilyStreamPosition { start_block: 43, cursor: None });
 }
@@ -342,6 +366,9 @@ async fn test_resolve_family_stream_position_rejects_mixed_bootstrap_marker_and_
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 42, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@42".to_string());
@@ -353,6 +380,9 @@ async fn test_resolve_family_stream_position_rejects_mixed_bootstrap_marker_and_
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 42, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor@42".to_string());
@@ -366,14 +396,12 @@ async fn test_resolve_family_stream_position_rejects_mixed_bootstrap_marker_and_
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let err = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for mixed marker/cursor rejection"),
-    )
-    .await
-    .expect_err("mixed bootstrap-only markers and stream cursors should fail");
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect_err("mixed bootstrap-only markers and stream cursors should fail");
 
     assert!(err.to_string().contains("cannot mix"));
 }
@@ -384,6 +412,9 @@ async fn test_resolve_family_stream_position_rejects_bootstrap_marker_block_drif
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 42, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@41".to_string());
@@ -395,6 +426,9 @@ async fn test_resolve_family_stream_position_rejects_bootstrap_marker_block_drif
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 42, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "bootstrap@41".to_string());
@@ -408,14 +442,12 @@ async fn test_resolve_family_stream_position_rejects_bootstrap_marker_block_drif
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let err = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for bootstrap marker drift rejection"),
-    )
-    .await
-    .expect_err("bootstrap-only marker block drift should fail");
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect_err("bootstrap-only marker block drift should fail");
 
     assert!(err
         .to_string()
@@ -428,6 +460,9 @@ async fn test_resolve_family_stream_position_rejects_resume_block_overflow() {
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: u64::MAX, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-max".to_string());
@@ -439,6 +474,9 @@ async fn test_resolve_family_stream_position_rejects_resume_block_overflow() {
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: u64::MAX, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-max".to_string());
@@ -452,14 +490,12 @@ async fn test_resolve_family_stream_position_rejects_resume_block_overflow() {
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let err = resolve_family_stream_position(
-        &extractors,
-        &resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for overflow rejection"),
-    )
-    .await
-    .expect_err("resume block overflow should fail");
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
+        .await
+        .expect_err("resume block overflow should fail");
 
     assert!(err
         .to_string()
@@ -467,11 +503,14 @@ async fn test_resolve_family_stream_position_rejects_resume_block_overflow() {
 }
 
 #[tokio::test]
-async fn test_resolve_family_stream_start_rejects_misaligned_resume_blocks() {
+async fn test_resolve_family_stream_position_rejects_misaligned_resume_blocks() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-v2".to_string());
@@ -482,6 +521,9 @@ async fn test_resolve_family_stream_start_rejects_misaligned_resume_blocks() {
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 101, ..Default::default() }));
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(|| "cursor-v3".to_string());
@@ -495,11 +537,10 @@ async fn test_resolve_family_stream_start_rejects_misaligned_resume_blocks() {
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for misaligned resume blocks");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let err = resolve_family_stream_start(&extractors, &family_execution)
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
         .await
         .expect_err("misaligned progress should fail");
 
@@ -509,11 +550,14 @@ async fn test_resolve_family_stream_start_rejects_misaligned_resume_blocks() {
 }
 
 #[tokio::test]
-async fn test_resolve_family_stream_start_rejects_mixed_resumed_and_fresh_branches() {
+async fn test_resolve_family_stream_position_rejects_mixed_resumed_and_fresh_branches() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-v2".to_string());
@@ -524,6 +568,9 @@ async fn test_resolve_family_stream_start_rejects_mixed_resumed_and_fresh_branch
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(String::new);
@@ -537,11 +584,10 @@ async fn test_resolve_family_stream_start_rejects_mixed_resumed_and_fresh_branch
     ]);
     let configs = make_uniswap_family_runtime_test_configs(42, 42);
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives for mixed resumed/fresh rejection");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
 
-    let err = resolve_family_stream_start(&extractors, &family_execution)
+    let err = resolve_family_stream_position(&extractors, &resolved_family)
         .await
         .expect_err("mixed branch progress should fail");
 
@@ -551,7 +597,7 @@ async fn test_resolve_family_stream_start_rejects_mixed_resumed_and_fresh_branch
 }
 
 #[tokio::test]
-async fn test_resolve_family_stream_start_uses_bootstrap_adjusted_aligned_fresh_start() {
+async fn test_resolve_family_stream_position_uses_bootstrap_adjusted_aligned_fresh_start() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
         .once()
@@ -618,15 +664,14 @@ async fn test_resolve_family_stream_start_uses_bootstrap_adjusted_aligned_fresh_
         },
     ];
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution derives");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "test-shared.spkg");
 
-    let start = resolve_family_stream_start(&extractors, &family_execution)
+    let position = resolve_family_stream_position(&extractors, &resolved_family)
         .await
         .expect("aligned fresh bootstrap branches should resolve");
 
-    assert_eq!(start, 43);
+    assert_eq!(position, ResolvedFamilyStreamPosition { start_block: 43, cursor: None });
 }
 
 #[tokio::test]
@@ -666,9 +711,11 @@ async fn test_resolve_family_stream_start_rejects_misaligned_fresh_branch_starts
         },
     ];
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect_err("misaligned fresh family starts should fail in family execution config");
+    let family_execution = try_resolved_family_runtime_from_configs_for_tests(
+        &config_refs,
+        "/tmp/misaligned-fresh-starts.spkg",
+    )
+    .expect_err("misaligned fresh family starts should fail in full family runtime resolution");
 
     assert!(family_execution
         .to_string()
@@ -681,6 +728,9 @@ async fn test_run_family_bootstrap_if_needed_rejects_mixed_progress_before_boots
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| Some(Block { number: 100, ..Default::default() }));
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(|| "cursor-v2".to_string());
@@ -691,6 +741,9 @@ async fn test_run_family_bootstrap_if_needed_rejects_mixed_progress_before_boots
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(String::new);
@@ -704,13 +757,12 @@ async fn test_run_family_bootstrap_if_needed_rejects_mixed_progress_before_boots
     ]);
     let configs = make_uniswap_family_bootstrap_test_configs();
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution config derives for bootstrap preflight");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
     let rpc_client = EthereumRpcClient::new("http://localhost:8545")
         .expect("rpc client builds for non-networked preflight");
 
-    let err = run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
+    let err = run_family_bootstrap_if_needed(&extractors, &resolved_family, &rpc_client)
         .await
         .expect_err("mixed progress should fail before bootstrap materialization");
 
@@ -740,6 +792,9 @@ async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_c
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(String::new);
@@ -751,6 +806,9 @@ async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_c
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(String::new);
@@ -764,17 +822,16 @@ async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_c
     ]);
     let configs = make_uniswap_family_bootstrap_test_configs();
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let mut family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution config derives for completion test");
-    family_execution
-        .shared_bootstrap_execution
+    let mut resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
+    resolved_family
+        .shared_bootstrap_execution_mut()
         .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
         EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
-    run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
+    run_family_bootstrap_if_needed(&extractors, &resolved_family, &rpc_client)
         .await
         .expect("completed shared bootstrap should be skipped before materialization");
 }
@@ -785,6 +842,9 @@ async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootst
     v2.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_cursor()
         .once()
         .returning(String::new);
@@ -796,6 +856,9 @@ async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootst
     v3.expect_get_last_processed_block()
         .once()
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_cursor()
         .once()
         .returning(String::new);
@@ -809,17 +872,16 @@ async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootst
     ]);
     let configs = make_uniswap_family_bootstrap_test_configs();
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let mut family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution config derives for misaligned completion test");
-    family_execution
-        .shared_bootstrap_execution
+    let mut resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
+    resolved_family
+        .shared_bootstrap_execution_mut()
         .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
         EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
-    let err = run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
+    let err = run_family_bootstrap_if_needed(&extractors, &resolved_family, &rpc_client)
         .await
         .expect_err("misaligned shared bootstrap completion should fail before materialization");
     assert!(err
@@ -869,17 +931,16 @@ async fn test_run_family_bootstrap_if_needed_rejects_legacy_fallback_bootstrap_s
     ]);
     let configs = make_uniswap_family_bootstrap_test_configs();
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let mut family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution config derives for legacy fallback bootstrap scope");
-    family_execution
-        .shared_bootstrap_execution
+    let mut resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
+    resolved_family
+        .shared_bootstrap_execution_mut()
         .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
         EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
-    let err = run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
+    let err = run_family_bootstrap_if_needed(&extractors, &resolved_family, &rpc_client)
         .await
         .expect_err("legacy fallback bootstrap scope should fail shared bootstrap skip path");
     assert!(err
@@ -894,29 +955,29 @@ async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_af
     v2.expect_get_last_processed_block()
         .times(2)
         .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .times(2)
+        .return_const(false);
     v2.expect_get_cursor()
         .times(2)
         .returning(String::new);
     v2.expect_get_completed_bootstrap_block()
         .times(2)
         .returning(|| Ok(Some(42)));
-    v2.expect_supports_persisted_state_scope()
-        .times(2)
-        .return_const(false);
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
         .times(2)
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .times(2)
+        .return_const(false);
     v3.expect_get_cursor()
         .times(2)
         .returning(String::new);
     v3.expect_get_completed_bootstrap_block()
         .times(2)
         .returning(|| Ok(Some(42)));
-    v3.expect_supports_persisted_state_scope()
-        .times(2)
-        .return_const(false);
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
@@ -928,19 +989,25 @@ async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_af
         resolved_family_runtime_from_configs_for_tests(&config_refs, "test-shared.spkg");
     let rpc_client =
         EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
+    let bootstrap_commit_wiring =
+        crate::extractor::family_runner_wiring::FamilyBootstrapCommitWiring::from_runtime_contract(
+            &resolved_family.runtime_contract(),
+            &extractors,
+        )
+        .expect("resolved family bootstrap commit wiring");
 
-    let prepared_request = resolved_family
-        .prepare_substreams_request(&extractors, &rpc_client)
-        .await
-        .expect("completed shared bootstrap should shape request without rerunning bootstrap");
+    let prepared_request = prepare_substreams_request_for_runtime_target(
+        &resolved_family,
+        &FamilyPreparedRequestContext {
+            extractors: extractors.clone(),
+            bootstrap_commit_wiring,
+        },
+        &rpc_client,
+    )
+    .await
+    .expect("completed shared bootstrap should shape request without rerunning bootstrap");
 
-    assert_eq!(
-        prepared_request.request.spkg,
-        resolved_family
-            .execution
-            .shared_stream
-            .spkg
-    );
+    assert_eq!(prepared_request.request.spkg, resolved_family.family.shared_spkg());
     assert_eq!(prepared_request.request.module, family_output_module_for_tests("uniswap"));
     assert_eq!(prepared_request.request.start_block, 43);
     assert_eq!(prepared_request.cursor, None);
@@ -956,6 +1023,9 @@ async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
     v2.expect_get_last_processed_block()
         .times(2)
         .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .times(2)
+        .return_const(false);
     v2.expect_get_cursor()
         .times(2)
         .returning(String::new);
@@ -967,6 +1037,9 @@ async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
     v3.expect_get_last_processed_block()
         .times(2)
         .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .times(2)
+        .return_const(false);
     v3.expect_get_cursor()
         .times(2)
         .returning(String::new);
@@ -981,24 +1054,20 @@ async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
 
     let configs = make_uniswap_family_bootstrap_test_configs();
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let mut family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution config derives for stream request test");
-    family_execution
-        .shared_bootstrap_execution
-        .plan_materializer = fail_if_shared_bootstrap_materialized;
     let mut resolved_family =
         resolved_family_runtime_from_configs_for_tests(&config_refs, "test-family.spkg");
-    resolved_family.execution = family_execution.clone();
+    resolved_family
+        .shared_bootstrap_execution_mut()
+        .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
         EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
 
-    run_family_bootstrap_if_needed(&extractors, &family_execution, &rpc_client)
+    run_family_bootstrap_if_needed(&extractors, &resolved_family, &rpc_client)
         .await
         .expect("completed shared bootstrap should skip materialization");
 
-    let stream_position = resolve_family_stream_position(&extractors, &family_execution)
+    let stream_position = resolve_family_stream_position(&extractors, &resolved_family)
         .await
         .expect("completed shared bootstrap should produce fresh family stream position");
 

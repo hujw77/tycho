@@ -10,6 +10,7 @@ use crate::{
         control::{ExtractorHandle, SubscriptionsMap},
         managed_substreams_request::PreparedSubstreamsRequest,
         runner::ManagedRunner,
+        runtime_targets_startup::PreparedManagedRunnerStartup,
         single_runtime_execution::ExtractorRunner,
         substreams_package_loader::{load_substreams_package, LoadedSubstreamsPackage},
         ExtractionError, Extractor,
@@ -18,9 +19,15 @@ use crate::{
 };
 
 #[cfg(test)]
+use crate::extractor::runtime_targets_startup::PreparedRuntimeTargetKind;
+
+#[cfg(test)]
 use crate::extractor::{
     extractor_config::ExtractorConfig,
     family_registry::default_family_runtime_registry,
+    managed_substreams_request::{
+        prepare_substreams_request_for_runtime_target, StandalonePreparedRequestContext,
+    },
     runtime_target_planning::ResolvedStandaloneRuntime,
 };
 
@@ -30,27 +37,43 @@ pub(crate) struct PreparedSingleRunnerStartup {
     pub(crate) stream: SubstreamsStream,
 }
 
-impl PreparedSingleRunnerStartup {
-    pub(crate) fn into_managed_runner(
-        self,
+impl PreparedManagedRunnerStartup for PreparedSingleRunnerStartup {
+    fn build_managed_runner(
+        self: Box<Self>,
         runtime_handle: Option<Handle>,
         partial_blocks: bool,
-    ) -> (ManagedRunner, Vec<ExtractorHandle>) {
+    ) -> Result<(ManagedRunner, Vec<ExtractorHandle>), ExtractionError> {
+        let this = *self;
         let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
         let subscriptions: SubscriptionsMap = HashMap::new();
         let runner = ExtractorRunner::new(
-            self.extractor,
-            self.stream,
+            this.extractor,
+            this.stream,
             Arc::new(Mutex::new(subscriptions)),
             ctrl_rx,
             runtime_handle,
             partial_blocks,
         );
 
-        (
+        Ok((
             ManagedRunner::new(runner),
-            vec![ExtractorHandle::new(self.extractor_id, ctrl_tx)],
-        )
+            vec![ExtractorHandle::new(this.extractor_id, ctrl_tx)],
+        ))
+    }
+
+    #[cfg(test)]
+    fn kind(&self) -> PreparedRuntimeTargetKind {
+        PreparedRuntimeTargetKind::Standalone
+    }
+
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    #[cfg(test)]
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }
 
@@ -113,16 +136,20 @@ pub(crate) async fn build_test_single_runner(
     runtime_handle: Option<Handle>,
 ) -> Result<(ExtractorRunner, ExtractorHandle), ExtractionError> {
     let extractor_id = extractor.get_id();
-    let prepared_request = ResolvedStandaloneRuntime {
+    let runtime_target = ResolvedStandaloneRuntime {
         protocol_system: config.protocol_system(),
         extractor_config: config,
-    }
-    .prepare_substreams_request(
-        extractor.clone(),
-        &extractor_id,
-        &tycho_ethereum::rpc::EthereumRpcClient::new("http://localhost:0000")
-            .expect("build stub rpc client for request preparation"),
-        default_family_runtime_registry(),
+    };
+    let rpc_client = tycho_ethereum::rpc::EthereumRpcClient::new("http://localhost:0000")
+        .expect("build stub rpc client for request preparation");
+    let prepared_request = prepare_substreams_request_for_runtime_target(
+        &runtime_target,
+        &StandalonePreparedRequestContext {
+            extractor: extractor.clone(),
+            extractor_id: extractor_id.clone(),
+            registry: default_family_runtime_registry(),
+        },
+        &rpc_client,
     )
     .await?;
     let stream = load_stream_for_prepared_request(
@@ -135,8 +162,8 @@ pub(crate) async fn build_test_single_runner(
     )
     .await?;
     let prepared_startup = PreparedSingleRunnerStartup { extractor, extractor_id, stream };
-    let (runner, mut handles) =
-        prepared_startup.into_managed_runner(runtime_handle, partial_blocks);
+    let (runner, mut handles) = Box::new(prepared_startup)
+        .build_managed_runner(runtime_handle, partial_blocks)?;
     let runner: ExtractorRunner = runner.into_typed();
     Ok((
         runner,

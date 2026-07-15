@@ -7,9 +7,7 @@ use crate::extractor::{
     extractor_config::ExtractorConfig,
     family_bootstrap_registry::SharedBootstrapMemberRuntime,
     family_registry::{FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec},
-    protocol_message_registry::{
-        AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator,
-    },
+    protocol_message_registry::{AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator},
     ExtractionError,
 };
 
@@ -114,8 +112,9 @@ impl ExtractorConfig {
                     ))
                 })?;
 
-                let registry_metadata = registry
-                    .and_then(|registry| registry.shared_runtime_metadata_for_family(&runtime.family));
+                let registry_metadata = registry.and_then(|registry| {
+                    registry.shared_runtime_metadata_for_family(&runtime.family)
+                });
 
                 let module = runtime
                     .shared_module()
@@ -189,15 +188,11 @@ impl<'a> RegisteredProtocolSystemDefaults<'a> {
         normalized_shared_route_protocols_for_member(self.member_spec)
     }
 
-    pub(crate) fn auxiliary_protocol_message_decoders(
-        &self,
-    ) -> &[AuxiliaryProtocolMessageDecoder] {
+    pub(crate) fn auxiliary_protocol_message_decoders(&self) -> &[AuxiliaryProtocolMessageDecoder] {
         &self.auxiliary_protocol_message_decoders
     }
 
-    pub(crate) fn auxiliary_protocol_state_hydrators(
-        &self,
-    ) -> &[AuxiliaryProtocolStateHydrator] {
+    pub(crate) fn auxiliary_protocol_state_hydrators(&self) -> &[AuxiliaryProtocolStateHydrator] {
         &self.auxiliary_protocol_state_hydrators
     }
 
@@ -342,7 +337,9 @@ impl<'a> FamilyRuntimeRegistry<'a> {
                             .filter(|decoder| decoder.protocol_system == protocol_system)
                             .collect()
                     } else {
-                        member.auxiliary_protocol_message_decoders().to_vec()
+                        member
+                            .auxiliary_protocol_message_decoders()
+                            .to_vec()
                     },
                     auxiliary_protocol_state_hydrators: if member
                         .auxiliary_protocol_state_hydrators()
@@ -354,7 +351,9 @@ impl<'a> FamilyRuntimeRegistry<'a> {
                             .filter(|hydrator| hydrator.protocol_system == protocol_system)
                             .collect()
                     } else {
-                        member.auxiliary_protocol_state_hydrators().to_vec()
+                        member
+                            .auxiliary_protocol_state_hydrators()
+                            .to_vec()
                     },
                 })
         })
@@ -412,20 +411,30 @@ impl<'a> FamilyRuntimeRegistry<'a> {
             .map(|defaults| defaults.family_name())
     }
 
+    #[cfg(test)]
     pub(crate) fn auxiliary_protocol_message_decoders_for_protocol_system(
         &self,
         protocol_system: &str,
     ) -> Option<Vec<AuxiliaryProtocolMessageDecoder>> {
         self.registered_protocol_system_defaults(protocol_system)
-            .map(|defaults| defaults.auxiliary_protocol_message_decoders().to_vec())
+            .map(|defaults| {
+                defaults
+                    .auxiliary_protocol_message_decoders()
+                    .to_vec()
+            })
     }
 
+    #[cfg(test)]
     pub(crate) fn auxiliary_protocol_state_hydrators_for_protocol_system(
         &self,
         protocol_system: &str,
     ) -> Option<Vec<AuxiliaryProtocolStateHydrator>> {
         self.registered_protocol_system_defaults(protocol_system)
-            .map(|defaults| defaults.auxiliary_protocol_state_hydrators().to_vec())
+            .map(|defaults| {
+                defaults
+                    .auxiliary_protocol_state_hydrators()
+                    .to_vec()
+            })
     }
 
     pub fn require_family_name_for_protocol_systems<'b>(
@@ -611,13 +620,17 @@ mod tests {
                 .strategy,
             crate::extractor::extractor_config::BootstrapStrategy::UniswapV3Rpc
         );
-        assert_eq!(defaults.auxiliary_protocol_message_decoders().len(), 1);
         assert_eq!(
-            defaults.auxiliary_protocol_message_decoders()[0].protocol_system,
-            "uniswap_v3"
+            defaults
+                .auxiliary_protocol_message_decoders()
+                .len(),
+            1
         );
+        assert_eq!(defaults.auxiliary_protocol_message_decoders()[0].protocol_system, "uniswap_v3");
 
-        assert!(registry.registered_protocol_system_defaults("curve").is_none());
+        assert!(registry
+            .registered_protocol_system_defaults("curve")
+            .is_none());
     }
 
     #[test]
@@ -654,7 +667,9 @@ mod tests {
         const OTHER_MEMBERS: &[FamilyMemberSpec] = &[OTHER_MEMBER];
         const OTHER_FAMILY: FamilyRuntimeSpec =
             canonical_shared_family_runtime_spec!("other_swap", OTHER_MEMBERS, None);
-        let mut specs = default_family_runtime_registry().specs().to_vec();
+        let mut specs = default_family_runtime_registry()
+            .specs()
+            .to_vec();
         specs.push(OTHER_FAMILY);
 
         let registry = FamilyRuntimeRegistry::new(&specs);
@@ -748,7 +763,11 @@ mod tests {
         );
         assert_eq!(
             registry.durability_scope_for_family("uniswap"),
-            Some(expected_shared_stream.durability_scope.as_str())
+            Some(
+                expected_shared_stream
+                    .durability_scope
+                    .as_str()
+            )
         );
         assert_eq!(registry.shared_stream_name_for_family("curve"), None);
         assert_eq!(registry.durability_scope_for_family("curve"), None);
@@ -872,15 +891,10 @@ mod tests {
 
     #[test]
     fn registry_resolves_family_runtime_config_with_registry_durability_scope_default() {
-        const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
-            "future_swap",
-            &[shared_family_member_spec("future_v1", &["futurev1"], None)],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
+        let registry = crate::extractor::test_support::future_family_runtime_registry_for_tests(
+            &["future_v1"],
             "family::future_swap_runtime",
-            None,
         );
-        let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
 
         let resolved = registry
             .resolve_family_runtime_config(
@@ -943,7 +957,8 @@ mod tests {
             .validate()
             .expect("bootstrap-capable member without explicit route aliases should default from protocol system");
         assert_eq!(
-            registry.normalized_shared_route_protocol_filter_for_protocol_system("broken_protocol_v2"),
+            registry
+                .normalized_shared_route_protocol_filter_for_protocol_system("broken_protocol_v2"),
             Some(HashSet::from(["brokenprotocolv2".to_string()]))
         );
     }
@@ -974,32 +989,22 @@ mod tests {
             _partial_block_index: Option<u32>,
         ) -> AuxiliaryProtocolMessageBuildFuture<'a> {
             Box::pin(async {
-                Err(ExtractionError::Unknown(
-                    "test-only decoder should not run".to_string(),
-                ))
+                Err(ExtractionError::Unknown("test-only decoder should not run".to_string()))
             })
         }
 
-        const FUTURE_DECODERS: &[AuxiliaryProtocolMessageDecoder] = &[AuxiliaryProtocolMessageDecoder {
-            protocol_system: "future_v1",
-            type_url_suffix: "FutureEvents",
-            build_block_changes: build_future_events,
-        }];
-        const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
-            "future_swap",
-            &[crate::extractor::family_registry::shared_family_member_spec_with_auxiliary_runtime_hooks(
-                "future_v1",
-                &["futurev1"],
-                None,
-                FUTURE_DECODERS,
-                &[],
-            )],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
+        const FUTURE_DECODERS: &[AuxiliaryProtocolMessageDecoder] =
+            &[AuxiliaryProtocolMessageDecoder {
+                protocol_system: "future_v1",
+                type_url_suffix: "FutureEvents",
+                build_block_changes: build_future_events,
+            }];
+        let registry = crate::extractor::test_support::future_family_runtime_registry_with_member_auxiliary_decoders_for_tests(
+            &["future_v1"],
+            "future_v1",
             "family::future_swap_runtime",
-            None,
+            FUTURE_DECODERS,
         );
-        let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
 
         let decoders = registry
             .auxiliary_protocol_message_decoders_for_protocol_system("future_v1")

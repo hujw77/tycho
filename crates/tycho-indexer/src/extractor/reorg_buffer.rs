@@ -393,9 +393,9 @@ where
         let mut res = HashMap::new();
 
         for block_message in self.block_messages.iter().rev() {
-            for (key, val) in block_message.get_protocol_state_update_for_components(
-                component_ids.to_vec(),
-            ) {
+            for (key, val) in
+                block_message.get_protocol_state_update_for_components(component_ids.to_vec())
+            {
                 res.entry(key).or_insert(val);
             }
         }

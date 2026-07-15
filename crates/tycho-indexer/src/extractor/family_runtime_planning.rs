@@ -4,49 +4,94 @@ use tycho_common::models::Chain;
 
 use crate::extractor::{
     extractor_config::{configured_stream_start_block, ExtractorConfig},
-    family_dispatch::FamilyBranchSpec,
     family_bootstrap_registry::ResolvedSharedBootstrapExecution,
+    family_dispatch::FamilyBranchSpec,
     family_registry::{default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec},
     family_runtime_metadata::ResolvedSharedFamilyStream,
-    protocol_message_registry::AuxiliaryProtocolMessageDecoder,
-    runtime_target_planning::{ResolvedRuntimeTarget, ResolvedStandaloneRuntime},
+    protocol_message_registry::{AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator},
+    runtime_target_planning::{
+        ResolvedRuntimeTarget, ResolvedStandaloneRuntime, ResolvedSubstreamsExecutionRequest,
+    },
     shared_bootstrap::SharedBootstrapPlan,
     ExtractionError,
 };
 
-pub(crate) fn merge_substreams_params(
-    merged: &mut HashMap<String, String>,
-    incoming: &HashMap<String, String>,
-    extractor_name: &str,
-) -> Result<(), ExtractionError> {
-    for (key, value) in incoming {
-        if let Some(existing) = merged.get(key) {
-            if existing != value {
-                return Err(ExtractionError::Setup(format!(
-                    "conflicting substreams param `{key}` while building family runner for `{extractor_name}`"
-                )));
-            }
-        } else {
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    Ok(())
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FamilySharedSubstreamsParams {
+    params: HashMap<String, String>,
 }
 
-pub(crate) fn merged_family_substreams_params(
-    extractor_configs: &[&ExtractorConfig],
-) -> Result<HashMap<String, String>, ExtractionError> {
-    let mut merged_substreams_params = HashMap::new();
-
-    for config in extractor_configs {
-        merge_substreams_params(
-            &mut merged_substreams_params,
-            &config.substreams_params,
-            config.name(),
-        )?;
+impl FamilySharedSubstreamsParams {
+    fn merge_from_extractor(
+        merged: &mut HashMap<String, String>,
+        config: &ExtractorConfig,
+    ) -> Result<(), ExtractionError> {
+        for (key, value) in &config.substreams_params {
+            if let Some(existing) = merged.get(key) {
+                if existing != value {
+                    return Err(ExtractionError::Setup(format!(
+                        "conflicting substreams param `{key}` while building family runner for `{}`",
+                        config.name()
+                    )));
+                }
+            } else {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(())
     }
 
-    Ok(merged_substreams_params)
+    pub(crate) fn from_extractor_configs(
+        extractor_configs: &[&ExtractorConfig],
+    ) -> Result<Self, ExtractionError> {
+        let mut merged = HashMap::new();
+
+        for config in extractor_configs {
+            Self::merge_from_extractor(&mut merged, config)?;
+        }
+
+        Ok(Self { params: merged })
+    }
+
+    pub(crate) fn as_map(&self) -> &HashMap<String, String> {
+        &self.params
+    }
+}
+
+impl FamilySharedStreamSettings {
+    fn from_extractor_configs(
+        family: &DetectedFamilyRuntime,
+        extractor_configs: &[&ExtractorConfig],
+    ) -> Result<Self, ExtractionError> {
+        let merged_substreams_params =
+            FamilySharedSubstreamsParams::from_extractor_configs(extractor_configs).map_err(
+                |err| match err {
+                    ExtractionError::Setup(message) => ExtractionError::Setup(format!(
+                        "family `{}` has incompatible shared substreams params: {message}",
+                        family.family_name
+                    )),
+                    other => other,
+                },
+            )?;
+
+        let first_config = extractor_configs.first().ok_or_else(|| {
+            ExtractionError::Setup(format!(
+                "family `{}` has no extractor configs to resolve stream settings",
+                family.family_name
+            ))
+        })?;
+
+        let stop_block =
+            u64::try_from(first_config.stop_block().unwrap_or(0)).map_err(|_| {
+                ExtractionError::Setup(format!(
+                    "family `{}` resolved stop_block exceeds u64",
+                    family.family_name
+                ))
+            })?;
+        let configured_start_block = configured_stream_start_block(first_config)?;
+
+        Ok(Self { merged_substreams_params, stop_block, configured_start_block })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,22 +113,91 @@ pub struct FamilyRuntimeBuildPlan {
 pub struct ResolvedFamilyRuntime<'a> {
     pub family: DetectedFamilyRuntime,
     pub extractor_configs: Vec<&'a ExtractorConfig>,
-    pub execution: ResolvedFamilyExecutionConfig,
+    pub(crate) shared_stream_runtime: ResolvedFamilyStreamRuntime,
+    pub(crate) shared_bootstrap: ResolvedFamilyBootstrapRuntime,
+    pub(crate) execution: ResolvedFamilyExecutionConfig,
 }
 
 #[derive(Clone, Debug)]
-pub struct ResolvedFamilyExecutionConfig {
+pub(crate) struct ResolvedFamilyExecutionConfig {
     pub branch_specs: Vec<FamilyBranchSpec>,
-    pub shared_stream: ResolvedSharedFamilyStream,
-    pub shared_bootstrap_execution: ResolvedSharedBootstrapExecution,
     pub(crate) auxiliary_protocol_message_decoders_by_protocol_system:
         HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>>,
-    pub(crate) auxiliary_protocol_state_hydrators_by_protocol_system:
-        HashMap<String, Vec<crate::extractor::protocol_message_registry::AuxiliaryProtocolStateHydrator>>,
-    pub merged_substreams_params: HashMap<String, String>,
-    pub stop_block: u64,
-    pub configured_start_block: i64,
+    pub(crate) auxiliary_protocol_state_hydrators_by_protocol_system: HashMap<
+        String,
+        Vec<crate::extractor::protocol_message_registry::AuxiliaryProtocolStateHydrator>,
+    >,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFamilyBootstrapRuntime {
+    pub shared_bootstrap_execution: ResolvedSharedBootstrapExecution,
     pub bootstrap_plan: Option<SharedBootstrapPlan>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFamilyStreamRuntime {
+    pub request: FamilySharedSubstreamsRequest,
+    pub configured_start_block: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FamilySharedStreamSettings {
+    merged_substreams_params: FamilySharedSubstreamsParams,
+    stop_block: u64,
+    configured_start_block: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FamilySharedSubstreamsRequest {
+    spkg: String,
+    module: String,
+    stop_block: u64,
+    params: FamilySharedSubstreamsParams,
+    extractor_id: String,
+}
+
+impl FamilySharedSubstreamsRequest {
+    fn from_detected_family_runtime_and_settings(
+        family: &DetectedFamilyRuntime,
+        settings: FamilySharedStreamSettings,
+    ) -> Self {
+        Self {
+            spkg: family.shared_spkg().to_string(),
+            module: family.output_module().to_string(),
+            stop_block: settings.stop_block,
+            params: settings.merged_substreams_params,
+            extractor_id: family.shared_extractor_id().to_string(),
+        }
+    }
+
+    pub(crate) fn with_start_block(
+        &self,
+        start_block: i64,
+    ) -> ResolvedSubstreamsExecutionRequest {
+        ResolvedSubstreamsExecutionRequest {
+            spkg: self.spkg.clone(),
+            module: self.module.clone(),
+            start_block,
+            stop_block: self.stop_block,
+            params: self.params.as_map().clone(),
+            extractor_id: self.extractor_id.clone(),
+        }
+    }
+
+    pub(crate) fn stop_block(&self) -> u64 {
+        self.stop_block
+    }
+
+    pub(crate) fn params(&self) -> &HashMap<String, String> {
+        self.params.as_map()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedFamilyRuntimeContract {
+    pub shared_extractor_id: String,
+    pub branch_specs: Vec<FamilyBranchSpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,8 +224,14 @@ impl<'a> FamilyRuntimeRegistry<'a> {
                 .iter()
                 .map(|member| member.protocol_system.to_string())
                 .collect(),
-            shared_stream_name: shared_metadata.shared_stream_name.to_string(),
-            shared_stream: self.resolved_shared_stream_for_family(chain, family_name, shared_spkg)?,
+            shared_stream_name: shared_metadata
+                .shared_stream_name
+                .to_string(),
+            shared_stream: self.resolved_shared_stream_for_family(
+                chain,
+                family_name,
+                shared_spkg,
+            )?,
         })
     }
 }
@@ -126,7 +246,9 @@ impl DetectedFamilyRuntime {
     }
 
     pub fn durability_scope(&self) -> String {
-        self.shared_stream.durability_scope.clone()
+        self.shared_stream
+            .durability_scope
+            .clone()
     }
 
     pub fn shared_spkg(&self) -> &str {
@@ -135,6 +257,97 @@ impl DetectedFamilyRuntime {
 
     pub fn output_module(&self) -> &str {
         &self.shared_stream.module
+    }
+
+    pub fn shared_extractor_id(&self) -> &str {
+        &self.shared_stream.extractor_id
+    }
+}
+
+impl<'a> ResolvedFamilyRuntime<'a> {
+    pub fn configured_start_block(&self) -> i64 {
+        self.shared_stream_runtime
+            .configured_start_block
+    }
+
+    pub fn stop_block(&self) -> u64 {
+        self.shared_stream_runtime
+            .request
+            .stop_block()
+    }
+
+    pub fn merged_substreams_params(&self) -> &HashMap<String, String> {
+        self.shared_stream_runtime
+            .request
+            .params()
+    }
+
+    pub fn shared_extractor_id(&self) -> &str {
+        self.family.shared_extractor_id()
+    }
+
+    pub fn branch_specs(&self) -> &[FamilyBranchSpec] {
+        &self.execution.branch_specs
+    }
+
+    pub fn shared_bootstrap_plan(&self) -> Option<&SharedBootstrapPlan> {
+        self.shared_bootstrap
+            .bootstrap_plan
+            .as_ref()
+    }
+
+    pub fn shared_bootstrap_execution(&self) -> &ResolvedSharedBootstrapExecution {
+        &self
+            .shared_bootstrap
+            .shared_bootstrap_execution
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_bootstrap_execution_mut(
+        &mut self,
+    ) -> &mut ResolvedSharedBootstrapExecution {
+        &mut self
+            .shared_bootstrap
+            .shared_bootstrap_execution
+    }
+
+    pub fn runtime_contract(&self) -> ResolvedFamilyRuntimeContract {
+        ResolvedFamilyRuntimeContract {
+            shared_extractor_id: self.family.shared_extractor_id().to_string(),
+            branch_specs: self.execution.branch_specs.clone(),
+        }
+    }
+
+    pub(crate) fn auxiliary_protocol_message_decoders_by_protocol_system(
+        &self,
+    ) -> &HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>> {
+        &self
+            .execution
+            .auxiliary_protocol_message_decoders_by_protocol_system
+    }
+
+    pub(crate) fn auxiliary_protocol_state_hydrators_by_protocol_system(
+        &self,
+    ) -> &HashMap<String, Vec<AuxiliaryProtocolStateHydrator>> {
+        &self
+            .execution
+            .auxiliary_protocol_state_hydrators_by_protocol_system
+    }
+}
+
+impl ResolvedFamilyRuntimeContract {
+    pub fn shared_extractor_id(&self) -> &str {
+        &self.shared_extractor_id
+    }
+
+    pub fn branch_specs(&self) -> &[FamilyBranchSpec] {
+        &self.branch_specs
+    }
+
+    pub fn branch_protocol_systems(&self) -> impl Iterator<Item = &str> {
+        self.branch_specs
+            .iter()
+            .map(|branch| branch.protocol_system.as_str())
     }
 }
 
@@ -493,72 +706,96 @@ pub(crate) fn resolve_resolved_family_execution_config(
     validate_resolved_family_stream_config(family, extractor_configs)?;
 
     let branch_specs = FamilyBranchSpec::from_extractor_configs(extractor_configs)?;
-    let merged_substreams_params =
-        merged_family_substreams_params(extractor_configs).map_err(|err| match err {
-            ExtractionError::Setup(message) => ExtractionError::Setup(format!(
-                "family `{}` has incompatible shared substreams params: {message}",
-                family.family_name
-            )),
-            other => other,
-        })?;
-
-    let first_config = extractor_configs
-        .first()
-        .ok_or_else(|| {
-            ExtractionError::Setup(format!(
-                "family `{}` has no extractor configs to resolve execution settings",
-                family.family_name
-            ))
-        })?;
-
-    let stop_block = u64::try_from(first_config.stop_block().unwrap_or(0)).map_err(|_| {
-        ExtractionError::Setup(format!(
-            "family `{}` resolved stop_block exceeds u64",
-            family.family_name
-        ))
-    })?;
-    let configured_start_block = configured_stream_start_block(first_config)?;
-    let bootstrap_plan = resolve_family_bootstrap_plan(extractor_configs, registry)?;
-    let shared_bootstrap_execution: ResolvedSharedBootstrapExecution =
-        registry.resolve_shared_bootstrap_execution(&family.family_name)?;
+    let family_spec = registry.require_family_spec(&family.family_name, "family execution")?;
     let auxiliary_protocol_message_decoders_by_protocol_system = extractor_configs
         .iter()
         .map(|config| {
+            let protocol_system = config.protocol_system();
+            let member_spec = family_spec
+                .members()
+                .iter()
+                .find(|member| member.protocol_system == protocol_system)
+                .expect("validated family member should exist in runtime registry");
             (
-                config.protocol_system().to_string(),
-                registry
-                    .auxiliary_protocol_message_decoders_for_protocol_system(
-                        config.protocol_system(),
-                    )
-                    .unwrap_or_default(),
+                protocol_system.to_string(),
+                if member_spec
+                    .auxiliary_protocol_message_decoders()
+                    .is_empty()
+                {
+                    family_spec
+                        .auxiliary_protocol_message_decoders()
+                        .to_vec()
+                } else {
+                    member_spec
+                        .auxiliary_protocol_message_decoders()
+                        .to_vec()
+                },
             )
         })
         .collect::<HashMap<_, _>>();
     let auxiliary_protocol_state_hydrators_by_protocol_system = extractor_configs
         .iter()
         .map(|config| {
+            let protocol_system = config.protocol_system();
+            let member_spec = family_spec
+                .members()
+                .iter()
+                .find(|member| member.protocol_system == protocol_system)
+                .expect("validated family member should exist in runtime registry");
             (
-                config.protocol_system().to_string(),
-                registry
-                    .auxiliary_protocol_state_hydrators_for_protocol_system(
-                        config.protocol_system(),
-                    )
-                    .unwrap_or_default(),
+                protocol_system.to_string(),
+                if member_spec
+                    .auxiliary_protocol_state_hydrators()
+                    .is_empty()
+                {
+                    family_spec
+                        .auxiliary_protocol_state_hydrators()
+                        .to_vec()
+                } else {
+                    member_spec
+                        .auxiliary_protocol_state_hydrators()
+                        .to_vec()
+                },
             )
         })
         .collect::<HashMap<_, _>>();
 
     Ok(ResolvedFamilyExecutionConfig {
         branch_specs,
-        shared_stream: family.resolved_shared_stream(),
-        shared_bootstrap_execution,
         auxiliary_protocol_message_decoders_by_protocol_system,
         auxiliary_protocol_state_hydrators_by_protocol_system,
-        merged_substreams_params,
-        stop_block,
-        configured_start_block,
-        bootstrap_plan,
     })
+}
+
+pub(crate) fn resolve_resolved_family_stream_runtime(
+    family: &DetectedFamilyRuntime,
+    extractor_configs: &[&ExtractorConfig],
+) -> Result<ResolvedFamilyStreamRuntime, ExtractionError> {
+    validate_resolved_family_stream_config(family, extractor_configs)?;
+
+    let settings = FamilySharedStreamSettings::from_extractor_configs(family, extractor_configs)?;
+    let configured_start_block = settings.configured_start_block;
+    let request =
+        FamilySharedSubstreamsRequest::from_detected_family_runtime_and_settings(family, settings);
+
+    Ok(ResolvedFamilyStreamRuntime {
+        request,
+        configured_start_block,
+    })
+}
+
+pub(crate) fn resolve_resolved_family_bootstrap_runtime(
+    family: &DetectedFamilyRuntime,
+    extractor_configs: &[&ExtractorConfig],
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Result<ResolvedFamilyBootstrapRuntime, ExtractionError> {
+    validate_resolved_family_stream_config(family, extractor_configs)?;
+
+    let bootstrap_plan = resolve_family_bootstrap_plan(extractor_configs, registry)?;
+    let shared_bootstrap_execution =
+        registry.resolve_shared_bootstrap_execution(&family.family_name)?;
+
+    Ok(ResolvedFamilyBootstrapRuntime { shared_bootstrap_execution, bootstrap_plan })
 }
 
 fn validate_family_shared_bootstrap_config(
@@ -640,13 +877,7 @@ fn validate_family_shared_substreams_params(
     family: &DetectedFamilyRuntime,
     extractor_configs: &[&ExtractorConfig],
 ) -> Result<(), ExtractionError> {
-    merged_family_substreams_params(extractor_configs).map_err(|err| match err {
-        ExtractionError::Setup(message) => ExtractionError::Setup(format!(
-            "family `{}` has incompatible shared substreams params: {message}",
-            family.family_name
-        )),
-        other => other,
-    })?;
+    FamilySharedStreamSettings::from_extractor_configs(family, extractor_configs)?;
 
     Ok(())
 }
@@ -696,9 +927,19 @@ pub fn build_resolved_family_runtime_plan_with_registry<'a>(
         .into_iter()
         .map(|family| {
             let extractor_configs = family_extractor_configs(&family, extractors)?;
+            let shared_stream_runtime =
+                resolve_resolved_family_stream_runtime(&family, &extractor_configs)?;
+            let shared_bootstrap =
+                resolve_resolved_family_bootstrap_runtime(&family, &extractor_configs, registry)?;
             let execution =
                 resolve_resolved_family_execution_config(&family, &extractor_configs, registry)?;
-            Ok(ResolvedFamilyRuntime { family, extractor_configs, execution })
+            Ok(ResolvedFamilyRuntime {
+                family,
+                extractor_configs,
+                shared_stream_runtime,
+                shared_bootstrap,
+                execution,
+            })
         })
         .collect::<Result<Vec<_>, ExtractionError>>()?;
     let standalone_extractors = runtime_plan
@@ -722,76 +963,57 @@ pub fn build_resolved_family_runtime_plan_with_registry<'a>(
 }
 
 #[cfg(test)]
-pub(crate) fn resolved_family_execution_config_from_extractor_configs_for_tests(
-    extractor_configs: &[&ExtractorConfig],
-) -> Result<ResolvedFamilyExecutionConfig, ExtractionError> {
+pub(crate) fn resolved_family_runtime_from_extractor_configs_for_tests<'a>(
+    extractor_configs: &[&'a ExtractorConfig],
+    shared_spkg: &str,
+) -> Result<ResolvedFamilyRuntime<'a>, ExtractionError> {
     let registry = default_family_runtime_registry();
-    let detected_family = detect_single_test_family_runtime(extractor_configs, registry)?;
-
-    resolve_resolved_family_execution_config(&detected_family, extractor_configs, registry)
-}
-
-#[cfg(test)]
-fn infer_single_test_family_name(
-    extractor_configs: &[&ExtractorConfig],
-    registry: FamilyRuntimeRegistry<'_>,
-) -> Result<String, ExtractionError> {
-    registry
+    let family_name = registry
         .require_family_name_for_protocol_systems(
-            extractor_configs
-                .iter()
-                .map(|config| config.protocol_system()),
-            "family execution test helper",
-        )
-        .map(str::to_string)
-}
-
-#[cfg(test)]
-fn detect_single_test_family_runtime(
-    extractor_configs: &[&ExtractorConfig],
-    registry: FamilyRuntimeRegistry<'_>,
-) -> Result<DetectedFamilyRuntime, ExtractionError> {
-    let family_name = infer_single_test_family_name(extractor_configs, registry)?;
+            extractor_configs.iter().map(|config| config.protocol_system()),
+            "family runtime test helper",
+        )?
+        .to_string();
     let extractors = extractor_configs
         .iter()
-        .map(|config| (config.protocol_system().to_string(), (*config).clone()))
+        .map(|config| {
+            let mut cloned = (*config).clone();
+            cloned.family_runtime =
+                Some(crate::testing::family_runtime_config_for_tests(&family_name, shared_spkg));
+            (cloned.protocol_system().to_string(), cloned)
+        })
         .collect::<HashMap<_, _>>();
-    let detected = detect_family_runtimes_with_registry(&extractors, registry)?;
-    let detected = if detected.is_empty() {
-        let family_spec = registry.require_family_spec(&family_name, "test family runtime")?;
-        let synthetic_shared_spkg = format!("/tmp/{family_name}-family-test.spkg");
-        let enriched = extractor_configs
-            .iter()
-            .map(|config| {
-                let mut cloned = (*config).clone();
-                cloned.family_runtime = Some(crate::extractor::family_runtime_metadata::FamilyRuntimeConfig {
-                    family: family_name.clone(),
-                    shared_spkg: Some(synthetic_shared_spkg.clone()),
-                    shared_module: Some(family_spec.output_module().to_string()),
-                    durability_scope: Some(family_spec.durability_scope().to_string()),
-                });
-                (cloned.protocol_system().to_string(), cloned)
-            })
-            .collect::<HashMap<_, _>>();
-        detect_family_runtimes_with_registry(&enriched, registry)?
-    } else {
-        detected
-    };
-    let mut matches = detected
+    let mut detected = detect_family_runtimes_with_registry(&extractors, registry)?
         .into_iter()
         .filter(|family| family.family_name == family_name)
         .collect::<Vec<_>>();
+    let family = match detected.len() {
+        1 => detected.remove(0),
+        0 => {
+            return Err(ExtractionError::Setup(format!(
+                "family runtime test helper could not detect family runtime `{family_name}`"
+            )))
+        }
+        many => {
+            return Err(ExtractionError::Setup(format!(
+                "family runtime test helper expected exactly one detected family runtime `{family_name}`, found {many}"
+            )))
+        }
+    };
+    let shared_stream_runtime =
+        resolve_resolved_family_stream_runtime(&family, extractor_configs)?;
+    let shared_bootstrap =
+        resolve_resolved_family_bootstrap_runtime(&family, extractor_configs, registry)?;
+    let execution =
+        resolve_resolved_family_execution_config(&family, extractor_configs, registry)?;
 
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(ExtractionError::Setup(format!(
-            "family execution test helper could not detect family runtime `{family_name}` from provided extractor configs"
-        ))),
-        _ => Err(ExtractionError::Setup(format!(
-            "family execution test helper expected exactly one detected family runtime `{family_name}`, found {}",
-            matches.len()
-        ))),
-    }
+    Ok(ResolvedFamilyRuntime {
+        family,
+        extractor_configs: extractor_configs.to_vec(),
+        shared_stream_runtime,
+        shared_bootstrap,
+        execution,
+    })
 }
 
 pub fn build_resolved_runtime_targets_with_registry<'a>(
@@ -824,7 +1046,7 @@ mod tests {
             BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig,
         },
         family_registry::{
-            default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec,
+            default_family_runtime_registry,
         },
         family_runtime_metadata::{FamilyRuntimeConfig, ResolvedSharedFamilyStream},
         protocol_message_registry::{
@@ -834,6 +1056,7 @@ mod tests {
         runtime_target_planning::{ResolvedRuntimeTarget, ResolvedStandaloneRuntime},
         ExtractionError,
     };
+    use crate::testing::family_output_module_for_tests;
 
     use super::{
         build_family_runtime_plan, build_family_runtime_plan_with_registry,
@@ -912,9 +1135,7 @@ mod tests {
         _partial_block_index: Option<u32>,
     ) -> AuxiliaryProtocolMessageBuildFuture<'a> {
         Box::pin(async {
-            Err(ExtractionError::Unknown(
-                "test-only decoder should not run".to_string(),
-            ))
+            Err(ExtractionError::Unknown("test-only decoder should not run".to_string()))
         })
     }
 
@@ -926,54 +1147,29 @@ mod tests {
                 type_url_suffix: "FutureEvents",
                 build_block_changes: build_future_family_events,
             }];
-        const FUTURE_FAMILY: FamilyRuntimeSpec =
-            crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_decoders(
-                "future_swap",
-                &[
-                    crate::extractor::family_registry::shared_family_member_spec(
-                        "future_v1",
-                        &["futurev1"],
-                        None,
-                    ),
-                    crate::extractor::family_registry::shared_family_member_spec(
-                        "future_v2",
-                        &["futurev2"],
-                        None,
-                    ),
-                ],
-                "map_future_swap_family_protocol_changes",
-                "future_swap_family",
+        let registry =
+            crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_for_tests(
+                &["future_v1", "future_v2"],
                 "family::future_swap_runtime",
-                None,
                 FUTURE_AUXILIARY_PROTOCOL_MESSAGE_DECODERS,
             );
-        const SPECS: &[FamilyRuntimeSpec] = &[FUTURE_FAMILY];
-        let registry = FamilyRuntimeRegistry::new(SPECS);
         let extractors = HashMap::from([
             (
                 "future_v1".to_string(),
                 make_config("future_v1", "/tmp/future-v1-only.spkg").with_family_runtime(Some(
-                    FamilyRuntimeConfig {
-                        family: "future_swap".to_string(),
-                        shared_spkg: Some(
-                            "protocols/substreams/future-swap-combined/test.spkg".to_string(),
-                        ),
-                        shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
-                        durability_scope: Some("family::future_swap_runtime".to_string()),
-                    },
+                    crate::extractor::test_support::future_family_runtime_config_for_tests(
+                        "protocols/substreams/future-swap-combined/test.spkg",
+                        "family::future_swap_runtime",
+                    ),
                 )),
             ),
             (
                 "future_v2".to_string(),
                 make_config("future_v2", "/tmp/future-v2-only.spkg").with_family_runtime(Some(
-                    FamilyRuntimeConfig {
-                        family: "future_swap".to_string(),
-                        shared_spkg: Some(
-                            "protocols/substreams/future-swap-combined/test.spkg".to_string(),
-                        ),
-                        shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
-                        durability_scope: Some("family::future_swap_runtime".to_string()),
-                    },
+                    crate::extractor::test_support::future_family_runtime_config_for_tests(
+                        "protocols/substreams/future-swap-combined/test.spkg",
+                        "family::future_swap_runtime",
+                    ),
                 )),
             ),
             ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
@@ -997,7 +1193,12 @@ mod tests {
         assert_eq!(detected[0].durability_scope(), "family::future_swap_runtime");
         assert_eq!(plan.standalone_protocol_systems, vec!["curve".to_string()]);
         assert_eq!(resolved.families.len(), 1);
-        assert_eq!(resolved.families[0].extractor_configs.len(), 2);
+        assert_eq!(
+            resolved.families[0]
+                .extractor_configs
+                .len(),
+            2
+        );
         assert_eq!(resolved.standalone_extractors[0].protocol_system, "curve");
 
         let targets = build_resolved_runtime_targets_with_registry(&extractors, registry)
@@ -1020,8 +1221,7 @@ mod tests {
         );
         assert_eq!(
             resolved.families[0]
-                .execution
-                .auxiliary_protocol_message_decoders_by_protocol_system
+                .auxiliary_protocol_message_decoders_by_protocol_system()
                 .get("future_v1")
                 .map(Vec::len),
             Some(1)
@@ -1029,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn test_family_execution_helper_reuses_production_family_execution_resolution() {
+    fn test_family_runtime_helper_reuses_production_family_resolution() {
         let extractors = HashMap::from([
             (
                 "uniswap_v2".to_string(),
@@ -1062,38 +1262,50 @@ mod tests {
         let extractor_configs =
             family_extractor_configs(&family, &extractors).expect("family configs resolve");
 
-        let from_production =
+        let stream_from_production =
+            super::resolve_resolved_family_stream_runtime(&family, &extractor_configs)
+                .expect("production family stream runtime resolves");
+        let bootstrap_from_production =
+            super::resolve_resolved_family_bootstrap_runtime(&family, &extractor_configs, registry)
+                .expect("production family bootstrap runtime resolves");
+        let execution_from_production =
             super::resolve_resolved_family_execution_config(&family, &extractor_configs, registry)
                 .expect("production family execution config resolves");
-        let from_test_helper =
-            super::resolved_family_execution_config_from_extractor_configs_for_tests(
-                &extractor_configs,
-            )
-            .expect("test helper family execution config resolves");
+        let runtime_from_test_helper = super::resolved_family_runtime_from_extractor_configs_for_tests(
+            &extractor_configs,
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+        )
+        .expect("test helper family runtime resolves");
 
         assert_eq!(
-            from_test_helper.branch_specs, from_production.branch_specs,
+            runtime_from_test_helper.branch_specs(),
+            &execution_from_production.branch_specs,
             "test helper should reuse production branch routing"
         );
         assert_eq!(
-            from_test_helper.shared_stream, from_production.shared_stream,
-            "test helper should reuse production shared stream identity"
-        );
-        assert_eq!(
-            from_test_helper.merged_substreams_params, from_production.merged_substreams_params,
+            runtime_from_test_helper.merged_substreams_params(),
+            stream_from_production.request.params(),
             "test helper should reuse production shared substreams params"
         );
         assert_eq!(
-            from_test_helper.stop_block, from_production.stop_block,
+            runtime_from_test_helper.stop_block(),
+            stream_from_production.request.stop_block(),
             "test helper should reuse production stop block resolution"
         );
         assert_eq!(
-            from_test_helper.configured_start_block, from_production.configured_start_block,
+            runtime_from_test_helper.configured_start_block(),
+            stream_from_production.configured_start_block,
             "test helper should reuse production start block resolution"
         );
         assert_eq!(
-            from_test_helper.bootstrap_plan, from_production.bootstrap_plan,
+            runtime_from_test_helper.shared_bootstrap_plan(),
+            bootstrap_from_production.bootstrap_plan.as_ref(),
             "test helper should reuse production shared bootstrap planning"
+        );
+        assert_eq!(
+            runtime_from_test_helper.shared_extractor_id(),
+            stream_from_production.request.extractor_id,
+            "test helper should reuse production shared extractor identity"
         );
     }
 
@@ -1163,31 +1375,29 @@ mod tests {
             uniswap_shared_stream("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg");
 
         assert_eq!(
-            family.execution.shared_stream.spkg,
+            family.family.shared_spkg(),
             "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
         );
-        assert_eq!(family.execution.shared_stream.module, expected_shared_stream.module);
+        assert_eq!(family.family.output_module(), expected_shared_stream.module);
+        assert_eq!(family.shared_extractor_id(), expected_shared_stream.extractor_id);
         assert_eq!(
-            family.execution.shared_stream.extractor_id,
-            expected_shared_stream.extractor_id
-        );
-        assert_eq!(
-            family.execution.shared_bootstrap_execution.branch_runtimes.len(),
+            family
+                .shared_bootstrap_execution()
+                .branch_runtimes
+                .len(),
             2
         );
-        assert_eq!(family.execution.stop_block, 120);
-        assert_eq!(family.execution.configured_start_block, 43);
+        assert_eq!(family.stop_block(), 120);
+        assert_eq!(family.configured_start_block(), 43);
         assert_eq!(
-            family.execution.merged_substreams_params,
-            HashMap::from([
+            family.merged_substreams_params(),
+            &HashMap::from([
                 ("map_pool_events".to_string(), "factory=0x01".to_string()),
                 ("map_events".to_string(), "factory=0x02".to_string()),
             ])
         );
         let bootstrap_plan = family
-            .execution
-            .bootstrap_plan
-            .as_ref()
+            .shared_bootstrap_plan()
             .expect("family execution should precompute shared bootstrap plan");
         assert_eq!(bootstrap_plan.bootstrap_block, 42);
         assert_eq!(bootstrap_plan.branches.len(), 2);
@@ -1625,10 +1835,20 @@ mod tests {
         assert_eq!(resolved.families.len(), 1);
         assert_eq!(resolved.families[0].family.family_name, "uniswap");
         assert_eq!(resolved.families[0].family.chain, Chain::Ethereum);
-        assert_eq!(resolved.families[0].extractor_configs.len(), 2);
+        assert_eq!(
+            resolved.families[0]
+                .extractor_configs
+                .len(),
+            2
+        );
         assert_eq!(resolved.standalone_extractors.len(), 1);
         assert_eq!(resolved.standalone_extractors[0].protocol_system, "curve");
-        assert_eq!(resolved.standalone_extractors[0].extractor_config.name(), "curve");
+        assert_eq!(
+            resolved.standalone_extractors[0]
+                .extractor_config
+                .name(),
+            "curve"
+        );
     }
 
     #[test]
@@ -1733,6 +1953,24 @@ mod tests {
                 .expect("uniswap shared stream name")
         );
         assert_eq!(family.durability_scope(), shared_stream.durability_scope);
+    }
+
+    #[test]
+    fn resolved_family_runtime_helper_builds_full_runtime_with_requested_shared_spkg() {
+        let shared_spkg = "/tmp/uniswap-family-runtime-test.spkg";
+        let v2 = make_config("uniswap_v2", "/tmp/v2-only.spkg");
+        let v3 = make_config("uniswap_v3", "/tmp/v3-only.spkg");
+
+        let runtime =
+            super::resolved_family_runtime_from_extractor_configs_for_tests(&[&v2, &v3], shared_spkg)
+                .expect("test configs should resolve full family runtime");
+
+        assert_eq!(runtime.family.family_name, "uniswap");
+        assert_eq!(runtime.family.shared_spkg(), shared_spkg);
+        assert_eq!(runtime.family.output_module(), family_output_module_for_tests("uniswap"));
+        assert_eq!(runtime.shared_extractor_id(), runtime.family.shared_extractor_id());
+        assert_eq!(runtime.extractor_configs.len(), 2);
+        assert_eq!(runtime.branch_specs().len(), 2);
     }
 
     #[test]

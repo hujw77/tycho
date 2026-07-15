@@ -11,28 +11,25 @@ use crate::{
     extractor::{
         control::BranchSubscriptionsMap,
         extractor_config::{BootstrapConfig, ExtractorConfig, ProtocolTypeConfig},
-        family_dispatch::FamilyBlockChangesDispatcher,
+        family_dispatch::{FamilyBlockChangesDispatcher, FamilyBranchSpec},
         family_registry::default_family_runtime_registry,
-        family_runtime_planning::resolved_family_execution_config_from_extractor_configs_for_tests,
+        family_runtime_execution::FamilyRuntimeState,
         family_runtime_metadata::ResolvedSharedFamilyStream,
+        family_runtime_planning::resolved_family_runtime_from_extractor_configs_for_tests,
         family_runtime_planning::{
             validate_family_runtime_membership, DetectedFamilyRuntime, ResolvedFamilyRuntime,
+            ResolvedFamilyRuntimeContract,
         },
-        family_runtime_execution::FamilyRuntimeState,
         protocol_cache::ProtocolMemoryCache,
         ExtractionError, Extractor,
     },
     pb::sf::substreams::rpc::v2::BlockScopedData,
     pb::sf::substreams::v1::Clock,
     substreams::stream::SubstreamsStream,
-    testing::{
-        family_detected_runtime_from_configs_for_tests, family_output_module_for_tests, MockGateway,
-    },
+    testing::{family_output_module_for_tests, MockGateway},
 };
 
-pub(super) fn uniswap_shared_stream_for_tests(
-    shared_spkg: &str,
-) -> ResolvedSharedFamilyStream {
+pub(super) fn uniswap_shared_stream_for_tests(shared_spkg: &str) -> ResolvedSharedFamilyStream {
     default_family_runtime_registry()
         .resolved_shared_stream_for_family(Chain::Ethereum, "uniswap", shared_spkg)
         .expect("registered uniswap shared stream")
@@ -47,7 +44,18 @@ pub(super) fn family_runtime_state_for_tests(
         chrono::Duration::seconds(60),
         Arc::new(MockGateway::new()),
     );
-    FamilyRuntimeState::new(extractors, dispatcher, protocol_cache)
+    let runtime_contract = ResolvedFamilyRuntimeContract {
+        shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
+        branch_specs: extractors
+            .keys()
+            .cloned()
+            .map(|protocol_system| FamilyBranchSpec {
+                protocol_system,
+                protocol_type_names: Default::default(),
+            })
+            .collect::<Vec<_>>(),
+    };
+    FamilyRuntimeState::new(&runtime_contract, extractors, dispatcher, protocol_cache)
 }
 
 pub(super) fn family_runner_for_tests(
@@ -57,7 +65,19 @@ pub(super) fn family_runner_for_tests(
     dispatcher: FamilyBlockChangesDispatcher,
 ) -> FamilyExtractorRunner {
     let runtime_state = family_runtime_state_for_tests(&extractors, dispatcher);
+    let runtime_contract = ResolvedFamilyRuntimeContract {
+        shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
+        branch_specs: extractors
+            .keys()
+            .cloned()
+            .map(|protocol_system| FamilyBranchSpec {
+                protocol_system,
+                protocol_type_names: Default::default(),
+            })
+            .collect::<Vec<_>>(),
+    };
     FamilyExtractorRunner::new(
+        runtime_contract,
         extractors,
         substreams,
         subscriptions,
@@ -233,18 +253,19 @@ pub(super) fn make_uniswap_family_runtime_test_configs(
     ]
 }
 
+pub(super) fn try_resolved_family_runtime_from_configs_for_tests<'a>(
+    extractor_configs: &[&'a ExtractorConfig],
+    shared_spkg: &str,
+) -> Result<ResolvedFamilyRuntime<'a>, ExtractionError> {
+    resolved_family_runtime_from_extractor_configs_for_tests(extractor_configs, shared_spkg)
+}
+
 pub(super) fn resolved_family_runtime_from_configs_for_tests<'a>(
     extractor_configs: &[&'a ExtractorConfig],
     shared_spkg: &str,
 ) -> ResolvedFamilyRuntime<'a> {
-    ResolvedFamilyRuntime {
-        family: family_detected_runtime_from_configs_for_tests(extractor_configs, shared_spkg),
-        extractor_configs: extractor_configs.to_vec(),
-        execution: resolved_family_execution_config_from_extractor_configs_for_tests(
-            extractor_configs,
-        )
-        .expect("family execution config should derive from test configs"),
-    }
+    try_resolved_family_runtime_from_configs_for_tests(extractor_configs, shared_spkg)
+        .expect("resolved family runtime should derive from test configs")
 }
 
 pub(super) fn make_family_follow_up_block_scoped_data(

@@ -1,12 +1,13 @@
+use async_trait::async_trait;
+
 use crate::extractor::{
-    extractor_config::ExtractorConfig,
-    family_registry::FamilyRuntimeRegistry,
     managed_extractor_initialization::ManagedExtractorBuildContext,
-    managed_substreams_request::PreparedSubstreamsRequest,
     managed_stream_startup::PreparedSingleRunnerStartup,
-    protocol_message_registry::{
-        default_auxiliary_protocol_message_decoders_for_protocol_system,
-        default_auxiliary_protocol_state_hydrators_for_protocol_system,
+    managed_substreams_request::StandalonePreparedRequestContext,
+    runtime_targets_startup::{
+        prepare_managed_startup_request_from_payload, ManagedStartupLifecycleView,
+        ManagedStartupPreparedRequestPayload, PreparedManagedStartupDraft,
+        PreparedManagedStartupPayload,
     },
     runtime_target_planning::ResolvedStandaloneRuntime,
     ExtractionError, Extractor,
@@ -17,30 +18,11 @@ use tycho_common::models::ExtractorIdentity;
 
 use crate::substreams::stream::SubstreamsStream;
 
-pub(crate) struct PreparedSingleRunnerDraft {
+pub(crate) type PreparedSingleRunnerDraft = PreparedManagedStartupDraft<PreparedSingleRunnerPayload>;
+
+pub(crate) struct PreparedSingleRunnerPayload {
     pub(crate) extractor: Arc<dyn Extractor>,
     pub(crate) extractor_id: ExtractorIdentity,
-    pub(crate) prepared_request: PreparedSubstreamsRequest,
-}
-
-fn standalone_auxiliary_protocol_message_decoders(
-    extractor_config: &ExtractorConfig,
-    registry: FamilyRuntimeRegistry<'static>,
-) -> Vec<crate::extractor::protocol_message_registry::AuxiliaryProtocolMessageDecoder> {
-    default_auxiliary_protocol_message_decoders_for_protocol_system(
-        extractor_config.protocol_system(),
-        registry,
-    )
-}
-
-fn standalone_auxiliary_protocol_state_hydrators(
-    extractor_config: &ExtractorConfig,
-    registry: FamilyRuntimeRegistry<'static>,
-) -> Vec<crate::extractor::protocol_message_registry::AuxiliaryProtocolStateHydrator> {
-    default_auxiliary_protocol_state_hydrators_for_protocol_system(
-        extractor_config.protocol_system(),
-        registry,
-    )
 }
 
 impl<'a> ResolvedStandaloneRuntime<'a> {
@@ -48,40 +30,43 @@ impl<'a> ResolvedStandaloneRuntime<'a> {
         self,
         extractor_build: ManagedExtractorBuildContext<'_>,
     ) -> Result<PreparedSingleRunnerDraft, ExtractionError> {
-        let auxiliary_protocol_message_decoders = standalone_auxiliary_protocol_message_decoders(
-            self.extractor_config,
-            extractor_build.family_runtime_registry,
-        );
-        let auxiliary_protocol_state_hydrators = standalone_auxiliary_protocol_state_hydrators(
-            self.extractor_config,
-            extractor_build.family_runtime_registry,
-        );
-        let extractor = extractor_build
-            .build_initialized_extractor(
-                self.extractor_config,
-                auxiliary_protocol_message_decoders,
-                auxiliary_protocol_state_hydrators,
-            )
-            .await?;
-        let extractor_id = extractor.get_id();
-        let prepared_request = self
-            .prepare_substreams_request(
-                extractor.clone(),
-                &extractor_id,
-                extractor_build.rpc_client,
-                extractor_build.family_runtime_registry,
-            )
-            .await?;
-        Ok(PreparedSingleRunnerDraft {
-            extractor,
-            extractor_id,
-            prepared_request,
-        })
+        <Self as ManagedStartupLifecycleView>::prepare_managed_startup_draft(
+            &self,
+            extractor_build,
+        )
+        .await
     }
 }
 
-impl PreparedSingleRunnerDraft {
-    pub(crate) fn into_prepared_startup(
+#[async_trait]
+impl<'a> ManagedStartupLifecycleView<'a> for ResolvedStandaloneRuntime<'a> {
+    type Payload = PreparedSingleRunnerPayload;
+
+    async fn build_managed_startup_payload(
+        &self,
+        extractor_build: ManagedExtractorBuildContext<'_>,
+    ) -> Result<PreparedSingleRunnerPayload, ExtractionError> {
+        let extractor = extractor_build
+            .build_unique_runtime_target_extractor(self)
+            .await?;
+        let extractor_id = extractor.get_id();
+        Ok(PreparedSingleRunnerPayload { extractor, extractor_id })
+    }
+
+    async fn prepare_substreams_request_for_managed_startup(
+        &self,
+        payload: &Self::Payload,
+        extractor_build: ManagedExtractorBuildContext<'_>,
+    ) -> Result<crate::extractor::managed_substreams_request::PreparedSubstreamsRequest, ExtractionError>
+    {
+        prepare_managed_startup_request_from_payload(self, payload, extractor_build).await
+    }
+}
+
+impl PreparedManagedStartupPayload for PreparedSingleRunnerPayload {
+    type PreparedStartup = PreparedSingleRunnerStartup;
+
+    fn into_prepared_startup(
         self,
         stream: SubstreamsStream,
     ) -> PreparedSingleRunnerStartup {
@@ -89,6 +74,21 @@ impl PreparedSingleRunnerDraft {
             extractor: self.extractor,
             extractor_id: self.extractor_id,
             stream,
+        }
+    }
+}
+
+impl ManagedStartupPreparedRequestPayload for PreparedSingleRunnerPayload {
+    type PreparedRequestContext = StandalonePreparedRequestContext;
+
+    fn prepared_request_context(
+        &self,
+        extractor_build: ManagedExtractorBuildContext<'_>,
+    ) -> Self::PreparedRequestContext {
+        StandalonePreparedRequestContext {
+            extractor: self.extractor.clone(),
+            extractor_id: self.extractor_id.clone(),
+            registry: extractor_build.family_runtime_registry,
         }
     }
 }
@@ -101,8 +101,7 @@ mod tests {
 
     use super::*;
     use crate::extractor::{
-        extractor_config::ProtocolTypeConfig,
-        family_registry::{FamilyRuntimeRegistry, FamilyRuntimeSpec},
+        extractor_config::{ExtractorConfig, ProtocolTypeConfig},
         protocol_message_registry::{
             AuxiliaryProtocolMessageBuildFuture, AuxiliaryProtocolMessageContext,
             AuxiliaryProtocolMessageDecoder,
@@ -116,9 +115,7 @@ mod tests {
         _partial_block_index: Option<u32>,
     ) -> AuxiliaryProtocolMessageBuildFuture<'a> {
         Box::pin(async {
-            Err(ExtractionError::Unknown(
-                "test-only decoder should not run".to_string(),
-            ))
+            Err(ExtractionError::Unknown("test-only decoder should not run".to_string()))
         })
     }
 
@@ -130,21 +127,12 @@ mod tests {
                 type_url_suffix: "FutureEvents",
                 build_block_changes: build_future_events_for_startup_test,
             }];
-        const FUTURE_FAMILY: FamilyRuntimeSpec =
-            crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_decoders(
-                "future_swap",
-                &[crate::extractor::family_registry::shared_family_member_spec(
-                    "future_v1",
-                    &["futurev1"],
-                    None,
-                )],
-                "map_future_swap_family_protocol_changes",
-                "future_swap_family",
+        let registry =
+            crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_for_tests(
+                &["future_v1"],
                 "family::future_swap",
-                None,
                 FUTURE_DECODERS,
             );
-        let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
         let config = ExtractorConfig::new(
             "future_v1_alias".to_string(),
             Chain::Ethereum,
@@ -164,7 +152,11 @@ mod tests {
         )
         .with_protocol_system("future_v1");
 
-        let decoders = standalone_auxiliary_protocol_message_decoders(&config, registry);
+        let decoders = ManagedExtractorBuildContext::
+            auxiliary_protocol_message_decoders_for_protocol_system_with_registry(
+                config.protocol_system(),
+                registry,
+            );
 
         assert_eq!(decoders.len(), 1);
         assert_eq!(decoders[0].protocol_system, "future_v1");

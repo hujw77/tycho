@@ -6,7 +6,7 @@ use tokio::sync::{
     mpsc::{self, error::SendError, Receiver, Sender},
     Mutex,
 };
-use tracing::instrument;
+use tracing::{debug, error, info, instrument, trace};
 use tycho_common::models::ExtractorIdentity;
 
 use crate::extractor::{ExtractionError, ExtractorMsg};
@@ -72,3 +72,84 @@ impl MessageSender for ExtractorHandle {
 
 pub(crate) type SubscriptionsMap = HashMap<u64, Sender<ExtractorMsg>>;
 pub(crate) type BranchSubscriptionsMap = HashMap<String, Arc<Mutex<SubscriptionsMap>>>;
+
+pub(crate) fn allocate_subscriber_id(next_subscriber_id: &mut u64) -> u64 {
+    let subscriber_id = *next_subscriber_id;
+    *next_subscriber_id += 1;
+    subscriber_id
+}
+
+pub(crate) async fn register_subscription(
+    subscribers: &Arc<Mutex<SubscriptionsMap>>,
+    subscriber_id: u64,
+    sender: Sender<ExtractorMsg>,
+) {
+    subscribers
+        .lock()
+        .await
+        .insert(subscriber_id, sender);
+}
+
+pub(crate) fn allocate_logged_subscription_id(
+    next_subscriber_id: &mut u64,
+    extractor_id: Option<&ExtractorIdentity>,
+    message: &str,
+) -> u64 {
+    let subscriber_id = allocate_subscriber_id(next_subscriber_id);
+    log_new_subscription(subscriber_id, extractor_id, message);
+    subscriber_id
+}
+
+pub(crate) async fn register_logged_subscription(
+    subscribers: &Arc<Mutex<SubscriptionsMap>>,
+    next_subscriber_id: &mut u64,
+    sender: Sender<ExtractorMsg>,
+    extractor_id: Option<&ExtractorIdentity>,
+    message: &str,
+) -> u64 {
+    let subscriber_id = allocate_logged_subscription_id(next_subscriber_id, extractor_id, message);
+    register_subscription(subscribers, subscriber_id, sender).await;
+    subscriber_id
+}
+
+pub(crate) fn log_new_subscription(
+    subscriber_id: u64,
+    extractor_id: Option<&ExtractorIdentity>,
+    message: &str,
+) {
+    tracing::Span::current().record("subscriber_id", subscriber_id);
+    match extractor_id {
+        Some(extractor_id) => info!(?subscriber_id, ?extractor_id, "{message}"),
+        None => info!(?subscriber_id, "{message}"),
+    }
+}
+
+#[instrument(skip_all, fields(subscriber_count))]
+pub(crate) async fn propagate_subscription_message(
+    subscribers: &Arc<Mutex<SubscriptionsMap>>,
+    message: ExtractorMsg,
+) {
+    trace!(msg = %message, "Propagating message to subscribers.");
+    let arced_message = message;
+
+    let mut to_remove = Vec::new();
+    let mut subscribers = subscribers.lock().await;
+    tracing::Span::current().record("subscriber_count", subscribers.len());
+
+    for (counter, sender) in subscribers.iter_mut() {
+        match sender.send(arced_message.clone()).await {
+            Ok(_) => {
+                trace!(subscriber_id = %counter, "Message sent successfully.");
+            }
+            Err(err) => {
+                to_remove.push(*counter);
+                error!(error = %err, counter, "Error while sending message to subscriber");
+            }
+        }
+    }
+
+    for counter in to_remove {
+        subscribers.remove(&counter);
+        debug!("Subscriber {} has been dropped", counter);
+    }
+}

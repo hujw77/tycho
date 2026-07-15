@@ -8,17 +8,17 @@ use std::{
 use chrono::{DateTime, NaiveDateTime};
 use num_bigint::BigInt;
 use prost::Message;
-use tycho_ethereum::rpc::EthereumRpcClient;
+use tracing::{trace, warn};
 use tycho_common::{
     models::{
         blockchain::{Block, Transaction, TxWithChanges},
         protocol::{ComponentBalance, ProtocolComponent, ProtocolComponentStateDelta},
         Address, Chain, ChangeType, ComponentId,
     },
-    Bytes,
     storage::StorageError,
+    Bytes,
 };
-use tracing::{trace, warn};
+use tycho_ethereum::rpc::EthereumRpcClient;
 
 use crate::extractor::{
     models::BlockChanges,
@@ -62,10 +62,7 @@ fn build_uniswap_v3_auxiliary_block_changes<'a>(
 ) -> AuxiliaryProtocolMessageBuildFuture<'a> {
     Box::pin(async move {
         let raw_events = uniswap_v3_stream::Events::decode(value)?;
-        trace!(
-            n_events = raw_events.pool_events.len(),
-            "Received uniswap_v3 Events message"
-        );
+        trace!(n_events = raw_events.pool_events.len(), "Received uniswap_v3 Events message");
         build_uniswap_v3_block_changes_from_events(
             context,
             raw_events,
@@ -135,8 +132,11 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
     let created_in_block = pool_events
         .iter()
         .filter_map(|event| {
-            matches!(event.r#type, Some(uniswap_v3_stream::events::pool_event::Type::PoolCreated(_)))
-                .then(|| normalize_hex_address(&event.pool_address))
+            matches!(
+                event.r#type,
+                Some(uniswap_v3_stream::events::pool_event::Type::PoolCreated(_))
+            )
+            .then(|| normalize_hex_address(&event.pool_address))
         })
         .collect::<Result<HashSet<_>, _>>()?;
 
@@ -151,14 +151,23 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
         existing_component_ids.insert(component_id.clone());
     }
 
-    let existing_component_ids_vec = existing_component_ids.iter().cloned().collect::<Vec<_>>();
+    let existing_component_ids_vec = existing_component_ids
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let existing_components = context
         .get_protocol_components(&existing_component_ids_vec)
         .await?;
-    let tracked_existing_component_ids = existing_components.keys().cloned().collect::<HashSet<_>>();
+    let tracked_existing_component_ids = existing_components
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     let protocol_state_values = context
         .get_protocol_states_at_tip(
-            &tracked_existing_component_ids.iter().cloned().collect::<Vec<_>>(),
+            &tracked_existing_component_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
         )
         .await?;
 
@@ -172,16 +181,20 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
                 .map(move |token| (component_id, token))
         })
         .collect::<Vec<_>>();
-    let component_balances = context.get_component_balances_at_tip(&balance_lookup_keys).await?;
+    let component_balances = context
+        .get_component_balances_at_tip(&balance_lookup_keys)
+        .await?;
 
     let mut current_states = HashMap::new();
     for component_id in &tracked_existing_component_ids {
-        let component = existing_components.get(component_id).ok_or_else(|| {
-            ExtractionError::Storage(StorageError::NotFound(
-                "ProtocolComponent".to_string(),
-                component_id.clone(),
-            ))
-        })?;
+        let component = existing_components
+            .get(component_id)
+            .ok_or_else(|| {
+                ExtractionError::Storage(StorageError::NotFound(
+                    "ProtocolComponent".to_string(),
+                    component_id.clone(),
+                ))
+            })?;
         current_states.insert(
             component_id.clone(),
             runtime_state_from_snapshot(
@@ -214,7 +227,9 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
             .as_ref()
             .is_some_and(|(current_tx, _)| current_tx.index != transaction.index)
         {
-            let (completed_tx, completed_acc) = active_tx.take().expect("active tx exists");
+            let (completed_tx, completed_acc) = active_tx
+                .take()
+                .expect("active tx exists");
             hydrate_uniswap_v3_pool_states_if_needed(
                 context,
                 &mut current_states,
@@ -230,19 +245,28 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
             }
         }
         let tx_hash = transaction.hash.clone();
-        let (_, tx_acc) =
-            active_tx.get_or_insert_with(|| (transaction.clone(), UniswapV3TxAccumulator::default()));
-        let created_in_tx = tx_acc.created_components.contains(&component_id);
+        let (_, tx_acc) = active_tx
+            .get_or_insert_with(|| (transaction.clone(), UniswapV3TxAccumulator::default()));
+        let created_in_tx = tx_acc
+            .created_components
+            .contains(&component_id);
 
-        if let Some(uniswap_v3_stream::events::pool_event::Type::PoolCreated(created)) = &event.r#type
+        if let Some(uniswap_v3_stream::events::pool_event::Type::PoolCreated(created)) =
+            &event.r#type
         {
             let token0 = parse_address(&event.token0)?;
             let token1 = parse_address(&event.token1)?;
             current_states.insert(
                 component_id.clone(),
-                new_uniswap_v3_pool_runtime_state(component_id.clone(), token0.clone(), token1.clone()),
+                new_uniswap_v3_pool_runtime_state(
+                    component_id.clone(),
+                    token0.clone(),
+                    token1.clone(),
+                ),
             );
-            tx_acc.created_components.insert(component_id.clone());
+            tx_acc
+                .created_components
+                .insert(component_id.clone());
             tx_acc.protocol_components.insert(
                 component_id.clone(),
                 build_uniswap_v3_protocol_component(
@@ -260,12 +284,14 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
             continue;
         }
 
-        let state = current_states.get_mut(&component_id).ok_or_else(|| {
-            ExtractionError::Storage(StorageError::NotFound(
-                "ProtocolComponent".to_string(),
-                component_id.clone(),
-            ))
-        })?;
+        let state = current_states
+            .get_mut(&component_id)
+            .ok_or_else(|| {
+                ExtractionError::Storage(StorageError::NotFound(
+                    "ProtocolComponent".to_string(),
+                    component_id.clone(),
+                ))
+            })?;
 
         match event.r#type.as_ref() {
             Some(uniswap_v3_stream::events::pool_event::Type::Initialize(init)) => {
@@ -356,7 +382,9 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
                 state.protocol_fee_token0 = BigInt::from(set_fp.fee_protocol_0_new);
                 state.protocol_fee_token1 = BigInt::from(set_fp.fee_protocol_1_new);
             }
-            Some(uniswap_v3_stream::events::pool_event::Type::CollectProtocol(collect_protocol)) => {
+            Some(uniswap_v3_stream::events::pool_event::Type::CollectProtocol(
+                collect_protocol,
+            )) => {
                 let amount_0 = parse_big_int_str(&collect_protocol.amount_0)?;
                 let amount_1 = parse_big_int_str(&collect_protocol.amount_1)?;
                 if !created_in_tx {
@@ -384,7 +412,8 @@ pub(crate) async fn build_uniswap_v3_block_changes_from_events(
             block.number,
         )
         .await?;
-        if let Some(tx_update) = finalize_uniswap_v3_tx(completed_tx, completed_acc, &current_states)
+        if let Some(tx_update) =
+            finalize_uniswap_v3_tx(completed_tx, completed_acc, &current_states)
         {
             txs_with_update.push(tx_update);
         }
@@ -442,15 +471,27 @@ fn runtime_state_from_snapshot(
     state_values: Option<&HashMap<String, Bytes>>,
     balance_values: Option<&HashMap<Bytes, ComponentBalance>>,
 ) -> Result<UniswapV3PoolRuntimeState, ExtractionError> {
-    let token0 = component.tokens.first().cloned().ok_or_else(|| {
-        ExtractionError::DecodeError(format!("component `{}` is missing token0", component.id))
-    })?;
-    let token1 = component.tokens.get(1).cloned().ok_or_else(|| {
-        ExtractionError::DecodeError(format!("component `{}` is missing token1", component.id))
-    })?;
+    let token0 = component
+        .tokens
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            ExtractionError::DecodeError(format!("component `{}` is missing token0", component.id))
+        })?;
+    let token1 = component
+        .tokens
+        .get(1)
+        .cloned()
+        .ok_or_else(|| {
+            ExtractionError::DecodeError(format!("component `{}` is missing token1", component.id))
+        })?;
 
-    let values = state_values.cloned().unwrap_or_default();
-    let balances = balance_values.cloned().unwrap_or_default();
+    let values = state_values
+        .cloned()
+        .unwrap_or_default();
+    let balances = balance_values
+        .cloned()
+        .unwrap_or_default();
     let tick_liquidity_net = values
         .iter()
         .filter_map(|(attr, value)| {
@@ -472,7 +513,10 @@ fn runtime_state_from_snapshot(
         component_id: component.id.clone(),
         token0: token0.clone(),
         token1: token1.clone(),
-        liquidity: values.get("liquidity").map(parse_big_int_bytes).unwrap_or_default(),
+        liquidity: values
+            .get("liquidity")
+            .map(parse_big_int_bytes)
+            .unwrap_or_default(),
         tick: values
             .get("tick")
             .map(parse_i32_bytes)
@@ -561,9 +605,14 @@ fn build_uniswap_v3_protocol_component(
     )
 }
 
-fn created_state_delta_from_runtime(state: &UniswapV3PoolRuntimeState) -> ProtocolComponentStateDelta {
+fn created_state_delta_from_runtime(
+    state: &UniswapV3PoolRuntimeState,
+) -> ProtocolComponentStateDelta {
     let updated_attributes = runtime_dynamic_attributes(state);
-    let created_attributes = updated_attributes.keys().cloned().collect();
+    let created_attributes = updated_attributes
+        .keys()
+        .cloned()
+        .collect();
     ProtocolComponentStateDelta {
         component_id: state.component_id.clone(),
         updated_attributes,
@@ -591,12 +640,14 @@ async fn hydrate_uniswap_v3_pool_states_if_needed(
         .iter()
         .filter_map(|component_id| {
             let state = current_states.get(component_id)?;
-            (state.liquidity != BigInt::default() && state.tick_liquidity_net.is_empty()).then(|| {
-                acc.protocol_components
-                    .get(component_id)
-                    .or_else(|| existing_components.get(component_id))
-                    .cloned()
-            })?
+            (state.liquidity != BigInt::default() && state.tick_liquidity_net.is_empty()).then(
+                || {
+                    acc.protocol_components
+                        .get(component_id)
+                        .or_else(|| existing_components.get(component_id))
+                        .cloned()
+                },
+            )?
         })
         .collect::<Vec<_>>();
 
@@ -628,7 +679,11 @@ fn finalize_uniswap_v3_tx(
 ) -> Option<TxWithChanges> {
     let mut state_updates = HashMap::new();
     let mut balance_changes = HashMap::new();
-    let mut touched_components = acc.touched_attributes.keys().cloned().collect::<HashSet<_>>();
+    let mut touched_components = acc
+        .touched_attributes
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     touched_components.extend(acc.touched_balances.keys().cloned());
     touched_components.extend(acc.created_components.iter().cloned());
 
@@ -637,7 +692,10 @@ fn finalize_uniswap_v3_tx(
             continue;
         };
 
-        if acc.created_components.contains(&component_id) {
+        if acc
+            .created_components
+            .contains(&component_id)
+        {
             if state.liquidity != BigInt::default() && state.tick_liquidity_net.is_empty() {
                 warn!(
                     component_id = %state.component_id,
@@ -647,14 +705,15 @@ fn finalize_uniswap_v3_tx(
                 );
             }
             state_updates.insert(component_id.clone(), created_state_delta_from_runtime(state));
-            balance_changes.insert(
-                component_id.clone(),
-                all_balance_changes_from_runtime(state, &tx.hash),
-            );
+            balance_changes
+                .insert(component_id.clone(), all_balance_changes_from_runtime(state, &tx.hash));
             continue;
         }
 
-        if let Some(initial_attrs) = acc.touched_attributes.get(&component_id) {
+        if let Some(initial_attrs) = acc
+            .touched_attributes
+            .get(&component_id)
+        {
             let mut updated_attributes = HashMap::new();
             let mut deleted_attributes = HashSet::new();
             let mut created_attributes = HashSet::new();
@@ -756,14 +815,8 @@ fn runtime_dynamic_attributes(state: &UniswapV3PoolRuntimeState) -> HashMap<Stri
         ("liquidity".to_string(), encode_big_int(&state.liquidity)),
         ("tick".to_string(), encode_big_int(&BigInt::from(state.tick))),
         ("sqrt_price_x96".to_string(), encode_big_int(&state.sqrt_price_x96)),
-        (
-            "protocol_fees/token0".to_string(),
-            encode_big_int(&state.protocol_fee_token0),
-        ),
-        (
-            "protocol_fees/token1".to_string(),
-            encode_big_int(&state.protocol_fee_token1),
-        ),
+        ("protocol_fees/token0".to_string(), encode_big_int(&state.protocol_fee_token0)),
+        ("protocol_fees/token1".to_string(), encode_big_int(&state.protocol_fee_token1)),
     ]);
 
     for (tick, liquidity) in &state.tick_liquidity_net {
@@ -807,10 +860,14 @@ fn apply_hydrated_chain_state(
     state.tick_liquidity_net = parse_tick_liquidity_net(&state.component_id, &hydrated.attributes)?;
 
     if let Some(balance) = hydrated.balances.get(&state.token0) {
-        state.balances.insert(state.token0.clone(), parse_big_int_bytes(balance));
+        state
+            .balances
+            .insert(state.token0.clone(), parse_big_int_bytes(balance));
     }
     if let Some(balance) = hydrated.balances.get(&state.token1) {
-        state.balances.insert(state.token1.clone(), parse_big_int_bytes(balance));
+        state
+            .balances
+            .insert(state.token1.clone(), parse_big_int_bytes(balance));
     }
 
     Ok(())
@@ -855,7 +912,11 @@ fn parse_tick_liquidity_net(
 }
 
 fn runtime_balance_value(state: &UniswapV3PoolRuntimeState, token: &Address) -> Bytes {
-    state.balances.get(token).map(encode_big_int).unwrap_or_default()
+    state
+        .balances
+        .get(token)
+        .map(encode_big_int)
+        .unwrap_or_default()
 }
 
 fn capture_state_attr_before(
@@ -892,7 +953,10 @@ fn capture_balance_before(
 }
 
 fn adjust_tick_liquidity(state: &mut UniswapV3PoolRuntimeState, tick: i32, delta: BigInt) {
-    let entry = state.tick_liquidity_net.entry(tick).or_default();
+    let entry = state
+        .tick_liquidity_net
+        .entry(tick)
+        .or_default();
     *entry += delta;
     if *entry == BigInt::default() {
         state.tick_liquidity_net.remove(&tick);
@@ -900,7 +964,10 @@ fn adjust_tick_liquidity(state: &mut UniswapV3PoolRuntimeState, tick: i32, delta
 }
 
 fn adjust_balance(state: &mut UniswapV3PoolRuntimeState, token: &Address, delta: BigInt) {
-    *state.balances.entry(token.clone()).or_default() += delta;
+    *state
+        .balances
+        .entry(token.clone())
+        .or_default() += delta;
 }
 
 fn normalize_hex_address(value: &str) -> Result<String, ExtractionError> {
@@ -917,17 +984,14 @@ fn parse_address(value: &str) -> Result<Bytes, ExtractionError> {
     let address = Bytes::from_str(value)
         .map_err(|err| ExtractionError::DecodeError(format!("parse address `{value}`: {err}")))?;
     if address.len() != 20 {
-        return Err(ExtractionError::DecodeError(format!(
-            "address `{value}` is not 20 bytes"
-        )));
+        return Err(ExtractionError::DecodeError(format!("address `{value}` is not 20 bytes")));
     }
     Ok(address)
 }
 
 fn parse_big_int_str(value: &str) -> Result<BigInt, ExtractionError> {
-    BigInt::from_str(value).map_err(|err| {
-        ExtractionError::DecodeError(format!("parse big integer `{value}`: {err}"))
-    })
+    BigInt::from_str(value)
+        .map_err(|err| ExtractionError::DecodeError(format!("parse big integer `{value}`: {err}")))
 }
 
 fn parse_big_int_bytes(value: &Bytes) -> BigInt {
@@ -939,7 +1003,9 @@ fn parse_i32_bytes(value: &Bytes) -> Result<i32, ExtractionError> {
     parsed
         .to_string()
         .parse::<i32>()
-        .map_err(|err| ExtractionError::DecodeError(format!("parse i32 from state value `{parsed}`: {err}")))
+        .map_err(|err| {
+            ExtractionError::DecodeError(format!("parse i32 from state value `{parsed}`: {err}"))
+        })
 }
 
 fn encode_big_int(value: &BigInt) -> Bytes {

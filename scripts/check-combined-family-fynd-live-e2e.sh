@@ -28,13 +28,16 @@ Optional environment overrides:
   FYND_E2E_HEALTH_TIMEOUT_SECS
                          Default: 300
   FYND_E2E_TRADED_N_DAYS_AGO
-                         Default: 3
+                         Default: 42
   FYND_E2E_CLIENT_TIMEOUT_SECS
                          Default: 5
   FYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS
                          Default: 1
   FYND_E2E_MIN_TOKEN_QUALITY
-                         Default: 100
+                         Default: 10
+                         The live gate defaults target a local combined-family indexer that may
+                         still be catching up to chain head; override these values explicitly if
+                         you want to validate a near-tip strict-token profile instead.
   FYND_E2E_HEALTH_MODE   Optional override forwarded to the Fynd e2e test.
   FYND_E2E_QUOTE_TIMEOUT_SECS
                          Default: 420
@@ -42,13 +45,21 @@ Optional environment overrides:
   FYND_E2E_CONNECTOR_TOKENS
                          Default: WETH,USDC,USDT,DAI,WBTC
                          Optional comma-separated connector-token allowlist for intermediate hops.
+  FYND_E2E_TOKEN_BALANCE_SLOT
+                         Optional explicit ERC20 balance-slot position override for settlement
+                         dry-runs. Useful when live RPC rate limiting makes slot probing noisy.
+  FYND_E2E_TOKEN_ALLOWANCE_SLOT
+                         Optional explicit ERC20 allowance-slot position override for settlement
+                         dry-runs. Useful when live RPC rate limiting makes slot probing noisy.
   TYCHO_COMBINED_FAMILY_LIVE_TEST_MANIFEST
                          Optional override manifest path for the live route/settlement test map.
   FYND_E2E_ROUTE_TEST     Default: quote_returns_route_for_combined_uniswap_family
   FYND_E2E_SETTLEMENT_TEST
                          Default: quote_settles_within_encoded_bounds_at_quote_block_for_combined_uniswap_family
   TYCHO_STREAM_WS_BUFFER_SIZE
+                        Default: 4096
   TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE
+                        Default: 4096
   TYCHO_COMBINED_FAMILY_CHAIN
                          Default: ethereum
 
@@ -81,15 +92,17 @@ FYND_E2E_TYCHO_URL="${FYND_E2E_TYCHO_URL:-127.0.0.1:4242}"
 FYND_E2E_RPC_URL="${FYND_E2E_RPC_URL:-https://rpc.mevblocker.io}"
 FYND_E2E_RUST_LOG="${FYND_E2E_RUST_LOG:-info,tycho_client=info,tycho_simulation=info,fynd=info}"
 FYND_E2E_HEALTH_TIMEOUT_SECS="${FYND_E2E_HEALTH_TIMEOUT_SECS:-300}"
-FYND_E2E_TRADED_N_DAYS_AGO="${FYND_E2E_TRADED_N_DAYS_AGO:-3}"
+FYND_E2E_TRADED_N_DAYS_AGO="${FYND_E2E_TRADED_N_DAYS_AGO:-42}"
 FYND_E2E_CLIENT_TIMEOUT_SECS="${FYND_E2E_CLIENT_TIMEOUT_SECS:-5}"
 FYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS="${FYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS:-1}"
-FYND_E2E_MIN_TOKEN_QUALITY="${FYND_E2E_MIN_TOKEN_QUALITY:-100}"
+FYND_E2E_MIN_TOKEN_QUALITY="${FYND_E2E_MIN_TOKEN_QUALITY:-10}"
 FYND_E2E_HEALTH_MODE_VALUE="${FYND_E2E_HEALTH_MODE:-}"
 FYND_E2E_QUOTE_TIMEOUT_SECS_VALUE="${FYND_E2E_QUOTE_TIMEOUT_SECS:-420}"
 FYND_E2E_CONNECTOR_TOKENS_VALUE="${FYND_E2E_CONNECTOR_TOKENS:-${DEFAULT_FYND_E2E_CONNECTOR_TOKENS}}"
-TYCHO_STREAM_WS_BUFFER_SIZE_VALUE="${TYCHO_STREAM_WS_BUFFER_SIZE:-}"
-TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE="${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE:-}"
+FYND_E2E_TOKEN_BALANCE_SLOT_VALUE="${FYND_E2E_TOKEN_BALANCE_SLOT:-}"
+FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE="${FYND_E2E_TOKEN_ALLOWANCE_SLOT:-}"
+TYCHO_STREAM_WS_BUFFER_SIZE_VALUE="${TYCHO_STREAM_WS_BUFFER_SIZE:-4096}"
+TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE="${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE:-4096}"
 TYCHO_COMBINED_FAMILY_CHAIN_VALUE="${TYCHO_COMBINED_FAMILY_CHAIN:-ethereum}"
 
 ROUTE_TEST=""
@@ -161,6 +174,10 @@ tycho_protocols_ready="unknown"
 protocol_v2_ready="unknown"
 protocol_v3_ready="unknown"
 curl_available="true"
+tycho_filtered_tokens_ready="unknown"
+tycho_filtered_tokens_total="unknown"
+tycho_connector_tokens_ready="unknown"
+tycho_connector_tokens_total="unknown"
 ready="true"
 fynd_e2e_test_path="${FYND_REPO_ROOT}/tests/e2e_quote.rs"
 
@@ -248,9 +265,65 @@ EOF
       tycho_protocols_ready="false"
       ready="false"
     fi
+
+    read_token_total() {
+      local payload="$1"
+      local response
+      response="$(
+        curl -fsS \
+          -X POST \
+          "http://${FYND_E2E_TYCHO_URL}/v1/tokens" \
+          -H 'content-type: application/json' \
+          -d "${payload}" \
+          2>/dev/null || true
+      )"
+      if [[ -z "${response}" ]]; then
+        return 1
+      fi
+      printf '%s' "${response}" | sed -n 's/.*"total":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1
+    }
+
+    filtered_tokens_payload=$(cat <<EOF
+{"chain":"${TYCHO_COMBINED_FAMILY_CHAIN_VALUE}","min_quality":${FYND_E2E_MIN_TOKEN_QUALITY},"traded_n_days_ago":${FYND_E2E_TRADED_N_DAYS_AGO},"pagination":{"page":0,"page_size":1}}
+EOF
+)
+    if filtered_total="$(read_token_total "${filtered_tokens_payload}")"; then
+      tycho_filtered_tokens_total="${filtered_total}"
+      if [[ "${filtered_total}" =~ ^[1-9][0-9]*$ ]]; then
+        tycho_filtered_tokens_ready="true"
+      else
+        tycho_filtered_tokens_ready="false"
+        ready="false"
+      fi
+    else
+      tycho_filtered_tokens_ready="unverified"
+      tycho_filtered_tokens_total="unverified"
+      ready="false"
+    fi
+
+    connector_tokens_json="$(printf '%s' "${FYND_E2E_CONNECTOR_TOKENS_VALUE}" | sed 's/,/","/g')"
+    connector_tokens_payload=$(cat <<EOF
+{"chain":"${TYCHO_COMBINED_FAMILY_CHAIN_VALUE}","min_quality":${FYND_E2E_MIN_TOKEN_QUALITY},"traded_n_days_ago":${FYND_E2E_TRADED_N_DAYS_AGO},"token_addresses":["${connector_tokens_json}"],"pagination":{"page":0,"page_size":20}}
+EOF
+)
+    if connector_total="$(read_token_total "${connector_tokens_payload}")"; then
+      tycho_connector_tokens_total="${connector_total}"
+      if [[ "${connector_total}" =~ ^[1-9][0-9]*$ ]]; then
+        tycho_connector_tokens_ready="true"
+      else
+        tycho_connector_tokens_ready="false"
+      fi
+    else
+      tycho_connector_tokens_ready="unverified"
+      tycho_connector_tokens_total="unverified"
+    fi
   else
     tycho_health="unreachable"
     tycho_protocols_ready="unreachable"
+    tycho_filtered_tokens_ready="unreachable"
+    tycho_filtered_tokens_total="unreachable"
+    tycho_connector_tokens_ready="unreachable"
+    tycho_connector_tokens_total="unreachable"
     ready="false"
   fi
 fi
@@ -269,6 +342,10 @@ tycho_health=${tycho_health}
 tycho_protocols_ready=${tycho_protocols_ready}
 protocol_v2_ready=${protocol_v2_ready}
 protocol_v3_ready=${protocol_v3_ready}
+tycho_filtered_tokens_ready=${tycho_filtered_tokens_ready}
+tycho_filtered_tokens_total=${tycho_filtered_tokens_total}
+tycho_connector_tokens_ready=${tycho_connector_tokens_ready}
+tycho_connector_tokens_total=${tycho_connector_tokens_total}
 chain=${TYCHO_COMBINED_FAMILY_CHAIN_VALUE}
 rpc_url=${FYND_E2E_RPC_URL}
 rust_log=${FYND_E2E_RUST_LOG}
@@ -282,6 +359,8 @@ route_health_mode=$(effective_health_mode_for_selection route)
 settlement_health_mode=$(effective_health_mode_for_selection settlement)
 quote_timeout_secs=${FYND_E2E_QUOTE_TIMEOUT_SECS_VALUE}
 connector_tokens=${FYND_E2E_CONNECTOR_TOKENS_VALUE}
+token_balance_slot_override=${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE:-default}
+token_allowance_slot_override=${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE:-default}
 route_test=${ROUTE_TEST}
 settlement_test=${SETTLEMENT_TEST}
 curl_available=${curl_available}
@@ -345,7 +424,7 @@ effective_health_mode_for_selection() {
       printf '%s' "quote_ready"
       ;;
     settlement)
-      printf '%s' "quote_ready"
+      printf '%s' "strict"
       ;;
     *)
       echo "unknown health-mode selection: ${selection}" >&2
@@ -384,6 +463,14 @@ render_env_prefix() {
     printf 'FYND_E2E_CONNECTOR_TOKENS=%s \\\n' \
       "$(shell_escape "${FYND_E2E_CONNECTOR_TOKENS_VALUE}")"
   fi
+  if [[ -n "${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE}" ]]; then
+    printf 'FYND_E2E_TOKEN_BALANCE_SLOT=%s \\\n' \
+      "$(shell_escape "${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE}")"
+  fi
+  if [[ -n "${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE}" ]]; then
+    printf 'FYND_E2E_TOKEN_ALLOWANCE_SLOT=%s \\\n' \
+      "$(shell_escape "${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE}")"
+  fi
   if [[ -n "${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE}" ]]; then
     printf 'TYCHO_STREAM_WS_BUFFER_SIZE=%s \\\n' \
       "$(shell_escape "${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE}")"
@@ -413,6 +500,12 @@ run_one() {
     "FYND_E2E_HEALTH_MODE=${effective_health_mode}"
     "FYND_E2E_CONNECTOR_TOKENS=${FYND_E2E_CONNECTOR_TOKENS_VALUE}"
   )
+  if [[ -n "${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE}" ]]; then
+    env_args+=("FYND_E2E_TOKEN_BALANCE_SLOT=${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE}")
+  fi
+  if [[ -n "${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE}" ]]; then
+    env_args+=("FYND_E2E_TOKEN_ALLOWANCE_SLOT=${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE}")
+  fi
   if [[ -n "${FYND_E2E_QUOTE_TIMEOUT_SECS_VALUE}" ]]; then
     env_args+=("FYND_E2E_QUOTE_TIMEOUT_SECS=${FYND_E2E_QUOTE_TIMEOUT_SECS_VALUE}")
   fi

@@ -901,8 +901,25 @@ async fn test_family_runner_hydrates_missing_component_ownership_from_protocol_c
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let runtime_state = FamilyRuntimeState::new(&extractors, dispatcher, protocol_cache);
+    let branch_specs = vec![
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v2".to_string(),
+            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
+        },
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v3".to_string(),
+            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
+        },
+    ];
+    let runtime_contract =
+        crate::extractor::family_runtime_planning::ResolvedFamilyRuntimeContract {
+            shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
+            branch_specs: branch_specs.clone(),
+        };
+    let runtime_state =
+        FamilyRuntimeState::new(&runtime_contract, &extractors, dispatcher, protocol_cache);
     let runner = FamilyExtractorRunner::new(
+        runtime_contract,
         extractors,
         SubstreamsStream::from_stream(Box::pin(stream::iter(vec![
             Ok(BlockResponse::New(follow_up_block)),
@@ -1048,8 +1065,25 @@ async fn test_family_runner_hydrates_missing_contract_and_storage_ownership_from
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let runtime_state = FamilyRuntimeState::new(&extractors, dispatcher, protocol_cache);
+    let branch_specs = vec![
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v2".to_string(),
+            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
+        },
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v3".to_string(),
+            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
+        },
+    ];
+    let runtime_contract =
+        crate::extractor::family_runtime_planning::ResolvedFamilyRuntimeContract {
+            shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
+            branch_specs: branch_specs.clone(),
+        };
+    let runtime_state =
+        FamilyRuntimeState::new(&runtime_contract, &extractors, dispatcher, protocol_cache);
     let runner = FamilyExtractorRunner::new(
+        runtime_contract,
         extractors,
         SubstreamsStream::from_stream(Box::pin(stream::iter(vec![
             Ok(BlockResponse::New(follow_up_block)),

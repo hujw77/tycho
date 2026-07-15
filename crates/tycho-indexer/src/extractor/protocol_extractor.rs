@@ -258,8 +258,7 @@ where
                     protocol_types,
                     auxiliary_protocol_message_decoders: auxiliary_protocol_message_decoders
                         .clone(),
-                    auxiliary_protocol_state_hydrators: auxiliary_protocol_state_hydrators
-                        .clone(),
+                    auxiliary_protocol_state_hydrators: auxiliary_protocol_state_hydrators.clone(),
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
                     in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
@@ -309,8 +308,7 @@ where
                     protocol_types,
                     auxiliary_protocol_message_decoders: auxiliary_protocol_message_decoders
                         .clone(),
-                    auxiliary_protocol_state_hydrators: auxiliary_protocol_state_hydrators
-                        .clone(),
+                    auxiliary_protocol_state_hydrators: auxiliary_protocol_state_hydrators.clone(),
                     post_processor,
                     reorg_buffer: Mutex::new(ReorgBuffer::new()),
                     in_flight_commit_buffer: Arc::new(Mutex::new(ReorgBuffer::new())),
@@ -1004,7 +1002,8 @@ where
 
             let mut buffered_state =
                 in_flight_commit_buffer.lookup_protocol_state_for_components(&component_refs);
-            buffered_state.extend(reorg_buffer.lookup_protocol_state_for_components(&component_refs));
+            buffered_state
+                .extend(reorg_buffer.lookup_protocol_state_for_components(&component_refs));
             buffered_state
         };
 
@@ -1026,7 +1025,9 @@ where
             .collect::<HashMap<_, _>>();
 
         for ((component_id, attr), value) in buffered_state {
-            let attrs = combined.entry(component_id).or_default();
+            let attrs = combined
+                .entry(component_id)
+                .or_default();
             match value {
                 Some(value) => {
                     attrs.insert(attr, value);
@@ -1516,7 +1517,12 @@ where
     async fn get_cursor_state_scope(
         &self,
     ) -> Result<PersistedExtractorStateScope, ExtractionError> {
-        match self.gateway.inner.get_cursor_with_scope().await {
+        match self
+            .gateway
+            .inner
+            .get_cursor_with_scope()
+            .await
+        {
             Ok((_, _, scope)) => Ok(scope),
             Err(StorageError::NotFound(_, _)) => Ok(PersistedExtractorStateScope::Unknown),
             Err(err) => Err(ExtractionError::Storage(err)),
@@ -2140,10 +2146,7 @@ pub trait ExtractorGateway: Send + Sync {
     async fn get_bootstrap_state_with_scope(
         &self,
     ) -> Result<(Option<ExtractionState>, PersistedExtractorStateScope), StorageError> {
-        Ok((
-            self.get_bootstrap_state().await?,
-            PersistedExtractorStateScope::Unknown,
-        ))
+        Ok((self.get_bootstrap_state().await?, PersistedExtractorStateScope::Unknown))
     }
 
     /// Idempotently registers `new_protocol_types`, inserting any that do not yet exist and
@@ -2312,8 +2315,12 @@ impl ExtractorPgGateway {
                     .get_state(&legacy_state_name, &self.chain)
                     .await
                 {
-                    Ok(state) => Ok((Some(state), PersistedExtractorStateScope::LegacyExtractorFallback)),
-                    Err(StorageError::NotFound(_, _)) => Ok((None, PersistedExtractorStateScope::Unknown)),
+                    Ok(state) => {
+                        Ok((Some(state), PersistedExtractorStateScope::LegacyExtractorFallback))
+                    }
+                    Err(StorageError::NotFound(_, _)) => {
+                        Ok((None, PersistedExtractorStateScope::Unknown))
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -2862,7 +2869,8 @@ mod test {
         _: &'a dyn AuxiliaryProtocolMessageContext,
         protocol_components: &'a [ProtocolComponent],
         _: u64,
-    ) -> crate::extractor::protocol_message_registry::AuxiliaryProtocolStateHydrationFuture<'a> {
+    ) -> crate::extractor::protocol_message_registry::AuxiliaryProtocolStateHydrationFuture<'a>
+    {
         Box::pin(async move {
             assert_eq!(protocol_components.len(), 1);
             let component = &protocol_components[0];
@@ -2945,11 +2953,7 @@ mod test {
         gw.expect_get_cursor_with_scope()
             .times(1)
             .returning(|| {
-                Ok((
-                    "cursor".into(),
-                    Bytes::default(),
-                    PersistedExtractorStateScope::Unknown,
-                ))
+                Ok(("cursor".into(), Bytes::default(), PersistedExtractorStateScope::Unknown))
             });
         gw.expect_get_block()
             .times(1)
@@ -2983,28 +2987,28 @@ mod test {
         .expect("Failed to create extractor");
         let changes = build_uniswap_v3_changes(
             &extractor,
-                uniswap_v3_stream::Events {
-                    block: Some(uniswap_v3_test_block()),
-                    pool_events: vec![uniswap_v3_stream::events::PoolEvent {
-                        log_ordinal: 1,
-                        pool_address: "0x9999999999999999999999999999999999999999".to_string(),
-                        token0: String::new(),
-                        token1: String::new(),
-                        transaction: Some(uniswap_v3_test_tx(
-                            "0x5000000000000000000000000000000000000000000000000000000000000000",
-                            0,
-                        )),
-                        r#type: Some(pool_event::Type::Initialize(pool_event::Initialize {
-                            sqrt_price: "1".to_string(),
-                            tick: 1,
-                        })),
-                    }],
-                },
-                10,
-                None,
-            )
-            .await
-            .expect("build changes");
+            uniswap_v3_stream::Events {
+                block: Some(uniswap_v3_test_block()),
+                pool_events: vec![uniswap_v3_stream::events::PoolEvent {
+                    log_ordinal: 1,
+                    pool_address: "0x9999999999999999999999999999999999999999".to_string(),
+                    token0: String::new(),
+                    token1: String::new(),
+                    transaction: Some(uniswap_v3_test_tx(
+                        "0x5000000000000000000000000000000000000000000000000000000000000000",
+                        0,
+                    )),
+                    r#type: Some(pool_event::Type::Initialize(pool_event::Initialize {
+                        sqrt_price: "1".to_string(),
+                        tick: 1,
+                    })),
+                }],
+            },
+            10,
+            None,
+        )
+        .await
+        .expect("build changes");
 
         assert!(changes.txs_with_update.is_empty(), "unknown pools should be ignored");
     }
@@ -3025,11 +3029,7 @@ mod test {
         gw.expect_get_cursor_with_scope()
             .times(1)
             .returning(|| {
-                Ok((
-                    "cursor".into(),
-                    Bytes::default(),
-                    PersistedExtractorStateScope::Unknown,
-                ))
+                Ok(("cursor".into(), Bytes::default(), PersistedExtractorStateScope::Unknown))
             });
         gw.expect_get_block()
             .times(1)
@@ -3101,54 +3101,54 @@ mod test {
 
         let changes = build_uniswap_v3_changes(
             &extractor,
-                uniswap_v3_stream::Events {
-                    block: Some(uniswap_v3_test_block()),
-                    pool_events: vec![
-                        uniswap_v3_stream::events::PoolEvent {
-                            log_ordinal: 1,
-                            pool_address: pool.clone(),
-                            token0: String::new(),
-                            token1: String::new(),
-                            transaction: Some(uniswap_v3_test_tx(
-                                "0x6000000000000000000000000000000000000000000000000000000000000000",
-                                0,
-                            )),
-                            r#type: Some(pool_event::Type::Mint(pool_event::Mint {
-                                sender: "0x1".to_string(),
-                                owner: "0x2".to_string(),
-                                tick_lower: -10,
-                                tick_upper: 10,
-                                amount: "100".to_string(),
-                                amount_0: "5".to_string(),
-                                amount_1: "7".to_string(),
-                            })),
-                        },
-                        uniswap_v3_stream::events::PoolEvent {
-                            log_ordinal: 2,
-                            pool_address: pool.clone(),
-                            token0: String::new(),
-                            token1: String::new(),
-                            transaction: Some(uniswap_v3_test_tx(
-                                "0x7000000000000000000000000000000000000000000000000000000000000000",
-                                1,
-                            )),
-                            r#type: Some(pool_event::Type::Swap(pool_event::Swap {
-                                sender: "0x3".to_string(),
-                                recipient: "0x4".to_string(),
-                                amount_0: "2".to_string(),
-                                amount_1: "-3".to_string(),
-                                sqrt_price: "9".to_string(),
-                                liquidity: "120".to_string(),
-                                tick: 4,
-                            })),
-                        },
-                    ],
-                },
-                10,
-                None,
-            )
-            .await
-            .expect("build changes");
+            uniswap_v3_stream::Events {
+                block: Some(uniswap_v3_test_block()),
+                pool_events: vec![
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 1,
+                        pool_address: pool.clone(),
+                        token0: String::new(),
+                        token1: String::new(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x6000000000000000000000000000000000000000000000000000000000000000",
+                            0,
+                        )),
+                        r#type: Some(pool_event::Type::Mint(pool_event::Mint {
+                            sender: "0x1".to_string(),
+                            owner: "0x2".to_string(),
+                            tick_lower: -10,
+                            tick_upper: 10,
+                            amount: "100".to_string(),
+                            amount_0: "5".to_string(),
+                            amount_1: "7".to_string(),
+                        })),
+                    },
+                    uniswap_v3_stream::events::PoolEvent {
+                        log_ordinal: 2,
+                        pool_address: pool.clone(),
+                        token0: String::new(),
+                        token1: String::new(),
+                        transaction: Some(uniswap_v3_test_tx(
+                            "0x7000000000000000000000000000000000000000000000000000000000000000",
+                            1,
+                        )),
+                        r#type: Some(pool_event::Type::Swap(pool_event::Swap {
+                            sender: "0x3".to_string(),
+                            recipient: "0x4".to_string(),
+                            amount_0: "2".to_string(),
+                            amount_1: "-3".to_string(),
+                            sqrt_price: "9".to_string(),
+                            liquidity: "120".to_string(),
+                            tick: 4,
+                        })),
+                    },
+                ],
+            },
+            10,
+            None,
+        )
+        .await
+        .expect("build changes");
 
         assert_eq!(changes.txs_with_update.len(), 2);
 
@@ -3190,11 +3190,7 @@ mod test {
         gw.expect_get_cursor_with_scope()
             .times(1)
             .returning(|| {
-                Ok((
-                    "cursor".into(),
-                    Bytes::default(),
-                    PersistedExtractorStateScope::Unknown,
-                ))
+                Ok(("cursor".into(), Bytes::default(), PersistedExtractorStateScope::Unknown))
             });
         gw.expect_get_block()
             .times(1)
@@ -3275,33 +3271,33 @@ mod test {
         let first_block = uniswap_v3_stream::Block { number: 10, ..uniswap_v3_test_block() };
         let first_changes = build_uniswap_v3_changes(
             &extractor,
-                uniswap_v3_stream::Events {
-                    block: Some(first_block),
-                    pool_events: vec![uniswap_v3_stream::events::PoolEvent {
-                        log_ordinal: 1,
-                        pool_address: pool.clone(),
-                        token0: String::new(),
-                        token1: String::new(),
-                        transaction: Some(uniswap_v3_test_tx(
-                            "0x8000000000000000000000000000000000000000000000000000000000000000",
-                            0,
-                        )),
-                        r#type: Some(pool_event::Type::Mint(pool_event::Mint {
-                            sender: "0x1".to_string(),
-                            owner: "0x2".to_string(),
-                            tick_lower: -10,
-                            tick_upper: 10,
-                            amount: "100".to_string(),
-                            amount_0: "5".to_string(),
-                            amount_1: "7".to_string(),
-                        })),
-                    }],
-                },
-                10,
-                None,
-            )
-            .await
-            .expect("build first block changes");
+            uniswap_v3_stream::Events {
+                block: Some(first_block),
+                pool_events: vec![uniswap_v3_stream::events::PoolEvent {
+                    log_ordinal: 1,
+                    pool_address: pool.clone(),
+                    token0: String::new(),
+                    token1: String::new(),
+                    transaction: Some(uniswap_v3_test_tx(
+                        "0x8000000000000000000000000000000000000000000000000000000000000000",
+                        0,
+                    )),
+                    r#type: Some(pool_event::Type::Mint(pool_event::Mint {
+                        sender: "0x1".to_string(),
+                        owner: "0x2".to_string(),
+                        tick_lower: -10,
+                        tick_upper: 10,
+                        amount: "100".to_string(),
+                        amount_0: "5".to_string(),
+                        amount_1: "7".to_string(),
+                    })),
+                }],
+            },
+            10,
+            None,
+        )
+        .await
+        .expect("build first block changes");
 
         extractor
             .replace_in_flight_commit_blocks(&[BlockUpdateWithCursor::new(
@@ -3323,33 +3319,33 @@ mod test {
         };
         let second_changes = build_uniswap_v3_changes(
             &extractor,
-                uniswap_v3_stream::Events {
-                    block: Some(second_block),
-                    pool_events: vec![uniswap_v3_stream::events::PoolEvent {
-                        log_ordinal: 1,
-                        pool_address: pool.clone(),
-                        token0: String::new(),
-                        token1: String::new(),
-                        transaction: Some(uniswap_v3_test_tx(
-                            "0x8100000000000000000000000000000000000000000000000000000000000000",
-                            0,
-                        )),
-                        r#type: Some(pool_event::Type::Mint(pool_event::Mint {
-                            sender: "0x3".to_string(),
-                            owner: "0x4".to_string(),
-                            tick_lower: -10,
-                            tick_upper: 10,
-                            amount: "50".to_string(),
-                            amount_0: "11".to_string(),
-                            amount_1: "13".to_string(),
-                        })),
-                    }],
-                },
-                11,
-                None,
-            )
-            .await
-            .expect("build second block changes");
+            uniswap_v3_stream::Events {
+                block: Some(second_block),
+                pool_events: vec![uniswap_v3_stream::events::PoolEvent {
+                    log_ordinal: 1,
+                    pool_address: pool.clone(),
+                    token0: String::new(),
+                    token1: String::new(),
+                    transaction: Some(uniswap_v3_test_tx(
+                        "0x8100000000000000000000000000000000000000000000000000000000000000",
+                        0,
+                    )),
+                    r#type: Some(pool_event::Type::Mint(pool_event::Mint {
+                        sender: "0x3".to_string(),
+                        owner: "0x4".to_string(),
+                        tick_lower: -10,
+                        tick_upper: 10,
+                        amount: "50".to_string(),
+                        amount_0: "11".to_string(),
+                        amount_1: "13".to_string(),
+                    })),
+                }],
+            },
+            11,
+            None,
+        )
+        .await
+        .expect("build second block changes");
 
         assert_eq!(second_changes.txs_with_update.len(), 1);
         let tx = &second_changes.txs_with_update[0];
@@ -3391,11 +3387,7 @@ mod test {
         gw.expect_get_cursor_with_scope()
             .times(1)
             .returning(|| {
-                Ok((
-                    "cursor".into(),
-                    Bytes::default(),
-                    PersistedExtractorStateScope::Unknown,
-                ))
+                Ok(("cursor".into(), Bytes::default(), PersistedExtractorStateScope::Unknown))
             });
         gw.expect_get_block()
             .times(1)
@@ -3491,11 +3483,7 @@ mod test {
         gw.expect_get_cursor_with_scope()
             .times(1)
             .returning(|| {
-                Ok((
-                    "cursor".into(),
-                    Bytes::default(),
-                    PersistedExtractorStateScope::Unknown,
-                ))
+                Ok(("cursor".into(), Bytes::default(), PersistedExtractorStateScope::Unknown))
             });
         gw.expect_get_block()
             .times(1)
@@ -3503,7 +3491,10 @@ mod test {
         gw.expect_get_components_balances()
             .times(1)
             .return_once(|component_ids| {
-                assert!(component_ids.is_empty(), "created pool should not load historical balances");
+                assert!(
+                    component_ids.is_empty(),
+                    "created pool should not load historical balances"
+                );
                 Ok(HashMap::new())
             });
 
@@ -3629,11 +3620,7 @@ mod test {
         gw.expect_get_cursor_with_scope()
             .times(1)
             .returning(|| {
-                Ok((
-                    "cursor".into(),
-                    Bytes::default(),
-                    PersistedExtractorStateScope::Unknown,
-                ))
+                Ok(("cursor".into(), Bytes::default(), PersistedExtractorStateScope::Unknown))
             });
         gw.expect_get_block()
             .times(1)
@@ -3755,9 +3742,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
@@ -3774,9 +3767,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_advance().times(0);
         gw.expect_get_block()
             .times(1)
@@ -3825,9 +3824,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
@@ -3973,9 +3978,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
@@ -4045,9 +4056,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_get_block()
             .times(1)
             .returning(|_| Ok(Block::default()));
@@ -4123,9 +4140,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_advance().times(0);
         gw.expect_get_block()
             .times(1)
@@ -4234,9 +4257,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_advance().times(0);
         gw.expect_get_block()
             .times(1)
@@ -4349,9 +4378,15 @@ mod test {
         gw.expect_ensure_protocol_types()
             .times(1)
             .returning(|_| Ok(()));
-        gw.expect_get_cursor()
+        gw.expect_get_cursor_with_scope()
             .times(1)
-            .returning(|| Ok(("cursor".into(), Bytes::default())));
+            .returning(|| {
+                Ok((
+                    "cursor".into(),
+                    Bytes::default(),
+                    PersistedExtractorStateScope::ExtractorLocal,
+                ))
+            });
         gw.expect_advance().times(0);
         gw.expect_get_block()
             .times(1)

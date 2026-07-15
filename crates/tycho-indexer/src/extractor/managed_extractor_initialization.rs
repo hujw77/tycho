@@ -23,12 +23,16 @@ use crate::extractor::{
     },
     extractor_config::ExtractorConfig,
     family_registry::FamilyRuntimeRegistry,
+    family_runtime_planning::ResolvedFamilyRuntime,
     post_processors::POST_PROCESSOR_REGISTRY,
     protocol_cache::ProtocolMemoryCache,
     protocol_extractor::{ExtractorPgGateway, ProtocolExtractor},
     protocol_message_registry::{
+        default_auxiliary_protocol_message_decoders_for_protocol_system,
+        default_auxiliary_protocol_state_hydrators_for_protocol_system,
         AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator,
     },
+    runtime_target_planning::ResolvedStandaloneRuntime,
     ExtractionError, Extractor, ExtractorExtension,
 };
 
@@ -309,27 +313,27 @@ impl ExtractorBuilder {
             EthereumTokenPreProcessor,
             DCIPlugin<_>,
         >::new_with_runtime_support(
-                gw,
-                self.database_insert_batch_size
-                    .unwrap_or_default(),
-                &self.config.name,
-                self.config.chain,
-                chain_state,
-                self.config
-                    .protocol_system()
-                    .to_string(),
-                protocol_cache.clone(),
-                protocol_types,
-                self.auxiliary_protocol_message_decoders
-                    .clone(),
-                self.auxiliary_protocol_state_hydrators
-                    .clone(),
-                token_pre_processor.clone(),
-                post_processor,
-                dci_plugin,
-                self.rpc_client.clone(),
-            )
-            .await?;
+            gw,
+            self.database_insert_batch_size
+                .unwrap_or_default(),
+            &self.config.name,
+            self.config.chain,
+            chain_state,
+            self.config
+                .protocol_system()
+                .to_string(),
+            protocol_cache.clone(),
+            protocol_types,
+            self.auxiliary_protocol_message_decoders
+                .clone(),
+            self.auxiliary_protocol_state_hydrators
+                .clone(),
+            token_pre_processor.clone(),
+            post_processor,
+            dci_plugin,
+            self.rpc_client.clone(),
+        )
+        .await?;
 
         self.extractor = Some(Arc::new(extractor));
         Ok(self)
@@ -352,6 +356,40 @@ pub(crate) struct ManagedExtractorBuildContext<'a> {
 }
 
 impl ManagedExtractorBuildContext<'_> {
+    pub(crate) fn auxiliary_protocol_message_decoders_for_protocol_system_with_registry(
+        protocol_system: &str,
+        registry: FamilyRuntimeRegistry<'static>,
+    ) -> Vec<AuxiliaryProtocolMessageDecoder> {
+        default_auxiliary_protocol_message_decoders_for_protocol_system(protocol_system, registry)
+    }
+
+    pub(crate) fn auxiliary_protocol_message_decoders_for_protocol_system(
+        &self,
+        protocol_system: &str,
+    ) -> Vec<AuxiliaryProtocolMessageDecoder> {
+        Self::auxiliary_protocol_message_decoders_for_protocol_system_with_registry(
+            protocol_system,
+            self.family_runtime_registry,
+        )
+    }
+
+    pub(crate) fn auxiliary_protocol_state_hydrators_for_protocol_system_with_registry(
+        protocol_system: &str,
+        registry: FamilyRuntimeRegistry<'static>,
+    ) -> Vec<AuxiliaryProtocolStateHydrator> {
+        default_auxiliary_protocol_state_hydrators_for_protocol_system(protocol_system, registry)
+    }
+
+    pub(crate) fn auxiliary_protocol_state_hydrators_for_protocol_system(
+        &self,
+        protocol_system: &str,
+    ) -> Vec<AuxiliaryProtocolStateHydrator> {
+        Self::auxiliary_protocol_state_hydrators_for_protocol_system_with_registry(
+            protocol_system,
+            self.family_runtime_registry,
+        )
+    }
+
     pub(crate) async fn build_initialized_extractor(
         &self,
         extractor_config: &ExtractorConfig,
@@ -426,5 +464,113 @@ impl ManagedExtractorBuildContext<'_> {
         }
 
         Ok(extractors)
+    }
+
+    pub(crate) async fn build_runtime_target_extractors<'a>(
+        &self,
+        runtime_target: &impl RuntimeTargetExtractorBuildView<'a>,
+    ) -> Result<HashMap<String, Arc<dyn Extractor>>, ExtractionError> {
+        self.build_protocol_system_keyed_extractors(
+            &runtime_target.extractor_configs(),
+            &runtime_target.auxiliary_protocol_message_decoders_by_protocol_system(self),
+            &runtime_target.auxiliary_protocol_state_hydrators_by_protocol_system(self),
+        )
+        .await
+    }
+
+    pub(crate) async fn build_unique_runtime_target_extractor<'a>(
+        &self,
+        runtime_target: &impl RuntimeTargetExtractorBuildView<'a>,
+    ) -> Result<Arc<dyn Extractor>, ExtractionError> {
+        let protocol_system = runtime_target
+            .unique_protocol_system()
+            .ok_or_else(|| {
+                ExtractionError::Setup(
+                    "runtime target did not expose a unique protocol_system for single-extractor build"
+                        .to_string(),
+                )
+            })?;
+        let mut extractors = self
+            .build_runtime_target_extractors(runtime_target)
+            .await?;
+        extractors
+            .remove(protocol_system)
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
+                    "missing initialized extractor for runtime-target protocol_system `{protocol_system}`"
+                ))
+            })
+    }
+}
+
+pub(crate) trait RuntimeTargetExtractorBuildView<'a> {
+    fn extractor_configs(&self) -> Vec<&'a ExtractorConfig>;
+
+    fn unique_protocol_system(&self) -> Option<&str> {
+        None
+    }
+
+    fn auxiliary_protocol_message_decoders_by_protocol_system(
+        &self,
+        extractor_build: &ManagedExtractorBuildContext<'_>,
+    ) -> HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>>;
+
+    fn auxiliary_protocol_state_hydrators_by_protocol_system(
+        &self,
+        extractor_build: &ManagedExtractorBuildContext<'_>,
+    ) -> HashMap<String, Vec<AuxiliaryProtocolStateHydrator>>;
+}
+
+impl<'a> RuntimeTargetExtractorBuildView<'a> for ResolvedStandaloneRuntime<'a> {
+    fn extractor_configs(&self) -> Vec<&'a ExtractorConfig> {
+        vec![self.extractor_config]
+    }
+
+    fn unique_protocol_system(&self) -> Option<&str> {
+        Some(self.protocol_system)
+    }
+
+    fn auxiliary_protocol_message_decoders_by_protocol_system(
+        &self,
+        extractor_build: &ManagedExtractorBuildContext<'_>,
+    ) -> HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>> {
+        HashMap::from([(
+            self.protocol_system.to_string(),
+            extractor_build
+                .auxiliary_protocol_message_decoders_for_protocol_system(self.protocol_system),
+        )])
+    }
+
+    fn auxiliary_protocol_state_hydrators_by_protocol_system(
+        &self,
+        extractor_build: &ManagedExtractorBuildContext<'_>,
+    ) -> HashMap<String, Vec<AuxiliaryProtocolStateHydrator>> {
+        HashMap::from([(
+            self.protocol_system.to_string(),
+            extractor_build
+                .auxiliary_protocol_state_hydrators_for_protocol_system(self.protocol_system),
+        )])
+    }
+}
+
+impl<'a> RuntimeTargetExtractorBuildView<'a> for ResolvedFamilyRuntime<'a> {
+    fn extractor_configs(&self) -> Vec<&'a ExtractorConfig> {
+        self.extractor_configs.clone()
+    }
+
+    fn auxiliary_protocol_message_decoders_by_protocol_system(
+        &self,
+        _extractor_build: &ManagedExtractorBuildContext<'_>,
+    ) -> HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>> {
+        self.auxiliary_protocol_message_decoders_by_protocol_system()
+            .clone()
+    }
+
+    fn auxiliary_protocol_state_hydrators_by_protocol_system(
+        &self,
+        _extractor_build: &ManagedExtractorBuildContext<'_>,
+    ) -> HashMap<String, Vec<AuxiliaryProtocolStateHydrator>> {
+        self.auxiliary_protocol_state_hydrators_by_protocol_system()
+            .clone()
     }
 }

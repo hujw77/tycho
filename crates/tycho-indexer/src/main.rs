@@ -42,9 +42,9 @@ use tycho_ethereum::{
     rpc::EthereumRpcClient, services::token_pre_processor::EthereumTokenPreProcessor,
 };
 #[cfg(test)]
-use tycho_indexer::extractor::family_runtime_metadata::FamilyRuntimeConfig;
-#[cfg(test)]
 use tycho_indexer::extractor::chain_state::ChainState;
+#[cfg(test)]
+use tycho_indexer::extractor::family_runtime_metadata::FamilyRuntimeConfig;
 #[cfg(test)]
 use tycho_indexer::services::ServicesBuilder;
 use tycho_indexer::{
@@ -233,17 +233,15 @@ fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), Ext
 
         info!("Starting Tycho");
         debug!("{} CPUs detected", num_cpus::get());
-        let loaded_runtime_plan = config::LoadedIndexerRuntimePlan::from_yaml(
-            &index_args.extractors_config,
-        )
-        .map_err(|e| {
-            ExtractionError::Setup(format!(
-                "Failed to load extractors runtime owner: {e}"
-            ))
-        })?;
+        let loaded_runtime_plan =
+            config::LoadedIndexerRuntimePlan::from_yaml(&index_args.extractors_config).map_err(
+                |e| ExtractionError::Setup(format!("Failed to load extractors runtime owner: {e}")),
+            )?;
         let runtime_plan = loaded_runtime_plan
             .resolved_runtime_plan()
-            .map_err(|e| ExtractionError::Setup(format!("Failed to resolve runtime targets: {e}")))?;
+            .map_err(|e| {
+                ExtractionError::Setup(format!("Failed to resolve runtime targets: {e}"))
+            })?;
 
         let retention_horizon: NaiveDateTime = index_args
             .retention_horizon
@@ -485,8 +483,7 @@ mod test_serial_db {
         build_all_extractors_from_config_path_with_default_family_registry_for_tests as build_all_extractors_from_config_path,
         build_all_extractors_from_config_path_with_registry_for_tests,
         build_all_extractors_with_default_family_registry_for_tests as build_all_extractors,
-        family_block_response,
-        family_block_response_from_block_changes,
+        family_block_response, family_block_response_from_block_changes,
         future_family_runtime_registry_for_record_substreams_tests,
         future_family_runtime_registry_for_record_substreams_tests_with_durability_scope,
         repo_combined_family_bootstrap_pool_seeds_for_tests, scripted_session_response,
@@ -501,8 +498,8 @@ mod test_serial_db {
         write_record_substreams_future_family_fixture_inputs_with_registry,
         write_temp_substreams_package_for_tests as test_family_shared_spkg_path,
         write_uniswap_family_defaults_config_for_tests as test_family_defaults_config,
-        write_uniswap_family_defaults_config_with_member_names_for_tests as test_family_defaults_config_with_member_names,
         write_uniswap_family_defaults_config_with_member_names_and_runtime_overrides,
+        write_uniswap_family_defaults_config_with_member_names_for_tests as test_family_defaults_config_with_member_names,
         write_uniswap_family_defaults_config_with_shared_bootstrap,
     };
     use alloy::primitives::Address as AlloyAddress;
@@ -1655,7 +1652,8 @@ params:
                 None,
                 false,
             )
-            .await {
+            .await
+            {
                 Ok(_) => panic!(
                     "shared-family startup should reject legacy extractor-scoped resume state"
                 ),
@@ -4651,24 +4649,25 @@ params:
                 .await
                 .expect("persist future family bootstrap completion state");
 
-            let (mut runners, handles) = build_all_extractors_from_config_path_with_registry_for_tests(
-                &config_path,
-                crate::testing::BuildExtractorsTestContext {
-                    chain_state: ChainState::default(),
-                    endpoint_url: &format!("http://{addr}"),
-                    s3_bucket: None,
-                    substreams_api_token: "",
-                    cached_gw: &cached_gw,
-                    database_insert_batch_size: 1000,
-                    token_pre_processor: &token_processor,
-                    rpc_client: &rpc,
-                    runtime: None,
-                    partial_blocks: false,
-                    family_runtime_registry: registry,
-                },
-            )
-            .await
-            .expect("build future family runtime through custom registry");
+            let (mut runners, handles) =
+                build_all_extractors_from_config_path_with_registry_for_tests(
+                    &config_path,
+                    crate::testing::BuildExtractorsTestContext {
+                        chain_state: ChainState::default(),
+                        endpoint_url: &format!("http://{addr}"),
+                        s3_bucket: None,
+                        substreams_api_token: "",
+                        cached_gw: &cached_gw,
+                        database_insert_batch_size: 1000,
+                        token_pre_processor: &token_processor,
+                        rpc_client: &rpc,
+                        runtime: None,
+                        partial_blocks: false,
+                        family_runtime_registry: registry,
+                    },
+                )
+                .await
+                .expect("build future family runtime through custom registry");
 
             assert_eq!(runners.len(), 1);
             assert_eq!(handles.len(), 2);
@@ -4765,24 +4764,25 @@ params:
                 .await
                 .expect("commit future family resumed extraction state");
 
-            let (mut runners, handles) = build_all_extractors_from_config_path_with_registry_for_tests(
-                &config_path,
-                crate::testing::BuildExtractorsTestContext {
-                    chain_state: ChainState::default(),
-                    endpoint_url: &format!("http://{addr}"),
-                    s3_bucket: None,
-                    substreams_api_token: "",
-                    cached_gw: &cached_gw,
-                    database_insert_batch_size: 1000,
-                    token_pre_processor: &token_processor,
-                    rpc_client: &rpc,
-                    runtime: None,
-                    partial_blocks: false,
-                    family_runtime_registry: registry,
-                },
-            )
-            .await
-            .expect("build future family runtime from persisted shared cursor");
+            let (mut runners, handles) =
+                build_all_extractors_from_config_path_with_registry_for_tests(
+                    &config_path,
+                    crate::testing::BuildExtractorsTestContext {
+                        chain_state: ChainState::default(),
+                        endpoint_url: &format!("http://{addr}"),
+                        s3_bucket: None,
+                        substreams_api_token: "",
+                        cached_gw: &cached_gw,
+                        database_insert_batch_size: 1000,
+                        token_pre_processor: &token_processor,
+                        rpc_client: &rpc,
+                        runtime: None,
+                        partial_blocks: false,
+                        family_runtime_registry: registry,
+                    },
+                )
+                .await
+                .expect("build future family runtime from persisted shared cursor");
 
             assert_eq!(runners.len(), 1);
             assert_eq!(handles.len(), 2);
@@ -8358,6 +8358,12 @@ mod recorder_tests {
             .join("combined_family_extensibility_contract.tests")
     }
 
+    fn combined_family_fynd_replay_gate_manifest_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("combined_family_fynd_replay_gate.tests")
+    }
+
     fn combined_family_db_gate_script_path() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -8383,6 +8389,15 @@ mod recorder_tests {
             .expect("tycho-indexer crate should have repo grandparent")
             .join("scripts")
             .join("check-combined-family-extensibility.sh")
+    }
+
+    fn combined_family_fynd_replay_gate_script_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("tycho-indexer crate should have repo grandparent")
+            .join("scripts")
+            .join("check-combined-family-fynd-replay.sh")
     }
 
     fn combined_family_validation_script_path() -> std::path::PathBuf {
@@ -8415,10 +8430,10 @@ mod recorder_tests {
 
     fn shell_escape_for_rust_script_path(path: &std::path::Path) -> String {
         let rendered = path.to_string_lossy();
-        if rendered
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '+' | '=' | ',' | '-'))
-        {
+        if rendered.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '.' | '/' | ':' | '+' | '=' | ',' | '-')
+        }) {
             return rendered.into_owned();
         }
         format!("'{}'", rendered.replace('\'', "'\"'\"'"))
@@ -8475,6 +8490,27 @@ mod recorder_tests {
             .collect()
     }
 
+    fn combined_family_fynd_replay_gate_entries() -> Vec<(String, String)> {
+        read_nonempty_manifest_lines(&combined_family_fynd_replay_gate_manifest_path())
+            .into_iter()
+            .map(|line| {
+                let mut parts = line.split_whitespace();
+                let package_name = parts.next().unwrap_or_else(|| {
+                    panic!("Fynd replay gate entry missing package name: {line}")
+                });
+                let test_name = parts
+                    .next()
+                    .unwrap_or_else(|| panic!("Fynd replay gate entry missing test name: {line}"));
+                let extra = parts.next();
+                assert!(
+                    extra.is_none(),
+                    "Fynd replay gate entry should contain exactly two fields: {line}"
+                );
+                (package_name.to_string(), test_name.to_string())
+            })
+            .collect()
+    }
+
     fn combined_family_fynd_route_test_name() -> String {
         combined_family_live_gate_tests()
             .remove("route")
@@ -8493,6 +8529,14 @@ mod recorder_tests {
 
     fn combined_family_fynd_default_settlement_test() -> &'static str {
         "quote_settles_within_encoded_bounds_at_quote_block_for_combined_uniswap_family"
+    }
+
+    fn combined_family_fynd_replay_quote_test() -> &'static str {
+        "test_quote_endpoint_replays_combined_family_fixture"
+    }
+
+    fn combined_family_fynd_replay_feed_sync_test() -> &'static str {
+        "test_handle_message_tracks_combined_family_sync_states_and_components"
     }
 
     fn combined_family_db_gate_tests() -> Vec<String> {
@@ -8586,6 +8630,26 @@ mod recorder_tests {
             .map(|(file_path, function_name)| format!("{file_path} {function_name}\n"))
             .collect::<String>();
         std::fs::write(&path, body).expect("write temp combined-family extensibility manifest");
+        path
+    }
+
+    fn write_temp_combined_family_fynd_replay_manifest_for_tests(
+        file_name: &str,
+        entries: &[(&str, &str)],
+    ) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{file_name}-{}-{}.tests",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        ));
+        let body = entries
+            .iter()
+            .map(|(package_name, test_name)| format!("{package_name} {test_name}\n"))
+            .collect::<String>();
+        std::fs::write(&path, body).expect("write temp combined-family Fynd replay manifest");
         path
     }
 
@@ -8786,8 +8850,6 @@ mod recorder_tests {
             "token",
             "--extractors-config",
             &extractors_config_path.to_string_lossy(),
-            "--family",
-            "future_swap",
             "--stop-block",
             "+2",
             "--output",
@@ -8854,8 +8916,6 @@ mod recorder_tests {
             "token",
             "--extractors-config",
             &extractors_config_path.to_string_lossy(),
-            "--family",
-            "future_swap",
             "--stop-block",
             "+2",
             "--output",
@@ -8878,6 +8938,8 @@ mod recorder_tests {
         assert_eq!(resolved.start_block, 100);
         assert_eq!(resolved.stop_block, 102);
         assert_eq!(resolved.extractor_id, "ethereum:future_swap_family");
+        assert_eq!(record_args.family, None);
+        assert_eq!(record_args.protocol_system, None);
         assert_eq!(resolved.params.get("extra_flag"), Some(&"future-enabled".to_string()));
 
         let _ = std::fs::remove_file(spkg_path);
@@ -10004,7 +10066,7 @@ mod recorder_tests {
         let rendered = String::from_utf8(output.stdout)
             .expect("Fynd live E2E script doctor mode should emit utf8 diagnostics");
         let expected = format!(
-            "ready=false\nfynd_repo_root={}\nfynd_repo_exists=true\nfynd_test_exists=true\nroute_test_exists=true\nsettlement_test_exists=true\nlive_test_mapping_ready=true\ntycho_url={}\ntycho_health=unreachable\ntycho_protocols_ready=unreachable\nprotocol_v2_ready=unknown\nprotocol_v3_ready=unknown\nchain=ethereum\nrpc_url={}\nrust_log={}\nhealth_timeout_secs=300\ntraded_n_days_ago=3\nclient_timeout_secs=5\nclient_retry_max_attempts=1\nmin_token_quality=100\nhealth_mode_override=default\nroute_health_mode=quote_ready\nsettlement_health_mode=quote_ready\nquote_timeout_secs=420\nconnector_tokens=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599\nroute_test={}\nsettlement_test={}\ncurl_available=true\ntycho_stream_ws_buffer_size=default\ntycho_stream_subscription_buffer_size=default\ntest_manifest={}\n",
+            "ready=false\nfynd_repo_root={}\nfynd_repo_exists=true\nfynd_test_exists=true\nroute_test_exists=true\nsettlement_test_exists=true\nlive_test_mapping_ready=true\ntycho_url={}\ntycho_health=unreachable\ntycho_protocols_ready=unreachable\nprotocol_v2_ready=unknown\nprotocol_v3_ready=unknown\ntycho_filtered_tokens_ready=unreachable\ntycho_filtered_tokens_total=unreachable\ntycho_connector_tokens_ready=unreachable\ntycho_connector_tokens_total=unreachable\nchain=ethereum\nrpc_url={}\nrust_log={}\nhealth_timeout_secs=300\ntraded_n_days_ago=42\nclient_timeout_secs=5\nclient_retry_max_attempts=1\nmin_token_quality=10\nhealth_mode_override=default\nroute_health_mode=quote_ready\nsettlement_health_mode=strict\nquote_timeout_secs=420\nconnector_tokens=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599\ntoken_balance_slot_override=default\ntoken_allowance_slot_override=default\nroute_test={}\nsettlement_test={}\ncurl_available=true\ntycho_stream_ws_buffer_size=4096\ntycho_stream_subscription_buffer_size=4096\ntest_manifest={}\n",
             fynd_repo_root.display(),
             tycho_url,
             rpc_url,
@@ -10042,12 +10104,14 @@ mod recorder_tests {
             .join("tests")
             .join("e2e_quote.rs");
         let source = std::fs::read_to_string(&e2e_quote_path).unwrap_or_else(|err| {
-            panic!("expected to read Fynd e2e quote test file at {}: {err}", e2e_quote_path.display())
+            panic!(
+                "expected to read Fynd e2e quote test file at {}: {err}",
+                e2e_quote_path.display()
+            )
         });
-        for test_name in [
-            combined_family_fynd_route_test_name(),
-            combined_family_fynd_settlement_test_name(),
-        ] {
+        for test_name in
+            [combined_family_fynd_route_test_name(), combined_family_fynd_settlement_test_name()]
+        {
             assert!(
                 source.contains(&format!("fn {test_name}(")),
                 "live gate manifest test `{test_name}` must exist in {}",
@@ -10100,7 +10164,9 @@ mod recorder_tests {
         std::fs::write(fake_fynd.join("Cargo.toml"), "[package]\nname='fynd'\nversion='0.0.0'\n")
             .expect("write fake fynd Cargo.toml");
         std::fs::write(
-            fake_fynd.join("tests").join("e2e_quote.rs"),
+            fake_fynd
+                .join("tests")
+                .join("e2e_quote.rs"),
             "#[test]\nfn unrelated_live_test() {}\n",
         )
         .expect("write fake fynd e2e_quote.rs without manifest-backed tests");
@@ -10180,7 +10246,7 @@ mod recorder_tests {
         let rendered = String::from_utf8(output.stdout)
             .expect("Fynd live E2E script command mode should emit utf8 commands");
         let expected = format!(
-            "cd {} && \\\nRUST_LOG={} \\\nFYND_E2E_TYCHO_URL={} \\\nFYND_E2E_RPC_URL={} \\\nFYND_E2E_HEALTH_TIMEOUT_SECS=300 \\\nFYND_E2E_TRADED_N_DAYS_AGO=3 \\\nFYND_E2E_CLIENT_TIMEOUT_SECS=5 \\\nFYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS=1 \\\nFYND_E2E_MIN_TOKEN_QUALITY=100 \\\nFYND_E2E_HEALTH_MODE=quote_ready \\\nFYND_E2E_QUOTE_TIMEOUT_SECS=420 \\\nFYND_E2E_CONNECTOR_TOKENS=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599 \\\ncargo test --test e2e_quote {} -- --ignored --nocapture && \\\nRUST_LOG={} \\\nFYND_E2E_TYCHO_URL={} \\\nFYND_E2E_RPC_URL={} \\\nFYND_E2E_HEALTH_TIMEOUT_SECS=300 \\\nFYND_E2E_TRADED_N_DAYS_AGO=3 \\\nFYND_E2E_CLIENT_TIMEOUT_SECS=5 \\\nFYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS=1 \\\nFYND_E2E_MIN_TOKEN_QUALITY=100 \\\nFYND_E2E_HEALTH_MODE=strict \\\nFYND_E2E_QUOTE_TIMEOUT_SECS=420 \\\nFYND_E2E_CONNECTOR_TOKENS=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599 \\\ncargo test --test e2e_quote {} -- --ignored --nocapture\n",
+            "cd {} && \\\nRUST_LOG={} \\\nFYND_E2E_TYCHO_URL={} \\\nFYND_E2E_RPC_URL={} \\\nFYND_E2E_HEALTH_TIMEOUT_SECS=300 \\\nFYND_E2E_TRADED_N_DAYS_AGO=42 \\\nFYND_E2E_CLIENT_TIMEOUT_SECS=5 \\\nFYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS=1 \\\nFYND_E2E_MIN_TOKEN_QUALITY=10 \\\nFYND_E2E_HEALTH_MODE=quote_ready \\\nFYND_E2E_QUOTE_TIMEOUT_SECS=420 \\\nFYND_E2E_CONNECTOR_TOKENS=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599 \\\nTYCHO_STREAM_WS_BUFFER_SIZE=4096 \\\nTYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE=4096 \\\ncargo test --test e2e_quote {} -- --ignored --nocapture && \\\nRUST_LOG={} \\\nFYND_E2E_TYCHO_URL={} \\\nFYND_E2E_RPC_URL={} \\\nFYND_E2E_HEALTH_TIMEOUT_SECS=300 \\\nFYND_E2E_TRADED_N_DAYS_AGO=42 \\\nFYND_E2E_CLIENT_TIMEOUT_SECS=5 \\\nFYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS=1 \\\nFYND_E2E_MIN_TOKEN_QUALITY=10 \\\nFYND_E2E_HEALTH_MODE=strict \\\nFYND_E2E_QUOTE_TIMEOUT_SECS=420 \\\nFYND_E2E_CONNECTOR_TOKENS=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599 \\\nTYCHO_STREAM_WS_BUFFER_SIZE=4096 \\\nTYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE=4096 \\\ncargo test --test e2e_quote {} -- --ignored --nocapture\n",
             fynd_repo_root.display(),
             rust_log,
             tycho_url,
@@ -10268,7 +10334,9 @@ mod recorder_tests {
 
         let rendered = String::from_utf8(output.stdout)
             .expect("Fynd live E2E script command mode with health-mode override should emit utf8");
-        let override_occurrences = rendered.matches("FYND_E2E_HEALTH_MODE=strict").count();
+        let override_occurrences = rendered
+            .matches("FYND_E2E_HEALTH_MODE=strict")
+            .count();
         assert_eq!(
             override_occurrences, 2,
             "health-mode override should apply to both route and settlement commands"
@@ -10276,6 +10344,40 @@ mod recorder_tests {
         assert!(
             !rendered.contains("FYND_E2E_HEALTH_MODE=quote_ready"),
             "health-mode override should suppress the route default"
+        );
+    }
+
+    #[test]
+    fn combined_family_fynd_live_e2e_script_forwards_token_slot_overrides() {
+        let script_path = combined_family_fynd_live_e2e_script_path();
+        let output = std::process::Command::new(&script_path)
+            .arg("command")
+            .arg("settlement")
+            .env("FYND_REPO_ROOT", combined_family_fynd_repo_root())
+            .env("FYND_E2E_TOKEN_BALANCE_SLOT", "3")
+            .env("FYND_E2E_TOKEN_ALLOWANCE_SLOT", "4")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd live E2E script command mode with token-slot overrides at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "Fynd live E2E script command mode with token-slot overrides should succeed, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("Fynd live E2E script token-slot override command mode should emit utf8");
+        assert!(
+            rendered.contains("FYND_E2E_TOKEN_BALANCE_SLOT=3"),
+            "command output should forward the explicit balance-slot override"
+        );
+        assert!(
+            rendered.contains("FYND_E2E_TOKEN_ALLOWANCE_SLOT=4"),
+            "command output should forward the explicit allowance-slot override"
         );
     }
 
@@ -10584,6 +10686,190 @@ mod recorder_tests {
     }
 
     #[test]
+    fn combined_family_fynd_replay_gate_manifest_stays_aligned_with_source_tests() {
+        let manifest_entries = combined_family_fynd_replay_gate_entries();
+        assert!(
+            !manifest_entries.is_empty(),
+            "combined-family Fynd replay gate manifest should enumerate at least one test"
+        );
+
+        let fynd_repo_root = combined_family_fynd_repo_root();
+        for (package_name, test_name) in manifest_entries {
+            let source_path = match package_name.as_str() {
+                "fynd-rpc" => fynd_repo_root.join("fynd-rpc").join("src").join("api").join("handlers.rs"),
+                "fynd-core" => fynd_repo_root.join("fynd-core").join("src").join("feed").join("tycho_feed.rs"),
+                other => panic!("unexpected Fynd replay package in manifest: {other}"),
+            };
+            let source = std::fs::read_to_string(&source_path).unwrap_or_else(|err| {
+                panic!("read Fynd replay source file {}: {err}", source_path.display())
+            });
+            let test_patterns = [format!("fn {test_name}("), format!("async fn {test_name}(")];
+            assert!(
+                test_patterns.iter().any(|pattern| source.contains(pattern)),
+                "combined-family Fynd replay manifest references missing test `{test_name}` for package `{package_name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_family_fynd_replay_gate_manifest_keeps_quote_replay_coverage() {
+        let manifest_entries = combined_family_fynd_replay_gate_entries();
+        assert!(
+            manifest_entries.contains(&(
+                "fynd-rpc".to_string(),
+                combined_family_fynd_replay_quote_test().to_string()
+            )),
+            "combined-family Fynd replay manifest must keep the HTTP quote replay test that proves the user-facing quote endpoint preserves the combined-family recorded semantics"
+        );
+    }
+
+    #[test]
+    fn combined_family_fynd_replay_gate_manifest_keeps_feed_sync_coverage() {
+        let manifest_entries = combined_family_fynd_replay_gate_entries();
+        assert!(
+            manifest_entries.contains(&(
+                "fynd-core".to_string(),
+                combined_family_fynd_replay_feed_sync_test().to_string()
+            )),
+            "combined-family Fynd replay manifest must keep the feed sync-state test that proves Fynd continues to track separate v2/v3 branch readiness and component admission over the shared family stream"
+        );
+    }
+
+    #[test]
+    fn combined_family_fynd_replay_gate_script_list_stays_aligned_with_manifest() {
+        let script_path = combined_family_fynd_replay_gate_script_path();
+        let output = std::process::Command::new(&script_path)
+            .arg("list")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd replay gate script list mode at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "Fynd replay gate script list mode should succeed, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("Fynd replay gate script list mode should emit utf8 entries");
+        let rendered_entries = rendered
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let manifest_entries = combined_family_fynd_replay_gate_entries()
+            .into_iter()
+            .map(|(package_name, test_name)| format!("{package_name} {test_name}"))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered_entries, manifest_entries);
+    }
+
+    #[test]
+    fn combined_family_fynd_replay_gate_script_supports_manifest_override() {
+        let script_path = combined_family_fynd_replay_gate_script_path();
+        let custom_manifest = write_temp_combined_family_fynd_replay_manifest_for_tests(
+            "combined-family-fynd-replay-override",
+            &[("fynd-core", combined_family_fynd_replay_feed_sync_test())],
+        );
+        let output = std::process::Command::new(&script_path)
+            .arg("command")
+            .env("TYCHO_COMBINED_FAMILY_FYND_REPLAY_TEST_MANIFEST", &custom_manifest)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd replay gate script command mode with manifest override at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "Fynd replay gate script command mode with manifest override should succeed, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("Fynd replay gate command override should emit utf8 commands");
+        assert!(
+            rendered.contains("ENTRY_PACKAGES=("),
+            "Fynd replay gate command should render package-backed manifest ownership"
+        );
+        assert!(
+            rendered.contains("cargo test -p \"${package_name}\" --no-run 2>&1"),
+            "Fynd replay gate command should resolve test binaries per package"
+        );
+        assert!(
+            rendered.contains("TEST_BINARY_BY_ENTRY[\"${package_name}:${test_name}\"]"),
+            "Fynd replay gate command should map package+test entries to resolved executables"
+        );
+        assert!(
+            rendered.contains(combined_family_fynd_replay_feed_sync_test()),
+            "Fynd replay gate command should honor the override manifest test name"
+        );
+        assert!(
+            !rendered.contains(combined_family_fynd_replay_quote_test()),
+            "Fynd replay gate command should stop using the default manifest entries when overridden"
+        );
+
+        let _ = std::fs::remove_file(custom_manifest);
+    }
+
+    #[test]
+    fn combined_family_fynd_replay_gate_script_doctor_reports_expected_diagnostics() {
+        let script_path = combined_family_fynd_replay_gate_script_path();
+        let fynd_repo_root = combined_family_fynd_repo_root();
+        let test_manifest = combined_family_fynd_replay_gate_manifest_path();
+        let output = std::process::Command::new(&script_path)
+            .arg("doctor")
+            .env("FYND_REPO_ROOT", &fynd_repo_root)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd replay gate script doctor mode at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "Fynd replay gate script doctor mode should succeed, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("Fynd replay gate script doctor mode should emit utf8 diagnostics");
+        let expected = format!(
+            "ready=true\nfynd_repo_root={}\nfynd_repo_exists=true\ntest_manifest={}\ntest_count=2\ncargo_state=available\n",
+            fynd_repo_root.display(),
+            test_manifest.display(),
+        );
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn combined_family_fynd_replay_gate_script_stays_aligned_with_repo_workflow() {
+        let script_path = combined_family_fynd_replay_gate_script_path();
+        let script = std::fs::read_to_string(&script_path).unwrap_or_else(|err| {
+            panic!("expected to read Fynd replay gate script at {}: {err}", script_path.display())
+        });
+
+        assert!(script.contains("doctor [--strict]"), "script should advertise the doctor mode");
+        assert!(script.contains("list"), "script should advertise the list mode");
+        assert!(script.contains("command"), "script should advertise the command mode");
+        assert!(script.contains("run"), "script should advertise the run mode");
+        assert!(
+            script.contains("TYCHO_COMBINED_FAMILY_FYND_REPLAY_TEST_MANIFEST"),
+            "script should expose the Fynd replay manifest override surface"
+        );
+        assert!(
+            script.contains("cargo test -p \"${package_name}\" --no-run 2>&1"),
+            "script should resolve replay tests through package-scoped cargo test binaries"
+        );
+    }
+
+    #[test]
     fn combined_family_validation_script_doctor_reports_expected_diagnostics() {
         let script_path = combined_family_validation_script_path();
         let output = std::process::Command::new(&script_path)
@@ -10622,6 +10908,10 @@ mod recorder_tests {
             "doctor output should report extensibility gate readiness separately"
         );
         assert!(
+            rendered.contains("fynd_replay_ready=true"),
+            "doctor output should report the repo-local Fynd replay gate readiness separately"
+        );
+        assert!(
             rendered.contains("full_ready=false"),
             "doctor output should report full validation readiness"
         );
@@ -10654,8 +10944,16 @@ mod recorder_tests {
             "doctor output should include the DB gate script path"
         );
         assert!(
+            rendered.contains("fynd_replay_gate_script="),
+            "doctor output should include the Fynd replay gate script path"
+        );
+        assert!(
             rendered.contains("extensibility_doctor_command="),
             "doctor output should include the extensibility doctor command"
+        );
+        assert!(
+            rendered.contains("fynd_replay_doctor_command="),
+            "doctor output should include the Fynd replay doctor command"
         );
         assert!(
             rendered.contains("live_gate_script="),
@@ -10708,7 +11006,8 @@ mod recorder_tests {
     }
 
     #[test]
-    fn combined_family_validation_script_command_acceptance_renders_extensibility_then_repo_gate() {
+    fn combined_family_validation_script_command_acceptance_renders_extensibility_replay_then_repo_gate(
+    ) {
         let script_path = combined_family_validation_script_path();
         let output = std::process::Command::new(&script_path)
             .arg("command")
@@ -10748,6 +11047,18 @@ mod recorder_tests {
         assert!(
             rendered.contains("\"${TEST_BINARY_BY_ENTRY[${test_name}]}\" \"${TEST_FULL_NAME_BY_ENTRY[${test_name}]}\" --exact --nocapture"),
             "acceptance command should execute the extensibility gate through the manifest-backed executable-index loop"
+        );
+        assert!(
+            rendered.contains(combined_family_fynd_replay_quote_test()),
+            "acceptance command should include the repo-local Fynd quote replay contract gate"
+        );
+        assert!(
+            rendered.contains(combined_family_fynd_replay_feed_sync_test()),
+            "acceptance command should include the repo-local Fynd feed sync contract gate"
+        );
+        assert!(
+            rendered.contains("\"${TEST_BINARY_BY_ENTRY[${entry_key}]}\" \"${TEST_FULL_NAME_BY_ENTRY[${entry_key}]}\" --exact --nocapture"),
+            "acceptance command should execute the Fynd replay gate through its manifest-backed executable-index loop"
         );
         assert!(
             rendered.contains("export DATABASE_URL='postgres://example:secret@127.0.0.1:5888/combined_family_validation_command_gate'"),
@@ -10816,6 +11127,10 @@ mod recorder_tests {
         assert!(
             rendered.contains("custom_registry_loads_future_family_from_yaml_entrypoint"),
             "acceptance command should still include the extensibility contract gate"
+        );
+        assert!(
+            rendered.contains(combined_family_fynd_replay_quote_test()),
+            "acceptance command should still include the Fynd replay gate by default"
         );
         assert!(
             rendered.contains(
@@ -11132,6 +11447,10 @@ mod recorder_tests {
             "fake cargo environment should make the extensibility gate look ready"
         );
         assert!(
+            rendered.contains("fynd_replay_ready=true"),
+            "the real sibling Fynd workspace should make the replay gate ready"
+        );
+        assert!(
             rendered.contains("acceptance_ready=true"),
             "repo-local acceptance readiness should become true once extensibility and DB gates are ready, even if live validation is still unavailable"
         );
@@ -11184,7 +11503,9 @@ mod recorder_tests {
             .expect("write fake fynd Cargo.toml");
         std::fs::create_dir_all(fake_fynd.join("tests")).expect("create fake fynd tests dir");
         std::fs::write(
-            fake_fynd.join("tests").join("e2e_quote.rs"),
+            fake_fynd
+                .join("tests")
+                .join("e2e_quote.rs"),
             format!(
                 "#[test]\nfn {}() {{}}\n#[test]\nfn {}() {{}}\n",
                 combined_family_fynd_route_test_name(),
@@ -11254,6 +11575,10 @@ exit 0\n",
             "fake cargo environment should make the extensibility gate ready"
         );
         assert!(
+            rendered.contains("fynd_replay_ready=true"),
+            "the real sibling Fynd workspace should make the replay gate ready"
+        );
+        assert!(
             rendered.contains("repo_ready=true"),
             "fake docker/psql environment should make the repo DB gate ready"
         );
@@ -11311,6 +11636,7 @@ exit 0\n",
         let fake_script_path = temp_root.join("check-combined-family.sh");
         let fake_indexer_script_path = temp_root.join("run-combined-family-indexer.sh");
         let fake_live_script_path = temp_root.join("check-combined-family-fynd-live-e2e.sh");
+        let fake_fynd_replay_script_path = temp_root.join("check-combined-family-fynd-replay.sh");
         let fake_db_script_path = temp_root.join("check-combined-family-db.sh");
         let fake_extensibility_script_path =
             temp_root.join("check-combined-family-extensibility.sh");
@@ -11339,10 +11665,7 @@ exit 0\n",
             chmod_exec(path);
         };
 
-        write_fake_exec(
-            &fake_bin.join("curl"),
-            "#!/usr/bin/env bash\nexit 1\n",
-        );
+        write_fake_exec(&fake_bin.join("curl"), "#!/usr/bin/env bash\nexit 1\n");
 
         write_fake_exec(
             &fake_db_script_path,
@@ -11351,6 +11674,10 @@ exit 0\n",
         write_fake_exec(
             &fake_extensibility_script_path,
             "#!/usr/bin/env bash\ncase \"${1:-}\" in\n  doctor)\n    printf 'ready=true\\n'\n    ;;\n  command)\n    printf 'fake-extensibility-command\\n'\n    ;;\n  run)\n    exit 0\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
+        );
+        write_fake_exec(
+            &fake_fynd_replay_script_path,
+            "#!/usr/bin/env bash\ncase \"${1:-}\" in\n  doctor)\n    printf 'ready=true\\n'\n    ;;\n  command)\n    printf 'fake-fynd-replay-command\\n'\n    ;;\n  run)\n    exit 0\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
         );
         write_fake_exec(
             &fake_live_script_path,
@@ -11452,6 +11779,10 @@ exit 0\n",
             "strict doctor output should still report extensibility gate readiness"
         );
         assert!(
+            rendered.contains("fynd_replay_ready=true"),
+            "strict doctor output should still report repo-local Fynd replay readiness"
+        );
+        assert!(
             rendered.contains("full_ready=false"),
             "strict doctor output should report full validation readiness failure"
         );
@@ -11514,6 +11845,10 @@ exit 0\n",
             "script should compose the repo-local DB gate"
         );
         assert!(
+            script.contains("check-combined-family-fynd-replay.sh"),
+            "script should compose the repo-local Fynd replay gate"
+        );
+        assert!(
             script.contains("check-combined-family-fynd-live-e2e.sh"),
             "script should compose the live Fynd gate"
         );
@@ -11524,6 +11859,10 @@ exit 0\n",
         assert!(
             script.contains("TYCHO_COMBINED_FAMILY_EXTENSIBILITY_TEST_MANIFEST"),
             "script should document the forwarded extensibility manifest override"
+        );
+        assert!(
+            script.contains("TYCHO_COMBINED_FAMILY_FYND_REPLAY_TEST_MANIFEST"),
+            "script should document the forwarded Fynd replay manifest override"
         );
         assert!(
             script.contains("FYND_E2E_ROUTE_TEST"),
@@ -11617,13 +11956,13 @@ exit 0\n",
 
         assert!(
             script.contains(
-                "run-full  Execute the repo-local extensibility contract gate, then the DB-backed"
+                "run-full  Execute the repo-local extensibility contract gate, the repo-local Fynd replay"
             ),
             "usage text should describe run-full as acceptance plus live, not as the narrower repo-plus-live flow"
         );
         assert!(
             script.contains(
-                "run-full-managed Execute the repo-local extensibility contract gate, then the DB-backed"
+                "run-full-managed Execute the repo-local extensibility contract gate, the repo-local Fynd replay"
             ),
             "usage text should describe run-full-managed as acceptance plus managed live"
         );

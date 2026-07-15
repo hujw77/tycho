@@ -8,26 +8,24 @@ use crate::config::ExtractorConfigs;
 #[cfg(test)]
 use crate::extractor::chain_state::ChainState;
 #[cfg(test)]
+use crate::extractor::family_bootstrap_registry::SharedBootstrapParamsParser;
+#[cfg(test)]
 use crate::extractor::family_registry::{
     default_family_runtime_registry, shared_bootstrap_member_runtime, shared_family_member_spec,
     shared_family_runtime_spec, FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec,
 };
 #[cfg(test)]
-use crate::extractor::family_bootstrap_registry::SharedBootstrapParamsParser;
-#[cfg(test)]
 use crate::extractor::family_runtime_metadata::FamilyRuntimeConfig;
-#[cfg(test)]
-use crate::extractor::shared_bootstrap::BootstrapBranchDescriptor;
 #[cfg(test)]
 use crate::extractor::family_runtime_metadata::ResolvedSharedFamilyStream;
 #[cfg(test)]
-use crate::extractor::family_runtime_planning::{
-    detect_family_runtimes_with_registry, DetectedFamilyRuntime,
-};
-#[cfg(test)]
-use crate::extractor::startup::ResolvedRuntimeTargetsBuildContext;
+use crate::extractor::family_runtime_planning::DetectedFamilyRuntime;
 #[cfg(test)]
 use crate::extractor::runtime_target_planning::ResolvedRuntimeTarget;
+#[cfg(test)]
+use crate::extractor::shared_bootstrap::BootstrapBranchDescriptor;
+#[cfg(test)]
+use crate::extractor::startup::ResolvedRuntimeTargetsBuildContext;
 #[cfg(test)]
 use crate::extractor::{
     control::ExtractorHandle, extractor_config::BootstrapStrategy, models::BlockChanges,
@@ -828,91 +826,6 @@ pub fn family_detected_runtime_for_tests(
 
 #[cfg(test)]
 #[allow(dead_code)]
-pub fn family_detected_runtime_from_configs_for_tests(
-    extractor_configs: &[&crate::extractor::extractor_config::ExtractorConfig],
-    shared_spkg: impl Into<String>,
-) -> DetectedFamilyRuntime {
-    let registry = default_family_runtime_registry();
-    let shared_spkg = shared_spkg.into();
-    let extractors = extractor_configs
-        .iter()
-        .map(|config| (config.protocol_system().to_string(), (*config).clone()))
-        .collect::<HashMap<_, _>>();
-    let detected = detect_family_runtimes_with_registry(&extractors, registry).unwrap_or_else(|err| {
-        panic!(
-            "family test configs must resolve detected runtime through production detection: {err}"
-        )
-    });
-
-    let detected = if detected.is_empty() {
-        let family_name = extractor_configs
-            .iter()
-            .map(|config| {
-                registry
-                    .family_name_for_protocol_system(config.protocol_system())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "protocol system `{}` must belong to a registered family for test detection",
-                            config.protocol_system()
-                        )
-                    })
-            })
-            .reduce(|existing, candidate| {
-                assert_eq!(
-                    existing, candidate,
-                    "family test configs must all resolve to one registered family"
-                );
-                existing
-            })
-            .unwrap_or_else(|| panic!("family test configs must include at least one extractor"));
-
-        let enriched = extractor_configs
-            .iter()
-            .map(|config| {
-                let mut cloned = (*config).clone();
-                cloned.family_runtime =
-                    Some(family_runtime_config_for_tests(family_name, shared_spkg.clone()));
-                (cloned.protocol_system().to_string(), cloned)
-            })
-            .collect::<HashMap<_, _>>();
-        detect_family_runtimes_with_registry(&enriched, registry)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "family test configs must resolve detected runtime after shared-family enrichment: {err}"
-                )
-            })
-    } else {
-        detected
-    };
-
-    match detected.as_slice() {
-        [family] => family.clone(),
-        [] => panic!("family test configs did not resolve any detected runtime"),
-        many => panic!(
-            "family test configs must resolve exactly one detected runtime, found {}",
-            many.len()
-        ),
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub fn family_detected_runtime_with_members_for_tests(
-    family_name: &str,
-    chain: Chain,
-    shared_spkg: impl Into<String>,
-    member_protocol_systems: impl IntoIterator<Item = impl Into<String>>,
-) -> DetectedFamilyRuntime {
-    let mut family = family_detected_runtime_for_tests(family_name, chain, shared_spkg);
-    family.member_protocol_systems = member_protocol_systems
-        .into_iter()
-        .map(Into::into)
-        .collect();
-    family
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
 pub fn family_resolved_shared_stream_for_tests(
     family_name: &str,
     chain: Chain,
@@ -1394,8 +1307,8 @@ pub(crate) async fn build_all_extractors_from_config_path_with_registry_for_test
     )?;
     loaded_runtime_plan
         .resolved_runtime_plan()?
-    .build_managed_runners(context.runtime_targets_build_context())
-    .await
+        .build_managed_runners(context.runtime_targets_build_context())
+        .await
 }
 
 #[cfg(test)]

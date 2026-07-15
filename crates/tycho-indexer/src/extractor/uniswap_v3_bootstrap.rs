@@ -25,6 +25,7 @@ use tycho_ethereum::{rpc::EthereumRpcClient, BytesCodec};
 use crate::extractor::{
     models::BlockChanges,
     protocol_message_registry::ChainHydratedComponentState,
+    shared_bootstrap::{parse_pool_list_bootstrap_params, SharedBootstrapParams},
     u256_num::bytes_to_f64,
     ExtractionError,
 };
@@ -83,11 +84,7 @@ const PACKED_TICK_SIZE: usize = 19;
 const TICK_PAGE_PROGRESS_INTERVAL: usize = 10;
 const TICK_POOL_BATCH_SIZE: usize = 300;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BootstrapParams {
-    pub bootstrap_block: u64,
-    pub pools: Vec<Bytes>,
-}
+pub type BootstrapParams = SharedBootstrapParams;
 
 #[derive(Clone, Debug)]
 struct PoolSnapshotSeed {
@@ -115,43 +112,7 @@ struct TickSnapshotState {
 }
 
 pub fn parse_bootstrap_params(params: &str) -> Result<BootstrapParams, ExtractionError> {
-    let mut bootstrap_block = None;
-    let mut pools = Vec::new();
-
-    for pair in params
-        .split('&')
-        .filter(|part| !part.is_empty())
-    {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err(ExtractionError::Setup(format!("invalid bootstrap param `{pair}`")));
-        };
-
-        match key {
-            "bootstrap_block" => {
-                bootstrap_block = Some(value.parse::<u64>().map_err(|err| {
-                    ExtractionError::Setup(format!("parse bootstrap_block: {err}"))
-                })?);
-            }
-            "pool" => pools.push(parse_address(value)?),
-            "pools" => {
-                for pool in value
-                    .split(',')
-                    .filter(|pool| !pool.is_empty())
-                {
-                    pools.push(parse_address(pool)?);
-                }
-            }
-            _ => return Err(ExtractionError::Setup(format!("unknown bootstrap param `{key}`"))),
-        }
-    }
-
-    let bootstrap_block = bootstrap_block
-        .ok_or_else(|| ExtractionError::Setup("missing `bootstrap_block`".to_string()))?;
-    if pools.is_empty() {
-        return Err(ExtractionError::Setup("missing `pool` or `pools`".to_string()));
-    }
-
-    Ok(BootstrapParams { bootstrap_block, pools })
+    parse_pool_list_bootstrap_params(params)
 }
 
 pub async fn build_uniswap_v3_bootstrap_block(
@@ -253,7 +214,9 @@ pub(crate) async fn hydrate_uniswap_v3_components_from_chain(
     let block_tag = BlockNumberOrTag::Number(block_number);
     let pool_addresses = protocol_components
         .iter()
-        .map(|component| parse_address(&component.id).and_then(|address| to_alloy_address(&address)))
+        .map(|component| {
+            parse_address(&component.id).and_then(|address| to_alloy_address(&address))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let seeds = fetch_pool_snapshot_seeds(rpc, block_tag, &pool_addresses).await?;

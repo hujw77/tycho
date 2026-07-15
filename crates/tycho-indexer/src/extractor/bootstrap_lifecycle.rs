@@ -5,6 +5,8 @@ use crate::extractor::{
     },
     ExtractionError,
 };
+use std::future::Future;
+use tracing::{info, warn};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BootstrapRunDecision {
@@ -28,19 +30,21 @@ pub(crate) fn decide_bootstrap_run(
         return Ok(BootstrapRunDecision::Skip);
     };
 
-    Ok(match decide_bootstrap_completion(
-        completion_snapshot,
-        configured_bootstrap_block,
-        owner_label,
-        completion_policy,
-    )? {
-        BootstrapCompletionDecision::AlreadyCompleted => {
-            BootstrapRunDecision::AlreadyCompleted { configured_bootstrap_block }
-        }
-        BootstrapCompletionDecision::NeedsBootstrap => {
-            BootstrapRunDecision::Run { configured_bootstrap_block }
-        }
-    })
+    Ok(
+        match decide_bootstrap_completion(
+            completion_snapshot,
+            configured_bootstrap_block,
+            owner_label,
+            completion_policy,
+        )? {
+            BootstrapCompletionDecision::AlreadyCompleted => {
+                BootstrapRunDecision::AlreadyCompleted { configured_bootstrap_block }
+            }
+            BootstrapCompletionDecision::NeedsBootstrap => {
+                BootstrapRunDecision::Run { configured_bootstrap_block }
+            }
+        },
+    )
 }
 
 pub(crate) fn resolve_resume_start_block(
@@ -57,8 +61,89 @@ pub(crate) fn resolve_next_start_block(last_processed_block: u64) -> Result<i64,
     let next = last_processed_block
         .checked_add(1)
         .ok_or_else(|| ExtractionError::Setup("block number overflow".to_string()))?;
-    i64::try_from(next)
-        .map_err(|_| ExtractionError::Setup("block number exceeds i64".to_string()))
+    i64::try_from(next).map_err(|_| ExtractionError::Setup("block number exceeds i64".to_string()))
+}
+
+pub(crate) async fn execute_bootstrap_run_decision<RunBootstrap, RunBootstrapFut>(
+    decision: BootstrapRunDecision,
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    run_bootstrap: RunBootstrap,
+) -> Result<(), ExtractionError>
+where
+    RunBootstrap: FnOnce(u64) -> RunBootstrapFut,
+    RunBootstrapFut: Future<Output = Result<(), ExtractionError>>,
+{
+    match decision {
+        BootstrapRunDecision::Skip => Ok(()),
+        BootstrapRunDecision::AlreadyCompleted { configured_bootstrap_block } => {
+            info!(
+                startup_scope_kind,
+                startup_scope_id = %startup_scope_id,
+                bootstrap_block = configured_bootstrap_block,
+                "Bootstrap already completed in storage; skipping bootstrap run"
+            );
+            Ok(())
+        }
+        BootstrapRunDecision::Run { configured_bootstrap_block } => {
+            info!(
+                startup_scope_kind,
+                startup_scope_id = %startup_scope_id,
+                bootstrap_block = configured_bootstrap_block,
+                "Running bootstrap block before starting event stream"
+            );
+            tokio::select! {
+                res = run_bootstrap(configured_bootstrap_block) => res,
+                _ = tokio::signal::ctrl_c() => {
+                    warn!(
+                        startup_scope_kind,
+                        startup_scope_id = %startup_scope_id,
+                        bootstrap_block = configured_bootstrap_block,
+                        "Bootstrap interrupted by SIGINT before startup completed"
+                    );
+                    Err(ExtractionError::Unknown(format!(
+                        "bootstrap interrupted for {startup_scope_id}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_bootstrap_run_decision_with_progress_reload<
+    Progress,
+    LoadProgress,
+    LoadProgressFut,
+    RunBootstrap,
+    RunBootstrapFut,
+>(
+    progress: Progress,
+    decision: BootstrapRunDecision,
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    load_progress: LoadProgress,
+    run_bootstrap: RunBootstrap,
+) -> Result<Progress, ExtractionError>
+where
+    LoadProgress: FnOnce() -> LoadProgressFut,
+    LoadProgressFut: Future<Output = Result<Progress, ExtractionError>>,
+    RunBootstrap: FnOnce(u64) -> RunBootstrapFut,
+    RunBootstrapFut: Future<Output = Result<(), ExtractionError>>,
+{
+    let should_reload_progress = matches!(decision, BootstrapRunDecision::Run { .. });
+    execute_bootstrap_run_decision(
+        decision,
+        startup_scope_id,
+        startup_scope_kind,
+        run_bootstrap,
+    )
+    .await?;
+
+    if should_reload_progress {
+        load_progress().await
+    } else {
+        Ok(progress)
+    }
 }
 
 #[cfg(test)]
@@ -72,10 +157,7 @@ mod tests {
         let decision = decide_bootstrap_run(
             true,
             Some(42),
-            &BootstrapCompletionSnapshot {
-                completed_blocks: vec![],
-                missing_completion: vec![],
-            },
+            &BootstrapCompletionSnapshot { completed_blocks: vec![], missing_completion: vec![] },
             "extractor",
             BootstrapCompletionPolicy::AllowRerunOnConfiguredDrift,
         )
@@ -89,10 +171,7 @@ mod tests {
         let decision = decide_bootstrap_run(
             false,
             None,
-            &BootstrapCompletionSnapshot {
-                completed_blocks: vec![],
-                missing_completion: vec![],
-            },
+            &BootstrapCompletionSnapshot { completed_blocks: vec![], missing_completion: vec![] },
             "extractor",
             BootstrapCompletionPolicy::AllowRerunOnConfiguredDrift,
         )
@@ -135,10 +214,7 @@ mod tests {
         )
         .expect("drift should rerun under permissive policy");
 
-        assert_eq!(
-            decision,
-            BootstrapRunDecision::Run { configured_bootstrap_block: 42 }
-        );
+        assert_eq!(decision, BootstrapRunDecision::Run { configured_bootstrap_block: 42 });
     }
 
     #[test]
@@ -156,5 +232,52 @@ mod tests {
                 .expect("resume block should resolve from existing progress"),
             78
         );
+    }
+
+    #[tokio::test]
+    async fn execute_bootstrap_run_decision_returns_skip_without_running_bootstrap() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        execute_bootstrap_run_decision(
+            BootstrapRunDecision::Skip,
+            "uniswap_family",
+            "family",
+            move |_| {
+                let called_clone = called_clone.clone();
+                async move {
+                    called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("skip should succeed");
+
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn execute_bootstrap_run_decision_runs_bootstrap_closure_for_run_action() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        execute_bootstrap_run_decision(
+            BootstrapRunDecision::Run { configured_bootstrap_block: 42 },
+            "uniswap_family",
+            "family",
+            move |bootstrap_block| {
+                let called_clone = called_clone.clone();
+                async move {
+                    assert_eq!(bootstrap_block, 42);
+                    called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("run action should execute bootstrap closure");
+
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

@@ -4,9 +4,7 @@ use crate::extractor::{
         MaterializeBootstrapBranchFn, MaterializeBootstrapPlanFn, SharedBootstrapMemberRuntime,
         SharedBootstrapParamsParser, SharedFamilyBootstrapRuntime,
     },
-    protocol_message_registry::{
-        AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator,
-    },
+    protocol_message_registry::{AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator},
 };
 
 pub use crate::extractor::family_default_registry::{

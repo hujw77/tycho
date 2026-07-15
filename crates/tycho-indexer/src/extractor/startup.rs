@@ -1,4 +1,4 @@
-use std::{collections::HashMap, slice, sync::Arc};
+use std::{collections::HashMap, slice};
 
 use tracing::{info, instrument};
 use tycho_common::{
@@ -14,13 +14,9 @@ use tycho_common::{
 use tycho_ethereum::{rpc::EthereumRpcClient, services::account_extractor::EVMAccountExtractor};
 use tycho_storage::postgres::cache::CachedGateway;
 
-use crate::extractor::runtime_target_planning::{
-    ResolvedInitializedAccountsRequest, ResolvedRuntimeTargets,
-};
+use crate::extractor::runtime_target_planning::{ResolvedInitializedAccountsRequest, ResolvedRuntimeTargets};
 use crate::extractor::{
-    protocol_cache::ProtocolMemoryCache,
-    runtime_targets_startup::PreparedRuntimeTargetsStartup,
-    ExtractionError,
+    runtime_targets_startup::PreparedRuntimeTargetsStartup, ExtractionError,
 };
 
 pub use crate::extractor::runtime_targets_startup::ResolvedRuntimeTargetsBuildContext;
@@ -150,44 +146,19 @@ impl<'a> ResolvedRuntimeTargets<'a> {
         &self,
         context: &ResolvedRuntimeTargetsBuildContext<'_>,
     ) -> Result<PreparedRuntimeTargetsStartup, ExtractionError> {
-        let chain = self
-            .as_slice()
-            .first()
-            .map(crate::extractor::runtime_target_planning::ResolvedRuntimeTarget::chain)
-            .expect("resolved runtime targets should not be empty");
-
-        info!("Building protocol cache");
-        let protocol_cache = ProtocolMemoryCache::new(
-            chain,
-            chrono::Duration::seconds(900),
-            Arc::new(context.cached_gw.clone()),
-        );
-        protocol_cache.populate().await?;
-
-        self.initialize_accounts(context.rpc_client, context.cached_gw)
-            .await;
-
-        let mut prepared_targets = Vec::new();
-        for target in self.as_slice().iter().cloned() {
-            prepared_targets.push(
-                target
-                    .prepare_managed_startup(context, &protocol_cache)
-                    .await?,
-            );
-        }
-
-        Ok(PreparedRuntimeTargetsStartup::new(
-            prepared_targets,
-            context.runtime.clone(),
-            context.partial_blocks,
-        ))
+        context.prepare_runtime_targets_startup(self).await
     }
 
     pub async fn build_managed_runners(
         self,
         context: ResolvedRuntimeTargetsBuildContext<'_>,
-    ) -> Result<(Vec<crate::extractor::runner::ManagedRunner>, Vec<crate::extractor::control::ExtractorHandle>), ExtractionError>
-    {
+    ) -> Result<
+        (
+            Vec<crate::extractor::runner::ManagedRunner>,
+            Vec<crate::extractor::control::ExtractorHandle>,
+        ),
+        ExtractionError,
+    > {
         self.prepare_startup(&context)
             .await?
             .build_managed_runners()

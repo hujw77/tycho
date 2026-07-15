@@ -78,6 +78,15 @@ async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() 
     );
 
     let mut v2 = MockExtractor::new();
+    v2.expect_get_cursor()
+        .once()
+        .returning(|| String::new());
+    v2.expect_get_last_processed_block()
+        .once()
+        .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(None));
@@ -111,6 +120,15 @@ async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() 
         });
 
     let mut v3 = MockExtractor::new();
+    v3.expect_get_cursor()
+        .once()
+        .returning(|| String::new());
+    v3.expect_get_last_processed_block()
+        .once()
+        .returning(|| None);
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(None));
@@ -197,6 +215,15 @@ async fn test_apply_family_bootstrap_plan_skips_completed_family() {
     );
 
     let mut v2 = MockExtractor::new();
+    v2.expect_get_cursor()
+        .once()
+        .returning(|| String::new());
+    v2.expect_get_last_processed_block()
+        .once()
+        .returning(|| None);
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
@@ -256,11 +283,17 @@ async fn test_apply_family_bootstrap_plan_rejects_missing_branch_extractor() {
 #[tokio::test]
 async fn test_family_bootstrap_already_completed_rejects_mixed_completion_state() {
     let mut v2 = MockExtractor::new();
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
 
     let mut v3 = MockExtractor::new();
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(None));
@@ -282,11 +315,17 @@ async fn test_family_bootstrap_already_completed_rejects_mixed_completion_state(
 #[tokio::test]
 async fn test_family_bootstrap_already_completed_rejects_misaligned_completed_blocks() {
     let mut v2 = MockExtractor::new();
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(42)));
 
     let mut v3 = MockExtractor::new();
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(43)));
@@ -308,11 +347,17 @@ async fn test_family_bootstrap_already_completed_rejects_misaligned_completed_bl
 #[tokio::test]
 async fn test_family_bootstrap_already_completed_rejects_configured_block_drift() {
     let mut v2 = MockExtractor::new();
+    v2.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v2.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(43)));
 
     let mut v3 = MockExtractor::new();
+    v3.expect_supports_persisted_state_scope()
+        .once()
+        .return_const(false);
     v3.expect_get_completed_bootstrap_block()
         .once()
         .returning(|| Ok(Some(43)));

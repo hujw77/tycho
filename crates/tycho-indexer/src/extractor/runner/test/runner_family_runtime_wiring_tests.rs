@@ -7,9 +7,11 @@ use tycho_ethereum::rpc::EthereumRpcClient;
 use super::*;
 use crate::{
     extractor::{
-        managed_stream_startup::load_stream_for_prepared_request,
         protocol_cache::ProtocolMemoryCache,
-        runtime_targets_startup::{PreparedRuntimeTargetKind, PreparedRuntimeTargetStartup},
+        runtime_targets_startup::{
+            prepare_runtime_target_startup_from_draft, PreparedRuntimeTargetKind,
+            PreparedRuntimeTargetStartup, ResolvedRuntimeTargetsBuildContext,
+        },
         Extractor,
     },
     pb::sf::substreams::rpc::v2::BlockScopedData,
@@ -462,7 +464,10 @@ fn test_family_branch_subscription_index_learns_aliases_from_extractors() {
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let mut index = FamilyBranchSubscriptionIndex::from_extractors(&extractors);
+    let mut index = FamilyBranchSubscriptionIndex::from_branch_protocol_systems(
+        ["uniswap_v2", "uniswap_v3"],
+        &extractors,
+    );
 
     assert_eq!(index.get("uniswap_v2"), Some("uniswap_v2"));
     assert_eq!(index.get("uniswap_v2_alias"), Some("uniswap_v2"));
@@ -580,9 +585,8 @@ async fn test_family_runner_build_managed_from_startup_preserves_protocol_system
 
     let configs = make_uniswap_family_bootstrap_test_configs();
     let config_refs = configs.iter().collect::<Vec<_>>();
-    let family_execution =
-        resolved_family_execution_config_from_extractor_configs_for_tests(&config_refs)
-            .expect("family execution should derive from test configs");
+    let resolved_family =
+        resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
     let protocol_cache = ProtocolMemoryCache::new(
         Chain::Ethereum,
         chrono::Duration::seconds(60),
@@ -592,16 +596,23 @@ async fn test_family_runner_build_managed_from_startup_preserves_protocol_system
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let dispatcher = FamilyBlockChangesDispatcher::from_protocol_cache(
-        &family_execution.branch_specs,
+    let runtime_contract = resolved_family.runtime_contract();
+    let dispatcher = FamilyBlockChangesDispatcher::from_protocol_cache_for_runtime_contract(
+        &runtime_contract,
         &protocol_cache,
     )
     .await
     .expect("dispatcher should seed from protocol cache");
     let prepared_startup = PreparedFamilyRunnerStartup {
         extractors: extractors.clone(),
+        runtime_contract: runtime_contract.clone(),
         stream: SubstreamsStream::from_stream(Box::pin(stream::empty())),
-        runtime_state: FamilyRuntimeState::new(&extractors, dispatcher, protocol_cache.clone()),
+        runtime_state: FamilyRuntimeState::new(
+            &runtime_contract,
+            &extractors,
+            dispatcher,
+            protocol_cache.clone(),
+        ),
     };
 
     let (runner, handles) = PreparedRuntimeTargetStartup::new(prepared_startup)
@@ -618,6 +629,12 @@ async fn test_family_runner_build_managed_from_startup_preserves_protocol_system
     );
 
     let runner = runner.into_typed::<FamilyExtractorRunner>();
+    assert_eq!(
+        runner
+            .runtime_contract
+            .shared_extractor_id,
+        resolved_family.shared_extractor_id()
+    );
     assert_eq!(
         runner
             .extractors
@@ -767,17 +784,26 @@ async fn test_prepare_family_managed_startup_uses_shared_spkg_and_preserves_prot
             .expect(
                 "family startup should use shared spkg even when member spkg paths are missing",
             );
-        let stream = load_stream_for_prepared_request(
-            &prepared_startup.prepared_request,
-            None,
+        let context = ResolvedRuntimeTargetsBuildContext::new(
+            ChainState::default(),
             "https://mainnet.eth.streamingfast.io",
+            None,
             "",
+            &cached_gw,
+            1000,
+            &token_processor,
+            &rpc,
+            None,
             false,
             false,
-        )
-        .await
-        .expect("family startup stream");
-        let prepared_startup = prepared_startup.into_prepared_startup(stream);
+            crate::extractor::family_registry::default_family_runtime_registry(),
+        );
+        let prepared_startup =
+            prepare_runtime_target_startup_from_draft(Box::new(prepared_startup), &context)
+                .await
+                .expect("family startup stream");
+        let prepared_startup: crate::extractor::family_managed_startup::PreparedFamilyRunnerStartup =
+            prepared_startup.into_typed();
 
         assert_eq!(
             prepared_startup
@@ -1019,17 +1045,27 @@ async fn test_prepare_family_managed_startup_reuses_persisted_shared_bootstrap_c
             })
             .await
             .expect("fresh startup should reuse persisted shared bootstrap completion");
-        let stream = load_stream_for_prepared_request(
-            &prepared_startup.prepared_request,
+        let endpoint_url = format!("http://{addr}");
+        let context = ResolvedRuntimeTargetsBuildContext::new(
+            ChainState::default(),
+            &endpoint_url,
             None,
-            &format!("http://{addr}"),
             "",
+            &cached_gw,
+            1000,
+            &token_processor,
+            &rpc,
+            None,
             false,
             false,
-        )
-        .await
-        .expect("family startup stream");
-        let mut prepared_startup = prepared_startup.into_prepared_startup(stream);
+            crate::extractor::family_registry::default_family_runtime_registry(),
+        );
+        let prepared_startup =
+            prepare_runtime_target_startup_from_draft(Box::new(prepared_startup), &context)
+                .await
+                .expect("family startup stream");
+        let mut prepared_startup: crate::extractor::family_managed_startup::PreparedFamilyRunnerStartup =
+            prepared_startup.into_typed();
 
         let _ = prepared_startup
             .stream
@@ -1063,9 +1099,6 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
 
     use crate::extractor::{
         extractor_config::{ExtractorConfig, ProtocolTypeConfig},
-        family_managed_startup::family_auxiliary_protocol_message_decoders_by_protocol_system,
-        family_registry::{FamilyRuntimeRegistry, FamilyRuntimeSpec},
-        family_runtime_metadata::FamilyRuntimeConfig,
         family_runtime_planning::build_resolved_runtime_targets_with_registry,
         protocol_message_registry::{
             AuxiliaryProtocolMessageBuildFuture, AuxiliaryProtocolMessageContext,
@@ -1082,9 +1115,7 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
         _partial_block_index: Option<u32>,
     ) -> AuxiliaryProtocolMessageBuildFuture<'a> {
         Box::pin(async {
-            Err(ExtractionError::Unknown(
-                "test-only decoder should not run".to_string(),
-            ))
+            Err(ExtractionError::Unknown("test-only decoder should not run".to_string()))
         })
     }
 
@@ -1094,30 +1125,13 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
             type_url_suffix: "FutureEvents",
             build_block_changes: build_future_events_for_family_startup_test,
         }];
-    const FUTURE_FAMILY: FamilyRuntimeSpec =
-        crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_decoders(
-            "future_swap",
-            &[
-                crate::extractor::family_registry::shared_family_member_spec(
-                    "future_v1",
-                    &["futurev1"],
-                    None,
-                ),
-                crate::extractor::family_registry::shared_family_member_spec(
-                    "future_v2",
-                    &["futurev2"],
-                    None,
-                ),
-            ],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
+    let chain = Chain::Ethereum;
+    let registry =
+        crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_for_tests(
+            &["future_v1", "future_v2"],
             "family::future_swap",
-            None,
             FUTURE_DECODERS,
         );
-
-    let chain = Chain::Ethereum;
-    let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
     let shared_spkg_path = "/tmp/future-swap-family-test.spkg".to_string();
 
     let extractors = HashMap::from([
@@ -1147,12 +1161,12 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
                 None,
             )
             .with_protocol_system("future_v1")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "future_swap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
-                durability_scope: Some("family::future_swap".to_string()),
-            })),
+            .with_family_runtime(Some(
+                crate::extractor::test_support::future_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                    "family::future_swap",
+                ),
+            )),
         ),
         (
             "future_v2_alias".to_string(),
@@ -1180,12 +1194,12 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
                 None,
             )
             .with_protocol_system("future_v2")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "future_swap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
-                durability_scope: Some("family::future_swap".to_string()),
-            })),
+            .with_family_runtime(Some(
+                crate::extractor::test_support::future_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                    "family::future_swap",
+                ),
+            )),
         ),
     ]);
 
@@ -1199,7 +1213,7 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
         .expect("custom family target should be present");
 
     let decoders_by_protocol_system =
-        family_auxiliary_protocol_message_decoders_by_protocol_system(&family);
+        family.auxiliary_protocol_message_decoders_by_protocol_system();
 
     assert_eq!(decoders_by_protocol_system.len(), 2);
     let future_v1_decoders = decoders_by_protocol_system
@@ -1228,32 +1242,9 @@ async fn test_build_all_extractors_managed_startup_collapses_custom_family_into_
     use crate::extractor::{
         extractor_config::{ExtractorConfig, ProtocolTypeConfig},
         family_runner_wiring::FamilyBranchRuntimeWiring,
-        family_registry::{FamilyRuntimeRegistry, FamilyRuntimeSpec},
-        family_runtime_metadata::FamilyRuntimeConfig,
         family_runtime_planning::build_resolved_runtime_targets_with_registry,
         runtime_target_planning::ResolvedRuntimeTarget,
     };
-
-    const FUTURE_FAMILY: FamilyRuntimeSpec =
-        crate::extractor::family_registry::shared_family_runtime_spec(
-            "future_swap",
-            &[
-                crate::extractor::family_registry::shared_family_member_spec(
-                    "future_v1",
-                    &["futurev1"],
-                    None,
-                ),
-                crate::extractor::family_registry::shared_family_member_spec(
-                    "future_v2",
-                    &["futurev2"],
-                    None,
-                ),
-            ],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
-            "family::future_swap",
-            None,
-        );
 
     let chain = Chain::Ethereum;
     let shared_spkg_path = "/tmp/future-family-shared-startup.spkg".to_string();
@@ -1279,12 +1270,12 @@ async fn test_build_all_extractors_managed_startup_collapses_custom_family_into_
                 None,
             )
             .with_protocol_system("future_v1")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "future_swap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
-                durability_scope: Some("family::future_swap".to_string()),
-            })),
+            .with_family_runtime(Some(
+                crate::extractor::test_support::future_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                    "family::future_swap",
+                ),
+            )),
         ),
         (
             "future_v2_alias".to_string(),
@@ -1306,16 +1297,19 @@ async fn test_build_all_extractors_managed_startup_collapses_custom_family_into_
                 None,
             )
             .with_protocol_system("future_v2")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "future_swap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some("map_future_swap_family_protocol_changes".to_string()),
-                durability_scope: Some("family::future_swap".to_string()),
-            })),
+            .with_family_runtime(Some(
+                crate::extractor::test_support::future_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                    "family::future_swap",
+                ),
+            )),
         ),
     ]);
 
-    let registry = FamilyRuntimeRegistry::new(&[FUTURE_FAMILY]);
+    let registry = crate::extractor::test_support::future_family_runtime_registry_for_tests(
+        &["future_v1", "future_v2"],
+        "family::future_swap",
+    );
     let runtime_targets = build_resolved_runtime_targets_with_registry(&configs, registry)
         .expect("runtime targets should resolve custom future family startup");
     assert_eq!(
@@ -1396,8 +1390,7 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
     use crate::{
         config::ExtractorConfigs,
         extractor::{
-            chain_state::ChainState,
-            extractor_config::ExtractorConfig,
+            chain_state::ChainState, extractor_config::ExtractorConfig,
             family_registry::default_family_runtime_registry,
             family_runtime_metadata::FamilyRuntimeConfig,
         },
@@ -1630,8 +1623,7 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
     use crate::{
         config::ExtractorConfigs,
         extractor::{
-            chain_state::ChainState,
-            extractor_config::ExtractorConfig,
+            chain_state::ChainState, extractor_config::ExtractorConfig,
             family_registry::default_family_runtime_registry,
             family_runtime_metadata::FamilyRuntimeConfig,
             startup::ResolvedRuntimeTargetsBuildContext,
