@@ -14,10 +14,10 @@ use tycho_ethereum::rpc::EthereumRpcClient;
 
 use crate::extractor::{
     extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
-    family_bootstrap_registry::ResolvedSharedBootstrapBranchRuntime,
+    family_dispatch::{collect_branch_protocol_systems, ProtocolSystemBranchView},
     family_bootstrap_registry::ResolvedSharedBootstrapExecution,
-    family_registry::default_family_runtime_registry,
     family_registry::FamilyRuntimeRegistry,
+    family_runtime_resolution::ResolvedFamilyRuntimeContract,
     models::{BlockChanges, TxWithContractChanges},
     ExtractionError, Extractor,
 };
@@ -79,9 +79,15 @@ pub struct BootstrapBranchDescriptor {
     pub params: SharedBootstrapParams,
 }
 
+impl ProtocolSystemBranchView for BootstrapBranchDescriptor {
+    fn protocol_system(&self) -> &str {
+        &self.protocol_system
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedBootstrapPlan {
-    pub family_name: Option<String>,
+    pub family_name: String,
     pub bootstrap_block: u64,
     pub branches: Vec<BootstrapBranchDescriptor>,
 }
@@ -105,17 +111,7 @@ pub(crate) enum BootstrapCompletionDecision {
 }
 
 impl SharedBootstrapPlan {
-    pub fn for_extractor_config(
-        config: &ExtractorConfig,
-        bootstrap: &BootstrapConfig,
-    ) -> Result<Self, ExtractionError> {
-        Self::for_extractor_config_with_registry(
-            config,
-            bootstrap,
-            default_family_runtime_registry(),
-        )
-    }
-
+    #[cfg(test)]
     pub fn for_extractor_config_with_registry(
         config: &ExtractorConfig,
         bootstrap: &BootstrapConfig,
@@ -124,18 +120,53 @@ impl SharedBootstrapPlan {
         Self::for_extractor_configs_with_registry([(config, bootstrap)], registry)
     }
 
-    pub fn for_extractor_configs<'a>(
-        configs: impl IntoIterator<Item = (&'a ExtractorConfig, &'a BootstrapConfig)>,
-    ) -> Result<Self, ExtractionError> {
-        Self::for_extractor_configs_with_registry(configs, default_family_runtime_registry())
-    }
-
+    #[cfg(test)]
     pub fn for_extractor_configs_with_registry<'a>(
         configs: impl IntoIterator<Item = (&'a ExtractorConfig, &'a BootstrapConfig)>,
         registry: FamilyRuntimeRegistry<'_>,
     ) -> Result<Self, ExtractionError> {
         registry.build_shared_bootstrap_plan(configs)
     }
+
+    pub fn branch_protocol_systems(&self) -> HashSet<String> {
+        collect_branch_protocol_systems(self.branches.iter())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_shared_progress_owner_protocol_system_for_plan(
+    plan: &SharedBootstrapPlan,
+    registry: FamilyRuntimeRegistry<'_>,
+) -> Result<String, ExtractionError> {
+    registry
+        .shared_progress_owner_protocol_system_for_family(&plan.family_name)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ExtractionError::Setup(format!(
+                "shared bootstrap plan references unknown family `{}`",
+                plan.family_name
+            ))
+        })
+}
+
+pub(crate) fn validate_shared_bootstrap_plan_against_runtime_contract(
+    plan: &SharedBootstrapPlan,
+    runtime_contract: &ResolvedFamilyRuntimeContract,
+) -> Result<(), ExtractionError> {
+    let plan_protocol_systems = plan.branch_protocol_systems();
+    let runtime_protocol_systems = runtime_contract
+        .branch_protocol_systems()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+
+    if plan_protocol_systems != runtime_protocol_systems {
+        return Err(ExtractionError::Setup(format!(
+            "shared bootstrap plan branches {:?} do not match runtime branch protocol systems {:?}",
+            plan_protocol_systems, runtime_protocol_systems
+        )));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn configured_bootstrap_block(
@@ -320,24 +351,21 @@ pub(crate) fn resolve_materialized_bootstrap_commit_targets(
     Ok(commit_targets)
 }
 
-pub(crate) async fn materialize_plan_by_branch_runtimes(
+pub(crate) async fn materialize_plan_by_branch_materializers(
     rpc: &EthereumRpcClient,
     plan: &SharedBootstrapPlan,
-    branch_runtimes: &[ResolvedSharedBootstrapBranchRuntime],
+    branch_materializers: &HashMap<String, crate::extractor::family_bootstrap_registry::MaterializeBootstrapBranchFn>,
 ) -> Result<BlockChanges, ExtractionError> {
     let mut merged = None;
 
     for branch in &plan.branches {
-        let runtime = branch_runtimes
-            .iter()
-            .find(|runtime| runtime.protocol_system == branch.protocol_system)
-            .ok_or_else(|| {
-                ExtractionError::Setup(format!(
-                    "shared bootstrap plan is missing materializer for protocol system `{}`",
-                    branch.protocol_system
-                ))
-            })?;
-        let branch_changes = (runtime.materialize_branch)(rpc, branch).await?;
+        let materialize_branch = branch_materializers.get(&branch.protocol_system).ok_or_else(|| {
+            ExtractionError::Setup(format!(
+                "shared bootstrap plan is missing materializer for protocol system `{}`",
+                branch.protocol_system
+            ))
+        })?;
+        let branch_changes = (materialize_branch)(rpc, branch).await?;
         merged = Some(match merged {
             Some(existing) => merge_family_block_changes(existing, branch_changes)?,
             None => branch_changes,
@@ -832,6 +860,7 @@ mod tests {
         Bytes,
     };
     use tycho_ethereum::rpc::EthereumRpcClient;
+    use tycho_indexer::canonical_shared_family_runtime_spec_with_explicit_owner;
 
     use crate::extractor::{
         extractor_config::{BootstrapConfig, BootstrapStrategy, ExtractorConfig},
@@ -839,7 +868,7 @@ mod tests {
         family_registry::{
             default_family_runtime_registry, FamilyRuntimeRegistry, FamilyRuntimeSpec,
         },
-        family_registry::{shared_family_member_with_bootstrap, shared_family_runtime_spec},
+        family_registry::shared_family_member_with_bootstrap,
         family_runtime_metadata::FamilyRuntimeConfig,
         models::{BlockChanges, TxWithContractChanges},
         ExtractionError,
@@ -848,6 +877,7 @@ mod tests {
 
     use super::{
         decide_bootstrap_completion, merge_family_block_changes,
+        resolve_shared_progress_owner_protocol_system_for_plan,
         split_plan_block_by_protocol_system, BootstrapBranchDescriptor,
         BootstrapCompletionDecision, BootstrapCompletionPolicy, BootstrapCompletionSnapshot,
         SharedBootstrapParams, SharedBootstrapPlan,
@@ -882,10 +912,14 @@ mod tests {
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         };
 
-        let plan =
-            SharedBootstrapPlan::for_extractor_config(&config, &bootstrap).expect("plan builds");
+        let plan = SharedBootstrapPlan::for_extractor_config_with_registry(
+            &config,
+            &bootstrap,
+            default_family_runtime_registry(),
+        )
+        .expect("plan builds");
 
-        assert_eq!(plan.family_name, Some("uniswap".to_string()));
+        assert_eq!(plan.family_name, "uniswap".to_string());
         assert_eq!(plan.bootstrap_block, 42);
         assert_eq!(plan.branches.len(), 1);
         assert_eq!(plan.branches[0].extractor_name, "uniswap_v3");
@@ -894,6 +928,33 @@ mod tests {
         assert_eq!(plan.branches[0].strategy, BootstrapStrategy::UniswapV3Rpc);
         assert_eq!(plan.branches[0].params.bootstrap_block, 42);
         assert_eq!(plan.branches[0].params.pools.len(), 1);
+    }
+
+    #[test]
+    fn resolves_shared_progress_owner_for_family_plan_from_registry() {
+        let registry = default_family_runtime_registry();
+        let plan = SharedBootstrapPlan {
+            family_name: "uniswap".to_string(),
+            bootstrap_block: 42,
+            branches: vec![BootstrapBranchDescriptor {
+                extractor_name: "uniswap_v2".to_string(),
+                protocol_system: "uniswap_v2".to_string(),
+                chain: Chain::Ethereum,
+                strategy: BootstrapStrategy::UniswapV2Rpc,
+                params: SharedBootstrapParams {
+                    bootstrap_block: 42,
+                    pools: vec![Bytes::from(
+                        "0x0000000000000000000000000000000000001234",
+                    )],
+                },
+            }],
+        };
+
+        let owner =
+            resolve_shared_progress_owner_protocol_system_for_plan(&plan, registry)
+                .expect("family bootstrap plan should resolve shared progress owner");
+
+        assert_eq!(owner, "uniswap_v2");
     }
 
     #[test]
@@ -927,17 +988,21 @@ mod tests {
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678".to_owned(),
         };
 
-        let plan = SharedBootstrapPlan::for_extractor_configs([
-            (&v2_config, &v2_bootstrap),
-            (&v3_config, &v3_bootstrap),
-        ])
+        let plan = SharedBootstrapPlan::for_extractor_configs_with_registry(
+            [(&v2_config, &v2_bootstrap), (&v3_config, &v3_bootstrap)],
+            default_family_runtime_registry(),
+        )
         .expect("family plan builds");
 
-        assert_eq!(plan.family_name, Some("uniswap".to_string()));
+        assert_eq!(plan.family_name, "uniswap".to_string());
         assert_eq!(plan.bootstrap_block, 42);
         assert_eq!(plan.branches.len(), 2);
         assert_eq!(plan.branches[0].protocol_system, "uniswap_v2");
         assert_eq!(plan.branches[1].protocol_system, "uniswap_v3");
+        assert_eq!(
+            plan.branch_protocol_systems(),
+            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
+        );
     }
 
     #[test]
@@ -971,10 +1036,10 @@ mod tests {
             params: "bootstrap_block=43&pool=0x0000000000000000000000000000000000005678".to_owned(),
         };
 
-        let err = SharedBootstrapPlan::for_extractor_configs([
-            (&v2_config, &v2_bootstrap),
-            (&v3_config, &v3_bootstrap),
-        ])
+        let err = SharedBootstrapPlan::for_extractor_configs_with_registry(
+            [(&v2_config, &v2_bootstrap), (&v3_config, &v3_bootstrap)],
+            default_family_runtime_registry(),
+        )
         .expect_err("family plan should reject mismatched blocks");
 
         assert!(err
@@ -1014,10 +1079,10 @@ mod tests {
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678".to_owned(),
         };
 
-        let err = SharedBootstrapPlan::for_extractor_configs([
-            (&eth_config, &eth_bootstrap),
-            (&base_config, &base_bootstrap),
-        ])
+        let err = SharedBootstrapPlan::for_extractor_configs_with_registry(
+            [(&eth_config, &eth_bootstrap), (&base_config, &base_bootstrap)],
+            default_family_runtime_registry(),
+        )
         .expect_err("mixed chains should fail");
 
         assert!(err
@@ -1082,10 +1147,10 @@ mod tests {
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         };
 
-        let err = SharedBootstrapPlan::for_extractor_configs([
-            (&v2_config, &v2_bootstrap),
-            (&future_config, &future_bootstrap),
-        ])
+        let err = SharedBootstrapPlan::for_extractor_configs_with_registry(
+            [(&v2_config, &v2_bootstrap), (&future_config, &future_bootstrap)],
+            default_family_runtime_registry(),
+        )
         .expect_err("mixed family runtimes should fail");
 
         assert!(err
@@ -1142,10 +1207,10 @@ mod tests {
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000009999".to_owned(),
         };
 
-        let err = SharedBootstrapPlan::for_extractor_configs([
-            (&first_v2, &first_bootstrap),
-            (&second_v2, &second_bootstrap),
-        ])
+        let err = SharedBootstrapPlan::for_extractor_configs_with_registry(
+            [(&first_v2, &first_bootstrap), (&second_v2, &second_bootstrap)],
+            default_family_runtime_registry(),
+        )
         .expect_err("duplicate protocol systems should fail");
 
         assert!(err
@@ -1189,10 +1254,10 @@ mod tests {
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         };
 
-        let err = SharedBootstrapPlan::for_extractor_configs([
-            (&v2_config, &v2_bootstrap),
-            (&v3_config, &v3_bootstrap),
-        ])
+        let err = SharedBootstrapPlan::for_extractor_configs_with_registry(
+            [(&v2_config, &v2_bootstrap), (&v3_config, &v3_bootstrap)],
+            default_family_runtime_registry(),
+        )
         .expect_err("partial family runtime membership should fail");
 
         assert!(err
@@ -1202,20 +1267,19 @@ mod tests {
 
     #[test]
     fn rejects_shared_bootstrap_plan_with_mismatched_inferred_families() {
-        const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
-            "future_swap",
-            &[shared_family_member_with_bootstrap(
+        const FUTURE_FAMILY: FamilyRuntimeSpec =
+            canonical_shared_family_runtime_spec_with_explicit_owner!(
+                "future_swap",
+                &[shared_family_member_with_bootstrap(
+                    "future_v1",
+                    &["futurev1"],
+                    BootstrapStrategy::UniswapV2Rpc,
+                    SharedBootstrapParamsParser::Custom(parse_future_params),
+                    materialize_future_branch,
+                )],
+                None,
                 "future_v1",
-                &["futurev1"],
-                BootstrapStrategy::UniswapV2Rpc,
-                SharedBootstrapParamsParser::Custom(parse_future_params),
-                materialize_future_branch,
-            )],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
-            "family::future_swap",
-            None,
-        );
+            );
         let registry = test_registry_with_future_family(FUTURE_FAMILY);
 
         let future_config = ExtractorConfig::new(
@@ -1256,23 +1320,22 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("shared bootstrap plan requires one inferred family runtime"));
+            .contains("shared bootstrap plan inferred family runtime requires one registered family"));
     }
 
     #[test]
     fn rejects_shared_bootstrap_plan_with_invalid_custom_registry() {
-        const INVALID_FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
-            "future_swap",
-            &[crate::extractor::family_registry::shared_family_member_spec(
-                "future_v1",
-                &["futurev1"],
+        const INVALID_FUTURE_FAMILY: FamilyRuntimeSpec =
+            canonical_shared_family_runtime_spec_with_explicit_owner!(
+                "future_swap",
+                &[crate::extractor::family_registry::shared_family_member_spec(
+                    "future_v1",
+                    &["futurev1"],
+                    None,
+                )],
                 None,
-            )],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
-            "family::future_swap",
-            None,
-        );
+                "future_v1",
+            );
         let registry = FamilyRuntimeRegistry::new(&[INVALID_FUTURE_FAMILY]);
         let future_config = ExtractorConfig::new(
             "future_v1".to_owned(),
@@ -1342,29 +1405,28 @@ mod tests {
 
     #[test]
     fn builds_shared_bootstrap_plan_for_future_family_with_custom_registry() {
-        const FUTURE_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
-            "future_swap",
-            &[
-                shared_family_member_with_bootstrap(
-                    "future_v1",
-                    &["futurev1"],
-                    BootstrapStrategy::UniswapV2Rpc,
-                    SharedBootstrapParamsParser::Custom(parse_future_params),
-                    materialize_future_branch,
-                ),
-                shared_family_member_with_bootstrap(
-                    "future_v2",
-                    &["futurev2"],
-                    BootstrapStrategy::UniswapV2Rpc,
-                    SharedBootstrapParamsParser::Custom(parse_future_params),
-                    materialize_future_branch,
-                ),
-            ],
-            "map_future_swap_family_protocol_changes",
-            "future_swap_family",
-            "family::future_swap",
-            None,
-        );
+        const FUTURE_FAMILY: FamilyRuntimeSpec =
+            canonical_shared_family_runtime_spec_with_explicit_owner!(
+                "future_swap",
+                &[
+                    shared_family_member_with_bootstrap(
+                        "future_v1",
+                        &["futurev1"],
+                        BootstrapStrategy::UniswapV2Rpc,
+                        SharedBootstrapParamsParser::Custom(parse_future_params),
+                        materialize_future_branch,
+                    ),
+                    shared_family_member_with_bootstrap(
+                        "future_v2",
+                        &["futurev2"],
+                        BootstrapStrategy::UniswapV2Rpc,
+                        SharedBootstrapParamsParser::Custom(parse_future_params),
+                        materialize_future_branch,
+                    ),
+                ],
+                None,
+                "future_v1",
+            );
         let registry = test_registry_with_future_family(FUTURE_FAMILY);
 
         let v1_config = ExtractorConfig::new(
@@ -1418,7 +1480,7 @@ mod tests {
         )
         .expect("future family plan builds from custom registry");
 
-        assert_eq!(plan.family_name, Some("future_swap".to_string()));
+        assert_eq!(plan.family_name, "future_swap".to_string());
         assert_eq!(plan.bootstrap_block, 99);
         assert_eq!(plan.branches.len(), 2);
         assert_eq!(plan.branches[0].protocol_system, "future_v1");

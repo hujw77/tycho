@@ -168,6 +168,22 @@ pub fn configured_stream_start_block(config: &ExtractorConfig) -> Result<i64, Ex
     }
 }
 
+pub fn extractor_config_by_protocol_system<'a>(
+    extractors: &'a HashMap<String, ExtractorConfig>,
+    protocol_system: &str,
+) -> Result<Option<&'a ExtractorConfig>, ExtractionError> {
+    let mut matches = extractors
+        .values()
+        .filter(|config| config.protocol_system() == protocol_system);
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(ExtractionError::Setup(format!(
+            "multiple extractor configs declare protocol_system `{protocol_system}`"
+        )));
+    }
+    Ok(first)
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DCIType {

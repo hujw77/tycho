@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/combined-family-common.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -22,17 +25,7 @@ Environment:
 EOF
 }
 
-shell_escape() {
-  local arg="$1"
-  if [[ "${arg}" =~ ^[A-Za-z0-9_./:+=-]+$ ]]; then
-    printf '%s' "${arg}"
-    return
-  fi
-  printf "'%s'" "${arg//\'/\'\"\'\"\'}"
-}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${TYCHO_COMBINED_FAMILY_REPO_ROOT}"
 MODE="${1:-}"
 STRICT_DOCTOR="false"
 TEST_MANIFEST="${TYCHO_COMBINED_FAMILY_EXTENSIBILITY_TEST_MANIFEST:-${REPO_ROOT}/crates/tycho-indexer/tests/combined_family_extensibility_contract.tests}"
@@ -54,6 +47,7 @@ load_entries() {
 
   ENTRY_LINES=()
   ENTRY_TESTS=()
+  declare -A SEEN_TESTS=()
   while IFS= read -r line || [[ -n "${line}" ]]; do
     if [[ -z "${line}" || "${line}" =~ ^# ]]; then
       continue
@@ -67,6 +61,11 @@ load_entries() {
       echo "invalid combined-family extensibility contract manifest entry: ${line}" >&2
       exit 1
     fi
+    if [[ -n "${SEEN_TESTS[${test_name}]:-}" ]]; then
+      echo "duplicate combined-family extensibility contract manifest test: ${test_name}" >&2
+      exit 1
+    fi
+    SEEN_TESTS["${test_name}"]=1
     ENTRY_LINES+=("${line}")
     ENTRY_TESTS+=("${test_name}")
   done < "${TEST_MANIFEST}"
@@ -203,7 +202,7 @@ list_entries() {
 
 render_run_command() {
   cat <<EOF
-cd $(shell_escape "${REPO_ROOT}")
+cd $(tycho_combined_family_shell_escape "${REPO_ROOT}")
 $(render_test_binary_resolve_command)
 ENTRY_TESTS=(
 $(printf '  %s\n' "${ENTRY_TESTS[@]}")

@@ -12,7 +12,7 @@ use crate::{
         },
         family_dispatch_registry::{FamilyDispatchRegistry, FamilyDispatcherSeed},
         family_dispatch_splitter::split_family_block_changes,
-        family_runtime_planning::ResolvedFamilyRuntimeContract,
+        family_runtime_resolution::ResolvedFamilyRuntimeContract,
         protocol_cache::ProtocolMemoryCache,
         ExtractionError,
     },
@@ -23,6 +23,10 @@ use crate::{
 pub struct FamilyBranchSpec {
     pub protocol_system: String,
     pub protocol_type_names: HashSet<String>,
+}
+
+pub trait ProtocolSystemBranchView {
+    fn protocol_system(&self) -> &str;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,10 +66,7 @@ impl FamilyBranchSpec {
     pub fn protocol_system_set<'a>(
         branches: impl IntoIterator<Item = &'a FamilyBranchSpec>,
     ) -> HashSet<String> {
-        branches
-            .into_iter()
-            .map(|branch| branch.protocol_system.clone())
-            .collect()
+        collect_branch_protocol_systems(branches)
     }
 
     fn resolve_membership<'a>(
@@ -108,6 +109,24 @@ impl FamilyBranchSpec {
 
         Ok(FamilyDispatcherSeed { component_systems, contract_systems })
     }
+}
+
+impl ProtocolSystemBranchView for FamilyBranchSpec {
+    fn protocol_system(&self) -> &str {
+        &self.protocol_system
+    }
+}
+
+pub fn collect_branch_protocol_systems<'a, T>(
+    branches: impl IntoIterator<Item = &'a T>,
+) -> HashSet<String>
+where
+    T: ProtocolSystemBranchView + 'a,
+{
+    branches
+        .into_iter()
+        .map(|branch| branch.protocol_system().to_string())
+        .collect()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -324,7 +343,7 @@ mod tests {
 
     use crate::extractor::{
         extractor_config::{ExtractorConfig, ProtocolTypeConfig},
-        family_runtime_planning::ResolvedFamilyRuntimeContract,
+        family_runtime_resolution::ResolvedFamilyRuntimeContract,
         protocol_cache::{ProtocolDataCache, ProtocolMemoryCache},
     };
     use crate::pb::sf::substreams::{
@@ -529,13 +548,20 @@ mod tests {
 
     #[test]
     fn builds_dispatcher_from_runtime_contract() {
-        let contract = ResolvedFamilyRuntimeContract {
-            shared_extractor_id: "ethereum:uniswap_family".to_string(),
-            branch_specs: vec![
+        let contract = ResolvedFamilyRuntimeContract::new(
+            crate::extractor::family_runtime_metadata::ResolvedSharedFamilyStream {
+                shared_stream_name: "uniswap_family".to_string(),
+                spkg: String::new(),
+                module: String::new(),
+                extractor_id: "ethereum:uniswap_family".to_string(),
+                durability_scope: "family::uniswap".to_string(),
+            },
+            vec![
                 branch("uniswap_v2", "uniswap_v2_pool"),
                 branch("uniswap_v3", "uniswap_v3_pool"),
             ],
-        };
+            "uniswap_v2",
+        );
 
         let mut dispatcher = FamilyBlockChangesDispatcher::new_for_runtime_contract(&contract)
             .expect("dispatcher builds from runtime contract");

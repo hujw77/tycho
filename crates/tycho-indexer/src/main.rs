@@ -22,7 +22,7 @@ use chrono::{NaiveDateTime, Utc};
 use clap::Parser;
 use futures03::future::select_all;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use tokio::{runtime::Handle, select, task::JoinHandle};
+use tokio::select;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 #[cfg(test)]
@@ -44,16 +44,16 @@ use tycho_ethereum::{
 #[cfg(test)]
 use tycho_indexer::extractor::chain_state::ChainState;
 #[cfg(test)]
-use tycho_indexer::extractor::family_runtime_metadata::FamilyRuntimeConfig;
+use tycho_indexer::extractor::family_registry::default_family_runtime_registry;
 #[cfg(test)]
 use tycho_indexer::services::ServicesBuilder;
 use tycho_indexer::{
     cli::{
         AnalyzeTokenArgs, Cli, Command, GlobalArgs, IndexArgs, RecordSubstreamsArgs, RunSpkgArgs,
-        SubstreamsArgs,
     },
     extractor::{
         extractor_config::{DCIType, ExtractorConfig, ProtocolTypeConfig},
+        family_registry::FamilyRuntimeRegistry,
         token_analysis_cron::analyze_tokens,
         ExtractionError,
     },
@@ -71,31 +71,40 @@ mod testing;
 pub use tycho_indexer::{extractor, pb};
 
 use config::ExtractorConfigs;
-use record_substreams::record_substreams_fixture;
+use record_substreams::record_substreams_fixture_with_registry;
 #[cfg(test)]
 use record_substreams::{
     record_substreams_fixture_from_package_and_recorder, render_record_substreams_request_json,
-    resolve_record_substreams_request, resolve_record_substreams_request_with_registry,
+    resolve_record_substreams_request_with_registry,
     SubstreamsFixtureRecorder,
 };
-
-type ExtractionTasks = Vec<JoinHandle<Result<(), ExtractionError>>>;
-type ServerTasks = Vec<JoinHandle<Result<(), ExtractionError>>>; //TODO: introduce an error type for it
 
 mod record_substreams;
 
 fn main() -> Result<(), anyhow::Error> {
     let cli: Cli = Cli::parse();
     let global_args = cli.args();
+    let family_runtime_registry = cli.family_runtime_registry();
     match cli.command() {
         Command::Index(indexer_args) => {
-            run_indexer(global_args, indexer_args).map_err(|e| anyhow!(e))?;
+            run_indexer(
+                global_args,
+                indexer_args,
+                family_runtime_registry,
+            )
+                .map_err(|e| anyhow!(e))?;
         }
         Command::Run(run_args) => {
-            run_spkg(global_args, run_args).map_err(|e| anyhow!(e))?;
+            run_spkg(global_args, run_args, family_runtime_registry)
+                .map_err(|e| anyhow!(e))?;
         }
         Command::RecordSubstreams(record_args) => {
-            run_record_substreams(global_args, record_args).map_err(|e| anyhow!(e))?;
+            run_record_substreams(
+                global_args,
+                record_args,
+                family_runtime_registry,
+            )
+                .map_err(|e| anyhow!(e))?;
         }
         Command::AnalyzeTokens(analyze_args) => {
             run_analyze_tokens(global_args, analyze_args).map_err(|e| anyhow!(e))?;
@@ -201,7 +210,11 @@ fn spawn_jemalloc_stats_reporter() {
 /// By using separate runtimes, extraction processes in Tycho can run independently, ensuring
 /// that server-related tasks do not interfere with the extraction workflow, and overall
 /// system performance is maintained.
-fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), ExtractionError> {
+fn run_indexer(
+    global_args: GlobalArgs,
+    index_args: IndexArgs,
+    family_runtime_registry: FamilyRuntimeRegistry<'static>,
+) -> Result<(), ExtractionError> {
     let extraction_threads = std::env::var("EXTRACTION_WORKER_THREADS")
         .unwrap_or_else(|_| "2".to_string())
         .parse()
@@ -233,40 +246,56 @@ fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), Ext
 
         info!("Starting Tycho");
         debug!("{} CPUs detected", num_cpus::get());
-        let loaded_runtime_plan =
-            config::LoadedIndexerRuntimePlan::from_yaml(&index_args.extractors_config).map_err(
-                |e| ExtractionError::Setup(format!("Failed to load extractors runtime owner: {e}")),
-            )?;
-        let runtime_plan = loaded_runtime_plan
-            .resolved_runtime_plan()
-            .map_err(|e| {
-                ExtractionError::Setup(format!("Failed to resolve runtime targets: {e}"))
-            })?;
+        let loaded_runtime_plan = config::LoadedIndexerRuntimePlan::from_yaml_with_registry(
+            &index_args.extractors_config,
+            family_runtime_registry,
+        )
+        .map_err(|e| {
+            ExtractionError::Setup(format!("Failed to load extractors runtime owner: {e}"))
+        })?;
 
         let retention_horizon: NaiveDateTime = index_args
             .retention_horizon
             .parse()
             .expect("Failed to parse retention horizon");
+        let chains = index_args
+            .chains
+            .iter()
+            .map(|chain_str| {
+                Chain::from_str(chain_str)
+                    .unwrap_or_else(|_| panic!("Unknown chain {chain_str}"))
+            })
+            .collect::<Vec<_>>();
 
-        let (extraction_tasks, other_tasks) = create_indexing_tasks(
-            &global_args,
-            &index_args.substreams_args,
-            &index_args
-                .chains
-                .iter()
-                .map(|chain_str| {
-                    Chain::from_str(chain_str)
-                        .unwrap_or_else(|_| panic!("Unknown chain {chain_str}"))
-                })
-                .collect::<Vec<_>>(),
-            retention_horizon,
-            runtime_plan,
-            Some(extraction_runtime.handle()),
-            index_args.settlement_contract,
-        )
-        .await?;
+        let rpc_client = global_args.rpc.build_client()?;
+        let launch_config = config::ResolvedServiceLaunchConfig::from_runtime_args(
+            &global_args.server_version_prefix,
+            &global_args.server_ip,
+            global_args.server_port,
+        )?;
+        let managed_indexer = loaded_runtime_plan
+            .start_indexing(
+                &launch_config,
+                rpc_client,
+                config::ResolvedIndexerTaskContext {
+                    database_url: &global_args.database_url,
+                    chains: &chains,
+                    retention_horizon,
+                    endpoint_url: &global_args.endpoint_url,
+                    s3_bucket: global_args.s3_bucket.as_deref(),
+                    substreams_api_token: &index_args.substreams_args.substreams_api_token,
+                    database_insert_batch_size: global_args.database_insert_batch_size,
+                    settlement_contract: index_args.settlement_contract,
+                    extraction_runtime: Some(extraction_runtime.handle().clone()),
+                    partial_blocks: index_args.substreams_args.enable_partial_blocks,
+                },
+            )
+            .await
+            .map_err(|e| ExtractionError::Setup(format!("Failed to create extractors: {e}")))?;
 
-        Ok::<_, ExtractionError>((extraction_tasks, other_tasks))
+        let task_groups = managed_indexer.into_task_groups();
+
+        Ok::<_, ExtractionError>((task_groups.extraction_tasks, task_groups.service_tasks))
     })?;
 
     let extractor_ctrl_tx = control_tx.clone();
@@ -299,7 +328,11 @@ fn run_indexer(global_args: GlobalArgs, index_args: IndexArgs) -> Result<(), Ext
 }
 
 #[tokio::main]
-async fn run_spkg(global_args: GlobalArgs, run_args: RunSpkgArgs) -> Result<(), ExtractionError> {
+async fn run_spkg(
+    global_args: GlobalArgs,
+    run_args: RunSpkgArgs,
+    family_runtime_registry: FamilyRuntimeRegistry<'static>,
+) -> Result<(), ExtractionError> {
     create_tracing_subscriber();
     info!("Starting Tycho");
 
@@ -311,50 +344,66 @@ async fn run_spkg(global_args: GlobalArgs, run_args: RunSpkgArgs) -> Result<(), 
             _ => Err(ExtractionError::Setup(format!("Unknown DCI plugin: {s}"))),
         })?;
 
-    let config = ExtractorConfigs::new(HashMap::from([(
-        run_args.protocol_system.clone(),
-        ExtractorConfig::new(
+    let config = ExtractorConfigs::new_with_registry(
+        HashMap::from([(
             run_args.protocol_system.clone(),
-            Chain::from_str(&run_args.chain).unwrap(),
-            ImplementationType::Vm,
-            1, /* TODO: if we want to increase this, we need to commit the cache when we reached
-                * `end_block` */
-            run_args.start_block,
-            run_args.stop_block(),
-            run_args
-                .protocol_type_names
-                .into_iter()
-                .map(|name| {
-                    ProtocolTypeConfig::new(name, tycho_common::models::FinancialType::Swap)
-                })
-                .collect::<Vec<_>>(),
-            run_args.spkg,
-            run_args.module,
-            run_args.initialized_accounts,
-            run_args.initialization_block,
-            None,
-            dci_plugin,
-            HashMap::new(),
-            None,
-        ),
-    )]));
+            ExtractorConfig::new(
+                run_args.protocol_system.clone(),
+                Chain::from_str(&run_args.chain).unwrap(),
+                ImplementationType::Vm,
+                1, /* TODO: if we want to increase this, we need to commit the cache when we reached
+                    * `end_block` */
+                run_args.start_block,
+                run_args.stop_block(),
+                run_args
+                    .protocol_type_names
+                    .into_iter()
+                    .map(|name| {
+                        ProtocolTypeConfig::new(name, tycho_common::models::FinancialType::Swap)
+                    })
+                    .collect::<Vec<_>>(),
+                run_args.spkg,
+                run_args.module,
+                run_args.initialized_accounts,
+                run_args.initialization_block,
+                None,
+                dci_plugin,
+                HashMap::new(),
+                None,
+            ),
+        )]),
+        family_runtime_registry,
+    );
     let runtime_plan = config
         .resolved_indexer_runtime_plan()
         .map_err(|e| ExtractionError::Setup(format!("Failed to resolve runtime targets: {e}")))?;
+    let rpc_client = global_args.rpc.build_client()?;
+    let launch_config = config::ResolvedServiceLaunchConfig::from_runtime_args(
+        &global_args.server_version_prefix,
+        &global_args.server_ip,
+        global_args.server_port,
+    )?;
+    let managed_indexer = runtime_plan
+        .start_indexing(
+            &launch_config,
+            rpc_client,
+            config::ResolvedIndexerTaskContext {
+                database_url: &global_args.database_url,
+                chains: &[Chain::from_str(&run_args.chain).unwrap()],
+                retention_horizon: Utc::now().naive_utc(),
+                endpoint_url: &global_args.endpoint_url,
+                s3_bucket: global_args.s3_bucket.as_deref(),
+                substreams_api_token: &run_args.substreams_args.substreams_api_token,
+                database_insert_batch_size: global_args.database_insert_batch_size,
+                settlement_contract: run_args.settlement_contract,
+                extraction_runtime: None,
+                partial_blocks: run_args.substreams_args.enable_partial_blocks,
+            },
+        )
+        .await
+        .map_err(|e| ExtractionError::Setup(format!("Failed to create extractors: {e}")))?;
 
-    let (extraction_tasks, mut other_tasks) = create_indexing_tasks(
-        &global_args,
-        &run_args.substreams_args,
-        &[Chain::from_str(&run_args.chain).unwrap()],
-        Utc::now().naive_utc(),
-        runtime_plan,
-        None,
-        run_args.settlement_contract,
-    )
-    .await?;
-
-    let mut all_tasks = extraction_tasks;
-    all_tasks.append(&mut other_tasks);
+    let all_tasks = managed_indexer.into_all_tasks();
 
     let (res, _, _) = select_all(all_tasks).await;
     res.expect("Extractor- nor ServiceTasks should panic!")
@@ -364,11 +413,13 @@ async fn run_spkg(global_args: GlobalArgs, run_args: RunSpkgArgs) -> Result<(), 
 async fn run_record_substreams(
     global_args: GlobalArgs,
     record_args: RecordSubstreamsArgs,
+    family_runtime_registry: FamilyRuntimeRegistry<'static>,
 ) -> Result<(), ExtractionError> {
     create_tracing_subscriber();
     info!("Recording Substreams responses");
 
-    record_substreams_fixture(&global_args, &record_args).await
+    record_substreams_fixture_with_registry(&global_args, &record_args, family_runtime_registry)
+        .await
 }
 
 #[cfg(test)]
@@ -405,49 +456,6 @@ async fn run_rpc(global_args: GlobalArgs) -> Result<(), ExtractionError> {
     info!(server_url = managed_server.server_url, "Http and Ws server started");
     let (res, _, _) = select_all([managed_server.server_task, managed_server.shutdown_task]).await;
     res.expect("ServiceTasks shouldn't panic!")
-}
-
-/// Creates extraction and server tasks.
-async fn create_indexing_tasks(
-    global_args: &GlobalArgs,
-    substreams_args: &SubstreamsArgs,
-    chains: &[Chain],
-    retention_horizon: NaiveDateTime,
-    runtime_plan: config::ResolvedIndexerRuntimePlan<'_>,
-    extraction_runtime: Option<&Handle>,
-    settlement_contract: alloy::primitives::Address,
-) -> Result<(ExtractionTasks, ServerTasks), ExtractionError> {
-    let rpc_client = global_args.rpc.build_client()?;
-    let launch_config = config::ResolvedServiceLaunchConfig::from_runtime_args(
-        &global_args.server_version_prefix,
-        &global_args.server_ip,
-        global_args.server_port,
-    )?;
-
-    let family_runtime_registry = runtime_plan.family_runtime_registry();
-
-    let managed_indexer = launch_config
-        .start_indexing_runtime_plan(
-            runtime_plan,
-            rpc_client,
-            config::ResolvedIndexerTaskContext {
-                database_url: &global_args.database_url,
-                chains,
-                retention_horizon,
-                endpoint_url: &global_args.endpoint_url,
-                s3_bucket: global_args.s3_bucket.as_deref(),
-                substreams_api_token: &substreams_args.substreams_api_token,
-                database_insert_batch_size: global_args.database_insert_batch_size,
-                settlement_contract,
-                extraction_runtime: extraction_runtime.cloned(),
-                partial_blocks: substreams_args.enable_partial_blocks,
-                family_runtime_registry,
-            },
-        )
-        .await
-        .map_err(|e| ExtractionError::Setup(format!("Failed to create extractors: {e}")))?;
-
-    Ok((managed_indexer.extraction_tasks, managed_indexer.service_tasks))
 }
 
 #[tokio::main]
@@ -489,12 +497,13 @@ mod test_serial_db {
         repo_combined_family_bootstrap_pool_seeds_for_tests, scripted_session_response,
         scripted_undo_response, seed_repo_runtime_target_shared_bootstrap_universe_for_tests,
         shared_bootstrap_seed_universe_spec_from_config_path_with_registry_for_tests,
-        swap_extractor_config_for_tests, unique_test_suffix as test_unique_suffix,
+        unique_test_suffix as test_unique_suffix,
+        uniswap_family_swap_extractors_for_tests,
         uniswap_family_durability_scope_for_tests as test_family_durability_scope,
         uniswap_family_protocol_systems_for_tests as test_family_protocol_systems,
         uniswap_family_runtime_config_for_tests as test_family_runtime_config,
-        uniswap_family_shared_module_for_tests as test_family_shared_module, v2_pair_created_block,
-        v3_pool_created_block, write_record_substreams_future_family_fixture_inputs,
+        v2_pair_created_block, v3_pool_created_block,
+        write_record_substreams_future_family_fixture_inputs,
         write_record_substreams_future_family_fixture_inputs_with_registry,
         write_temp_substreams_package_for_tests as test_family_shared_spkg_path,
         write_uniswap_family_defaults_config_for_tests as test_family_defaults_config,
@@ -507,6 +516,12 @@ mod test_serial_db {
     use prost::Message;
     use substreams::store::StoreGet;
     use tycho_storage::postgres::testing::run_against_db;
+
+    fn test_extractor_configs_new(
+        extractors: HashMap<String, ExtractorConfig>,
+    ) -> ExtractorConfigs {
+        ExtractorConfigs::new_with_registry(extractors, default_family_runtime_registry())
+    }
 
     use super::*;
     static RPC: Lazy<EthereumRpcClient> = Lazy::new(|| {
@@ -739,47 +754,14 @@ mod test_serial_db {
                 .expect("utf8 missing member v3 spkg path")
                 .to_string();
 
-            let extractors = HashMap::from([
-                (
-                    "uniswap_v2".to_string(),
-                    swap_extractor_config_for_tests(
-                        "uniswap_v2",
-                        "uniswap_v2",
-                        chain,
-                        ImplementationType::Custom,
-                        42,
-                        "uniswap_v2_pool",
-                        missing_member_v2_spkg,
-                        "v2_map_pool_events",
-                        Some(FamilyRuntimeConfig {
-                            family: "uniswap".to_string(),
-                            shared_spkg: Some(shared_spkg_path.clone()),
-                            shared_module: Some(test_family_shared_module()),
-                            durability_scope: Some(test_family_durability_scope()),
-                        }),
-                    ),
-                ),
-                (
-                    "uniswap_v3".to_string(),
-                    swap_extractor_config_for_tests(
-                        "uniswap_v3",
-                        "uniswap_v3",
-                        chain,
-                        ImplementationType::Custom,
-                        42,
-                        "uniswap_v3_pool",
-                        missing_member_v3_spkg,
-                        "v3_map_protocol_changes",
-                        Some(FamilyRuntimeConfig {
-                            family: "uniswap".to_string(),
-                            shared_spkg: Some(shared_spkg_path.clone()),
-                            shared_module: Some(test_family_shared_module()),
-                            durability_scope: Some(test_family_durability_scope()),
-                        }),
-                    ),
-                ),
-            ]);
-            let config = ExtractorConfigs::new(extractors);
+            let extractors = uniswap_family_swap_extractors_for_tests(
+                chain,
+                42,
+                shared_spkg_path.clone(),
+                missing_member_v2_spkg,
+                missing_member_v3_spkg,
+            );
+            let config = test_extractor_configs_new(extractors);
 
             let (runners, handles) = build_all_extractors(
                 &config,
@@ -888,7 +870,7 @@ mod test_serial_db {
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let err = match build_all_extractors(
                 &config,
@@ -1076,10 +1058,11 @@ params:
                 Some("factory=0x1F98431c8aD98523631AE4a59f267346ea31F984"),
             );
 
-            let loaded_runtime_plan = config::LoadedIndexerRuntimePlan::from_yaml(
+            let loaded_runtime_plan = config::LoadedIndexerRuntimePlan::from_yaml_with_registry(
                 config_path
                     .to_str()
                     .expect("utf8 config path"),
+                default_family_runtime_registry(),
             )
             .expect("load family-default bootstrap config");
             let config = loaded_runtime_plan.extractors_config();
@@ -1261,7 +1244,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -1833,7 +1816,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -2188,7 +2171,7 @@ params:
                     .with_family_runtime(Some(test_family_runtime_config(shared_spkg_path.clone()))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -2558,7 +2541,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -3099,7 +3082,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -3649,7 +3632,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -4050,7 +4033,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -4385,7 +4368,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -4622,6 +4605,7 @@ params:
                     1000,
                     cached_gw.clone(),
                     Some(family_scope.clone()),
+                    true,
                 );
             cached_gw
                 .start_transaction(&persisted_block, Some("seed-future-family-bootstrap-progress"))
@@ -4652,19 +4636,20 @@ params:
             let (mut runners, handles) =
                 build_all_extractors_from_config_path_with_registry_for_tests(
                     &config_path,
-                    crate::testing::BuildExtractorsTestContext {
-                        chain_state: ChainState::default(),
-                        endpoint_url: &format!("http://{addr}"),
-                        s3_bucket: None,
-                        substreams_api_token: "",
-                        cached_gw: &cached_gw,
-                        database_insert_batch_size: 1000,
-                        token_pre_processor: &token_processor,
-                        rpc_client: &rpc,
-                        runtime: None,
-                        partial_blocks: false,
-                        family_runtime_registry: registry,
-                    },
+                    crate::extractor::startup::ResolvedRuntimeTargetsBuildContext::new(
+                        ChainState::default(),
+                        &format!("http://{addr}"),
+                        None,
+                        "",
+                        &cached_gw,
+                        1000,
+                        &token_processor,
+                        &rpc,
+                        None,
+                        false,
+                        false,
+                        registry,
+                    ),
                 )
                 .await
                 .expect("build future family runtime through custom registry");
@@ -4767,19 +4752,20 @@ params:
             let (mut runners, handles) =
                 build_all_extractors_from_config_path_with_registry_for_tests(
                     &config_path,
-                    crate::testing::BuildExtractorsTestContext {
-                        chain_state: ChainState::default(),
-                        endpoint_url: &format!("http://{addr}"),
-                        s3_bucket: None,
-                        substreams_api_token: "",
-                        cached_gw: &cached_gw,
-                        database_insert_batch_size: 1000,
-                        token_pre_processor: &token_processor,
-                        rpc_client: &rpc,
-                        runtime: None,
-                        partial_blocks: false,
-                        family_runtime_registry: registry,
-                    },
+                    crate::extractor::startup::ResolvedRuntimeTargetsBuildContext::new(
+                        ChainState::default(),
+                        &format!("http://{addr}"),
+                        None,
+                        "",
+                        &cached_gw,
+                        1000,
+                        &token_processor,
+                        &rpc,
+                        None,
+                        false,
+                        false,
+                        registry,
+                    ),
                 )
                 .await
                 .expect("build future family runtime from persisted shared cursor");
@@ -5437,7 +5423,7 @@ params:
                     ))),
                 ),
             ]);
-            let config = ExtractorConfigs::new(extractors);
+            let config = test_extractor_configs_new(extractors);
 
             let (mut runners, handles) = build_all_extractors(
                 &config,
@@ -8539,6 +8525,10 @@ mod recorder_tests {
         "test_handle_message_tracks_combined_family_sync_states_and_components"
     }
 
+    fn combined_family_fynd_replay_dynamic_admission_test() -> &'static str {
+        "test_combined_uniswap_dynamic_admission_becomes_routable_in_replay"
+    }
+
     fn combined_family_db_gate_tests() -> Vec<String> {
         read_nonempty_manifest_lines(&combined_family_db_gate_manifest_path())
     }
@@ -8555,6 +8545,22 @@ mod recorder_tests {
         "test_serial_db::combined_family_runner_rejects_legacy_extractor_scoped_resume_state_under_shared_durability"
     }
 
+    fn combined_family_db_gate_dynamic_admission_persistence_test() -> &'static str {
+        "combined_family_runner_persists_dynamically_admitted_component"
+    }
+
+    fn combined_family_db_gate_dynamic_admission_follow_up_state_test() -> &'static str {
+        "combined_family_runner_persists_follow_up_state_for_dynamically_admitted_component"
+    }
+
+    fn combined_family_db_gate_multi_branch_revert_test() -> &'static str {
+        "combined_family_runner_reverts_dynamically_admitted_components_across_branches"
+    }
+
+    fn combined_family_db_gate_multi_branch_reorg_recovery_test() -> &'static str {
+        "combined_family_runner_recovers_after_revert_and_reapplies_multi_branch_state"
+    }
+
     fn combined_family_db_gate_v2_dynamic_admission_reconnect_test() -> &'static str {
         "test_serial_db::combined_family_runner_reconnect_applies_v2_follow_up_state_after_dynamic_component_admission"
     }
@@ -8569,6 +8575,14 @@ mod recorder_tests {
 
     fn combined_family_db_gate_v3_dynamic_admission_restart_test() -> &'static str {
         "test_serial_db::combined_family_runner_restart_applies_v3_follow_up_state_after_dynamic_component_admission"
+    }
+
+    fn combined_family_db_gate_v2_seeded_universe_dynamic_join_test() -> &'static str {
+        "combined_family_runner_factory_style_dynamic_component_joins_seeded_universe_and_receives_follow_up_state"
+    }
+
+    fn combined_family_db_gate_v3_seeded_universe_dynamic_join_test() -> &'static str {
+        "combined_family_runner_v3_dynamic_component_joins_seeded_universe_and_receives_follow_up_state"
     }
 
     fn combined_family_db_gate_contract_and_storage_only_restart_test() -> &'static str {
@@ -8610,6 +8624,23 @@ mod recorder_tests {
         ));
         let body = format!("route {route_test}\nsettlement {settlement_test}\n");
         std::fs::write(&path, body).expect("write temp combined-family live gate manifest");
+        path
+    }
+
+    fn write_temp_combined_family_live_gate_manifest_body_for_tests(
+        file_name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{file_name}-{}-{}.tests",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, body)
+            .expect("write temp combined-family live gate manifest body");
         path
     }
 
@@ -8705,7 +8736,11 @@ mod recorder_tests {
             panic!("expected record-substreams command");
         };
 
-        record_substreams_fixture(&global_args, &record_args)
+        record_substreams_fixture_with_registry(
+            &global_args,
+            &record_args,
+            default_family_runtime_registry(),
+        )
             .await
             .expect("record fixture through command path");
 
@@ -8779,7 +8814,11 @@ mod recorder_tests {
             panic!("expected record-substreams command");
         };
 
-        record_substreams_fixture(&global_args, &record_args)
+        record_substreams_fixture_with_registry(
+            &global_args,
+            &record_args,
+            default_family_runtime_registry(),
+        )
             .await
             .expect("record derived fixture through command path");
 
@@ -8979,7 +9018,10 @@ mod recorder_tests {
             panic!("expected record-substreams command");
         };
 
-        let err = resolve_record_substreams_request(&record_args)
+        let err = resolve_record_substreams_request_with_registry(
+            &record_args,
+            default_family_runtime_registry(),
+        )
             .expect_err("ambiguous config should require an explicit selector");
         let err_text = err.to_string();
         assert!(err_text.contains("requires exactly one of `--family` or `--protocol-system`"));
@@ -9137,7 +9179,10 @@ mod recorder_tests {
             "+2",
             &["extra_flag=enabled"],
         );
-        let resolved = resolve_record_substreams_request(&record_args)
+        let resolved = resolve_record_substreams_request_with_registry(
+            &record_args,
+            default_family_runtime_registry(),
+        )
             .expect("repo combined config should derive one shared family request");
 
         let rendered = render_record_substreams_request_json(&resolved)
@@ -9189,7 +9234,11 @@ mod recorder_tests {
             panic!("expected record-substreams command");
         };
 
-        record_substreams_fixture(&global_args, &record_args)
+        record_substreams_fixture_with_registry(
+            &global_args,
+            &record_args,
+            default_family_runtime_registry(),
+        )
             .await
             .expect("print-request path should not require network access");
 
@@ -9213,7 +9262,10 @@ mod recorder_tests {
             &["extra_flag=enabled"],
         );
 
-        let resolved = resolve_record_substreams_request(&record_args)
+        let resolved = resolve_record_substreams_request_with_registry(
+            &record_args,
+            default_family_runtime_registry(),
+        )
             .expect("repo combined config should derive one shared family request");
 
         assert_eq!(resolved.spkg, repo_combined_family_expected_spkg_for_tests());
@@ -9262,7 +9314,10 @@ mod recorder_tests {
             "+2",
             &["extra_flag=enabled"],
         );
-        let resolved = resolve_record_substreams_request(&record_args)
+        let resolved = resolve_record_substreams_request_with_registry(
+            &record_args,
+            default_family_runtime_registry(),
+        )
             .expect("repo combined recorder helper should resolve");
 
         assert_eq!(record_args.output, output_path.to_string_lossy());
@@ -9283,7 +9338,11 @@ mod recorder_tests {
     fn combined_family_real_history_slice_capture_spec_anchors_live_fixture_refresh() {
         let spec = combined_family_real_history_slice_capture_spec_for_tests();
         let record_args = repo_combined_family_record_args_from_spec_for_tests(&spec);
-        let resolved = resolve_record_substreams_request(&record_args).expect(
+        let resolved = resolve_record_substreams_request_with_registry(
+            &record_args,
+            default_family_runtime_registry(),
+        )
+        .expect(
             "history-slice capture spec should resolve through repo combined recorder path",
         );
 
@@ -9407,7 +9466,10 @@ mod recorder_tests {
         let expected = format!(
             "{}\n",
             render_record_substreams_request_json(
-                &resolve_record_substreams_request(&record_args)
+                &resolve_record_substreams_request_with_registry(
+                    &record_args,
+                    default_family_runtime_registry(),
+                )
                     .expect("history-slice preflight request should resolve"),
             )
             .expect("history-slice request json should render")
@@ -9625,6 +9687,50 @@ mod recorder_tests {
     }
 
     #[test]
+    fn combined_family_db_gate_manifest_keeps_dynamic_admission_persistence_coverage() {
+        let manifest_tests = combined_family_db_gate_tests();
+        assert!(
+            manifest_tests.contains(
+                &combined_family_db_gate_dynamic_admission_persistence_test().to_string()
+            ),
+            "combined-family DB gate manifest must keep the dynamic-admission persistence test that proves a newly admitted shared-family component becomes durably stored and externally queryable"
+        );
+    }
+
+    #[test]
+    fn combined_family_db_gate_manifest_keeps_dynamic_admission_follow_up_state_coverage() {
+        let manifest_tests = combined_family_db_gate_tests();
+        assert!(
+            manifest_tests.contains(
+                &combined_family_db_gate_dynamic_admission_follow_up_state_test().to_string()
+            ),
+            "combined-family DB gate manifest must keep the dynamic-admission follow-up-state test that proves later shared-family updates reach latest-view storage, timestamp-version storage, and the RPC default timestamp path after admission"
+        );
+    }
+
+    #[test]
+    fn combined_family_db_gate_manifest_keeps_multi_branch_revert_coverage() {
+        let manifest_tests = combined_family_db_gate_tests();
+        assert!(
+            manifest_tests.contains(
+                &combined_family_db_gate_multi_branch_revert_test().to_string()
+            ),
+            "combined-family DB gate manifest must keep the multi-branch revert test that proves a shared-family revert can remove dynamically admitted V2 and V3 component/state visibility from storage and RPC together"
+        );
+    }
+
+    #[test]
+    fn combined_family_db_gate_manifest_keeps_multi_branch_reorg_recovery_coverage() {
+        let manifest_tests = combined_family_db_gate_tests();
+        assert!(
+            manifest_tests.contains(
+                &combined_family_db_gate_multi_branch_reorg_recovery_test().to_string()
+            ),
+            "combined-family DB gate manifest must keep the multi-branch reorg-recovery test that proves one shared family stream can recover both V2 and V3 branches after a revert and re-expose the recovered state through storage and RPC"
+        );
+    }
+
+    #[test]
     fn combined_family_db_gate_manifest_keeps_v2_dynamic_admission_coverage() {
         let manifest_tests = combined_family_db_gate_tests();
         assert!(
@@ -9658,6 +9764,17 @@ mod recorder_tests {
     }
 
     #[test]
+    fn combined_family_db_gate_manifest_keeps_v2_seeded_universe_dynamic_join_coverage() {
+        let manifest_tests = combined_family_db_gate_tests();
+        assert!(
+            manifest_tests.contains(
+                &combined_family_db_gate_v2_seeded_universe_dynamic_join_test().to_string()
+            ),
+            "combined-family DB gate manifest must keep the V2 seeded-universe dynamic-join test that proves a shared-bootstrap-seeded family universe can admit a later V2 pool on the shared stream while keeping seeded state visible"
+        );
+    }
+
+    #[test]
     fn combined_family_db_gate_manifest_keeps_v3_dynamic_admission_restart_coverage() {
         let manifest_tests = combined_family_db_gate_tests();
         assert!(
@@ -9665,6 +9782,17 @@ mod recorder_tests {
                 &combined_family_db_gate_v3_dynamic_admission_restart_test().to_string()
             ),
             "combined-family DB gate manifest must keep the V3 dynamic-admission restart test that proves a shared-bootstrap-seeded V3 branch can admit a new pool, persist follow-up state across process restart, and keep that state externally queryable after restart"
+        );
+    }
+
+    #[test]
+    fn combined_family_db_gate_manifest_keeps_v3_seeded_universe_dynamic_join_coverage() {
+        let manifest_tests = combined_family_db_gate_tests();
+        assert!(
+            manifest_tests.contains(
+                &combined_family_db_gate_v3_seeded_universe_dynamic_join_test().to_string()
+            ),
+            "combined-family DB gate manifest must keep the V3 seeded-universe dynamic-join test that proves a shared-bootstrap-seeded V3 universe is not treated as a permanent allowlist when a later V3 pool arrives on the shared stream"
         );
     }
 
@@ -9705,6 +9833,19 @@ mod recorder_tests {
                 "combined-family extensibility contract manifest references missing test `{function_name}` in `{file_path}`"
             );
         }
+    }
+
+    #[test]
+    fn combined_family_extensibility_contract_manifest_keeps_same_block_dynamic_admission_dispatch_coverage(
+    ) {
+        let manifest_entries = combined_family_extensibility_contract_entries();
+        assert!(
+            manifest_entries.contains(&(
+                "crates/tycho-indexer/src/extractor/family_dispatch.rs".to_string(),
+                "routes_same_block_dynamic_admission_and_follow_up_updates".to_string(),
+            )),
+            "combined-family extensibility contract manifest must keep the same-block dynamic-admission dispatch test that proves one shared family block can admit a new branch component and route its contract/entity/balance/storage follow-ups without waiting for a second block"
+        );
     }
 
     #[test]
@@ -9790,9 +9931,46 @@ mod recorder_tests {
     }
 
     #[test]
+    fn combined_family_db_gate_script_rejects_duplicate_manifest_entries() {
+        let script_path = combined_family_db_gate_script_path();
+        let duplicate_test =
+            "test_serial_db::repo_combined_family_bootstrap_pool_seeds_are_derived_from_repo_config";
+        let custom_manifest = write_temp_combined_family_db_gate_manifest_for_tests(
+            "combined-family-db-gate-duplicate",
+            &[duplicate_test, duplicate_test],
+        );
+
+        let output = std::process::Command::new(&script_path)
+            .arg("list")
+            .env("TYCHO_COMBINED_FAMILY_DB_TEST_MANIFEST", &custom_manifest)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected DB gate duplicate manifest failure at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            !output.status.success(),
+            "DB gate script should reject duplicate manifest entries"
+        );
+
+        let stderr = String::from_utf8(output.stderr)
+            .expect("DB gate duplicate manifest failure should emit utf8 stderr");
+        assert!(
+            stderr.contains("duplicate combined-family DB gate manifest entry"),
+            "duplicate DB gate manifest failure should be explicit, got: {stderr}"
+        );
+
+        let _ = std::fs::remove_file(custom_manifest);
+    }
+
+    #[test]
     fn combined_family_db_gate_doctor_reports_expected_diagnostics() {
         let script_path = combined_family_db_gate_script_path();
         let custom_database_url = "postgres://example:secret@127.0.0.1:5999/custom_db";
+        let test_manifest = combined_family_db_gate_manifest_path();
+        let test_count = combined_family_db_gate_tests().len();
         let output = std::process::Command::new(&script_path)
             .arg("doctor")
             .env("DATABASE_URL", custom_database_url)
@@ -9838,6 +10016,18 @@ mod recorder_tests {
             "doctor output should include docker daemon availability"
         );
         assert!(
+            rendered.contains("compose_db_container_id="),
+            "doctor output should include the compose db container id field"
+        );
+        assert!(
+            rendered.contains("compose_db_state="),
+            "doctor output should include the compose db container state field"
+        );
+        assert!(
+            rendered.contains("compose_db_error="),
+            "doctor output should include the compose db error field"
+        );
+        assert!(
             rendered.contains("docker_compose_file="),
             "doctor output should include compose file path"
         );
@@ -9846,10 +10036,108 @@ mod recorder_tests {
             "doctor output should include the DB start command"
         );
         assert!(
-            rendered.contains("test_count="),
-            "doctor output should include focused test count"
+            rendered.contains(&format!("test_manifest={}", test_manifest.display())),
+            "doctor output should include the exact manifest path"
         );
-        assert!(rendered.contains("test_manifest="), "doctor output should include manifest path");
+        assert!(
+            rendered.contains(&format!("test_count={test_count}")),
+            "doctor output should include the exact manifest-backed focused test count"
+        );
+    }
+
+    #[test]
+    fn combined_family_db_gate_doctor_reports_compose_db_io_error_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_path = combined_family_db_gate_script_path();
+        let temp_root = std::env::temp_dir().join(format!(
+            "combined-family-db-gate-compose-io-error-{}-{}",
+            std::process::id(),
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let fake_bin = temp_root.join("bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake bin dir");
+
+        let write_fake_exec = |name: &str, body: &str| {
+            let path = fake_bin.join(name);
+            std::fs::write(&path, body)
+                .unwrap_or_else(|err| panic!("write fake executable {}: {err}", path.display()));
+            let mut perms = std::fs::metadata(&path)
+                .expect("read fake executable metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake executable");
+        };
+
+        write_fake_exec(
+            "docker",
+            "#!/usr/bin/env bash\n\
+if [[ \"${1:-}\" == \"info\" ]]; then\n\
+  exit 0\n\
+fi\n\
+if [[ \"${1:-}\" == \"compose\" ]]; then\n\
+  printf 'fake-compose-db-container\\n'\n\
+  exit 0\n\
+fi\n\
+if [[ \"${1:-}\" == \"inspect\" ]]; then\n\
+  if [[ \"${4:-}\" == *'.State.Status'* ]]; then\n\
+    printf 'exited'\n\
+    exit 0\n\
+  fi\n\
+  if [[ \"${4:-}\" == *'.State.Error'* ]]; then\n\
+    printf 'open /var/lib/docker/containers/fake/hosts: input/output error'\n\
+    exit 0\n\
+  fi\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+        );
+        write_fake_exec("psql", "#!/usr/bin/env bash\nexit 2\n");
+
+        let path_env = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake_bin.to_string_lossy());
+        let output = std::process::Command::new(&script_path)
+            .arg("doctor")
+            .env("PATH", path_env)
+            .env("DATABASE_URL", "postgres://example:secret@127.0.0.1:5999/compose_io_db")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected DB gate script compose-io-error doctor mode at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "DB gate script compose-io-error doctor mode should succeed, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("DB gate script compose-io-error doctor mode should emit utf8 diagnostics");
+        assert!(
+            rendered.contains("ready=false"),
+            "failed psql probe should keep readiness false"
+        );
+        assert!(
+            rendered.contains("database_state=compose_db_exited_io_error"),
+            "doctor should surface a narrowed compose-db I/O failure state"
+        );
+        assert!(
+            rendered.contains("compose_db_container_id=fake-compose-db-container"),
+            "doctor should include the fake compose db container id"
+        );
+        assert!(
+            rendered.contains("compose_db_state=exited"),
+            "doctor should include the fake compose db state"
+        );
+        assert!(
+            rendered.contains("compose_db_error=open /var/lib/docker/containers/fake/hosts: input/output error"),
+            "doctor should include the fake compose db error string"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
@@ -9913,8 +10201,8 @@ mod recorder_tests {
             "run preflight should echo the base DATABASE_URL override before failing"
         );
         assert!(
-            rendered.contains("database_state=unreachable"),
-            "run preflight should report unreachable database before aborting"
+            rendered.contains("database_state="),
+            "run preflight should report a database state before aborting"
         );
         assert!(
             rendered.contains("database_start_command="),
@@ -10025,8 +10313,8 @@ mod recorder_tests {
             "strict doctor output should echo the base DATABASE_URL override"
         );
         assert!(
-            rendered.contains("database_state=unreachable"),
-            "strict doctor output should report unreachable database"
+            rendered.contains("database_state="),
+            "strict doctor output should report a database state"
         );
         assert!(
             rendered.contains("database_start_command="),
@@ -10039,6 +10327,7 @@ mod recorder_tests {
         let script_path = combined_family_fynd_live_e2e_script_path();
         let fynd_repo_root = combined_family_fynd_repo_root();
         let test_manifest = combined_family_live_gate_manifest_path();
+        let test_count = combined_family_live_gate_tests().len();
         let tycho_url = "127.0.0.1:1";
         let rpc_url = "https://rpc.example.invalid";
         let rust_log = "warn,tycho_client=debug,fynd=trace";
@@ -10066,7 +10355,7 @@ mod recorder_tests {
         let rendered = String::from_utf8(output.stdout)
             .expect("Fynd live E2E script doctor mode should emit utf8 diagnostics");
         let expected = format!(
-            "ready=false\nfynd_repo_root={}\nfynd_repo_exists=true\nfynd_test_exists=true\nroute_test_exists=true\nsettlement_test_exists=true\nlive_test_mapping_ready=true\ntycho_url={}\ntycho_health=unreachable\ntycho_protocols_ready=unreachable\nprotocol_v2_ready=unknown\nprotocol_v3_ready=unknown\ntycho_filtered_tokens_ready=unreachable\ntycho_filtered_tokens_total=unreachable\ntycho_connector_tokens_ready=unreachable\ntycho_connector_tokens_total=unreachable\nchain=ethereum\nrpc_url={}\nrust_log={}\nhealth_timeout_secs=300\ntraded_n_days_ago=42\nclient_timeout_secs=5\nclient_retry_max_attempts=1\nmin_token_quality=10\nhealth_mode_override=default\nroute_health_mode=quote_ready\nsettlement_health_mode=strict\nquote_timeout_secs=420\nconnector_tokens=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599\ntoken_balance_slot_override=default\ntoken_allowance_slot_override=default\nroute_test={}\nsettlement_test={}\ncurl_available=true\ntycho_stream_ws_buffer_size=4096\ntycho_stream_subscription_buffer_size=4096\ntest_manifest={}\n",
+            "ready=false\nfynd_repo_root={}\nfynd_repo_exists=true\nfynd_test_exists=true\nroute_test_exists=true\nsettlement_test_exists=true\nlive_test_mapping_ready=true\ntycho_url={}\ntycho_health=unreachable\ntycho_protocols_ready=unreachable\nprotocol_v2_ready=unknown\nprotocol_v3_ready=unknown\ntycho_filtered_tokens_ready=unreachable\ntycho_filtered_tokens_total=unreachable\ntycho_connector_tokens_ready=unreachable\ntycho_connector_tokens_total=unreachable\nchain=ethereum\nrpc_url={}\nrust_log={}\nhealth_timeout_secs=300\ntraded_n_days_ago=42\nclient_timeout_secs=5\nclient_retry_max_attempts=1\nmin_token_quality=10\nhealth_mode_override=default\nroute_health_mode=quote_ready\nsettlement_health_mode=strict\nquote_timeout_secs=420\nconnector_tokens=0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599\ntoken_balance_slot_override=default\ntoken_allowance_slot_override=default\nroute_test={}\nsettlement_test={}\ncurl_available=true\ntycho_stream_ws_buffer_size=4096\ntycho_stream_subscription_buffer_size=4096\ntest_manifest={}\ntest_count={}\n",
             fynd_repo_root.display(),
             tycho_url,
             rpc_url,
@@ -10074,6 +10363,7 @@ mod recorder_tests {
             route_test,
             settlement_test,
             test_manifest.display(),
+            test_count,
         );
         assert_eq!(rendered, expected);
     }
@@ -10112,9 +10402,19 @@ mod recorder_tests {
         for test_name in
             [combined_family_fynd_route_test_name(), combined_family_fynd_settlement_test_name()]
         {
+            let fn_marker = format!("fn {test_name}(");
+            let fn_index = source.find(&fn_marker);
             assert!(
-                source.contains(&format!("fn {test_name}(")),
+                fn_index.is_some(),
                 "live gate manifest test `{test_name}` must exist in {}",
+                e2e_quote_path.display()
+            );
+            let fn_index = fn_index.expect("checked above");
+            let search_start = fn_index.saturating_sub(256);
+            let prelude = &source[search_start..fn_index];
+            assert!(
+                prelude.contains("#[ignore"),
+                "live gate manifest test `{test_name}` must remain an ignored test in {}",
                 e2e_quote_path.display()
             );
         }
@@ -10209,6 +10509,71 @@ mod recorder_tests {
         assert!(
             rendered.contains("live_test_mapping_ready=false"),
             "doctor output should expose the combined manifest-to-file mapping failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn combined_family_fynd_live_e2e_script_doctor_rejects_non_ignored_manifest_mapped_tests() {
+        let script_path = combined_family_fynd_live_e2e_script_path();
+        let temp_root = std::env::temp_dir().join(format!(
+            "combined-family-live-non-ignored-tests-{}-{}",
+            std::process::id(),
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let fake_fynd = temp_root.join("fynd");
+        std::fs::create_dir_all(fake_fynd.join("tests")).expect("create fake fynd tests dir");
+        std::fs::write(fake_fynd.join("Cargo.toml"), "[package]\nname='fynd'\nversion='0.0.0'\n")
+            .expect("write fake fynd Cargo.toml");
+        std::fs::write(
+            fake_fynd
+                .join("tests")
+                .join("e2e_quote.rs"),
+            format!(
+                "#[test]\nasync fn {}() {{}}\n\n#[test]\nasync fn {}() {{}}\n",
+                combined_family_fynd_route_test_name(),
+                combined_family_fynd_settlement_test_name()
+            ),
+        )
+        .expect("write fake fynd e2e_quote.rs with non-ignored manifest-backed tests");
+
+        let output = std::process::Command::new(&script_path)
+            .arg("doctor")
+            .env("FYND_REPO_ROOT", &fake_fynd)
+            .env("FYND_E2E_TYCHO_URL", "127.0.0.1:1")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd live E2E script doctor mode with non-ignored mapped tests at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "Fynd live E2E script doctor mode with non-ignored mapped tests should still emit diagnostics, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("Fynd live E2E non-ignored-mapped-tests doctor mode should emit utf8");
+        assert!(
+            rendered.contains("ready=false"),
+            "doctor output should mark the live gate unready when manifest-backed tests are not ignored"
+        );
+        assert!(
+            rendered.contains("route_test_exists=false"),
+            "doctor output should reject route tests that exist but are not ignored"
+        );
+        assert!(
+            rendered.contains("settlement_test_exists=false"),
+            "doctor output should reject settlement tests that exist but are not ignored"
+        );
+        assert!(
+            rendered.contains("live_test_mapping_ready=false"),
+            "doctor output should surface the ignored-test contract failure"
         );
 
         let _ = std::fs::remove_dir_all(&temp_root);
@@ -10438,6 +10803,39 @@ mod recorder_tests {
     }
 
     #[test]
+    fn combined_family_fynd_live_e2e_script_rejects_duplicate_manifest_selections() {
+        let script_path = combined_family_fynd_live_e2e_script_path();
+        let custom_manifest = write_temp_combined_family_live_gate_manifest_body_for_tests(
+            "combined-family-live-gate-duplicate-selection",
+            "route first_route_test\nroute second_route_test\nsettlement settlement_test_name\n",
+        );
+
+        let output = std::process::Command::new(&script_path)
+            .arg("list")
+            .env("TYCHO_COMBINED_FAMILY_LIVE_TEST_MANIFEST", &custom_manifest)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd live E2E script duplicate manifest failure at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            !output.status.success(),
+            "Fynd live E2E script should reject duplicate route/settlement manifest selections"
+        );
+
+        let stderr = String::from_utf8(output.stderr)
+            .expect("duplicate live gate manifest failure should emit utf8 stderr");
+        assert!(
+            stderr.contains("duplicate combined-family live gate selection in manifest: route"),
+            "duplicate manifest failure should name the duplicated selection, got: {stderr}"
+        );
+
+        let _ = std::fs::remove_file(custom_manifest);
+    }
+
+    #[test]
     fn combined_family_fynd_live_e2e_script_strict_doctor_fails_when_tycho_is_unreachable() {
         let script_path = combined_family_fynd_live_e2e_script_path();
         let output = std::process::Command::new(&script_path)
@@ -10531,12 +10929,15 @@ mod recorder_tests {
             "script should keep documenting quote-ready health mode for the route gate"
         );
         assert!(
-            script.contains("Default: 3"),
+            script.contains("Default: 42"),
             "script should document the combined-family traded-n-days-ago default"
         );
-        assert!(script.contains("Default: 300"), "script should document the live quote timeout");
         assert!(
-            script.contains("Default: 100"),
+            script.contains("Default: 420"),
+            "script should document the live quote timeout"
+        );
+        assert!(
+            script.contains("Default: 10"),
             "script should document the combined-family live minimum token quality default"
         );
         assert!(
@@ -10546,6 +10947,10 @@ mod recorder_tests {
         assert!(
             script.contains("TYCHO_COMBINED_FAMILY_LIVE_TEST_MANIFEST"),
             "script should expose the manifest override surface"
+        );
+        assert!(
+            script.contains("test_count=${LIVE_TEST_COUNT}"),
+            "doctor output should expose the exact live manifest-backed test count"
         );
         assert!(
             script.contains("cargo test --test e2e_quote"),
@@ -10629,7 +11034,7 @@ mod recorder_tests {
             "extensibility gate command should honor the override manifest test name"
         );
         assert!(
-            rendered.contains("cargo test -p tycho-indexer --no-run 2>/dev/null |"),
+            rendered.contains("cargo test -p tycho-indexer --no-run 2>&1 |"),
             "extensibility gate command should resolve the current tycho-indexer test executables from the latest cargo test --no-run output"
         );
         assert!(
@@ -10659,6 +11064,44 @@ mod recorder_tests {
         assert!(
             !rendered.contains("custom_registry_detects_future_family_without_runner_changes"),
             "extensibility gate command should stop using the default manifest entries when overridden"
+        );
+
+        let _ = std::fs::remove_file(custom_manifest);
+    }
+
+    #[test]
+    fn combined_family_extensibility_gate_script_rejects_duplicate_manifest_tests() {
+        let script_path = combined_family_extensibility_gate_script_path();
+        let duplicate_test =
+            "combined_family_extensibility_contract_manifest_stays_aligned_with_source_tests";
+        let custom_manifest = write_temp_combined_family_extensibility_manifest_for_tests(
+            "combined-family-extensibility-duplicate",
+            &[
+                ("crates/tycho-indexer/src/main.rs", duplicate_test),
+                ("crates/tycho-indexer/src/main.rs", duplicate_test),
+            ],
+        );
+
+        let output = std::process::Command::new(&script_path)
+            .arg("list")
+            .env("TYCHO_COMBINED_FAMILY_EXTENSIBILITY_TEST_MANIFEST", &custom_manifest)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected extensibility gate duplicate manifest failure at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            !output.status.success(),
+            "extensibility gate script should reject duplicate manifest tests"
+        );
+
+        let stderr = String::from_utf8(output.stderr)
+            .expect("extensibility duplicate manifest failure should emit utf8 stderr");
+        assert!(
+            stderr.contains("duplicate combined-family extensibility contract manifest test"),
+            "duplicate extensibility manifest failure should be explicit, got: {stderr}"
         );
 
         let _ = std::fs::remove_file(custom_manifest);
@@ -10695,17 +11138,36 @@ mod recorder_tests {
 
         let fynd_repo_root = combined_family_fynd_repo_root();
         for (package_name, test_name) in manifest_entries {
-            let source_path = match package_name.as_str() {
-                "fynd-rpc" => fynd_repo_root.join("fynd-rpc").join("src").join("api").join("handlers.rs"),
-                "fynd-core" => fynd_repo_root.join("fynd-core").join("src").join("feed").join("tycho_feed.rs"),
+            let source_paths = match package_name.as_str() {
+                "fynd-rpc" => vec![
+                    fynd_repo_root
+                        .join("fynd-rpc")
+                        .join("src")
+                        .join("api")
+                        .join("handlers.rs"),
+                ],
+                "fynd-core" => vec![
+                    fynd_repo_root
+                        .join("fynd-core")
+                        .join("src")
+                        .join("feed")
+                        .join("tycho_feed.rs"),
+                    fynd_repo_root
+                        .join("fynd-core")
+                        .join("tests")
+                        .join("integration")
+                        .join("solution_tests.rs"),
+                ],
                 other => panic!("unexpected Fynd replay package in manifest: {other}"),
             };
-            let source = std::fs::read_to_string(&source_path).unwrap_or_else(|err| {
-                panic!("read Fynd replay source file {}: {err}", source_path.display())
-            });
             let test_patterns = [format!("fn {test_name}("), format!("async fn {test_name}(")];
             assert!(
-                test_patterns.iter().any(|pattern| source.contains(pattern)),
+                source_paths.iter().any(|source_path| {
+                    let source = std::fs::read_to_string(source_path).unwrap_or_else(|err| {
+                        panic!("read Fynd replay source file {}: {err}", source_path.display())
+                    });
+                    test_patterns.iter().any(|pattern| source.contains(pattern))
+                }),
                 "combined-family Fynd replay manifest references missing test `{test_name}` for package `{package_name}`"
             );
         }
@@ -10732,6 +11194,18 @@ mod recorder_tests {
                 combined_family_fynd_replay_feed_sync_test().to_string()
             )),
             "combined-family Fynd replay manifest must keep the feed sync-state test that proves Fynd continues to track separate v2/v3 branch readiness and component admission over the shared family stream"
+        );
+    }
+
+    #[test]
+    fn combined_family_fynd_replay_gate_manifest_keeps_dynamic_admission_routing_coverage() {
+        let manifest_entries = combined_family_fynd_replay_gate_entries();
+        assert!(
+            manifest_entries.contains(&(
+                "fynd-core".to_string(),
+                combined_family_fynd_replay_dynamic_admission_test().to_string()
+            )),
+            "combined-family Fynd replay manifest must keep the dynamic-admission routing replay test that proves a pool admitted after the seeded combined-family universe can become the preferred quoted route"
         );
     }
 
@@ -10802,6 +11276,10 @@ mod recorder_tests {
             "Fynd replay gate command should resolve test binaries per package"
         );
         assert!(
+            rendered.contains("export CARGO_TARGET_DIR="),
+            "Fynd replay gate command should allow a target-dir override for low-disk-space runs"
+        );
+        assert!(
             rendered.contains("TEST_BINARY_BY_ENTRY[\"${package_name}:${test_name}\"]"),
             "Fynd replay gate command should map package+test entries to resolved executables"
         );
@@ -10818,6 +11296,40 @@ mod recorder_tests {
     }
 
     #[test]
+    fn combined_family_fynd_replay_gate_script_rejects_duplicate_manifest_entries() {
+        let script_path = combined_family_fynd_replay_gate_script_path();
+        let duplicate_test = combined_family_fynd_replay_feed_sync_test();
+        let custom_manifest = write_temp_combined_family_fynd_replay_manifest_for_tests(
+            "combined-family-fynd-replay-duplicate",
+            &[("fynd-core", duplicate_test), ("fynd-core", duplicate_test)],
+        );
+
+        let output = std::process::Command::new(&script_path)
+            .arg("list")
+            .env("TYCHO_COMBINED_FAMILY_FYND_REPLAY_TEST_MANIFEST", &custom_manifest)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected Fynd replay gate duplicate manifest failure at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            !output.status.success(),
+            "Fynd replay gate script should reject duplicate manifest entries"
+        );
+
+        let stderr = String::from_utf8(output.stderr)
+            .expect("Fynd replay duplicate manifest failure should emit utf8 stderr");
+        assert!(
+            stderr.contains("duplicate combined-family Fynd replay gate manifest entry"),
+            "duplicate Fynd replay manifest failure should be explicit, got: {stderr}"
+        );
+
+        let _ = std::fs::remove_file(custom_manifest);
+    }
+
+    #[test]
     fn combined_family_fynd_replay_gate_script_doctor_reports_expected_diagnostics() {
         let script_path = combined_family_fynd_replay_gate_script_path();
         let fynd_repo_root = combined_family_fynd_repo_root();
@@ -10825,6 +11337,7 @@ mod recorder_tests {
         let output = std::process::Command::new(&script_path)
             .arg("doctor")
             .env("FYND_REPO_ROOT", &fynd_repo_root)
+            .env("FYND_REPLAY_CARGO_TARGET_DIR", "/tmp/fynd-replay-gate-target")
             .output()
             .unwrap_or_else(|err| {
                 panic!(
@@ -10841,7 +11354,7 @@ mod recorder_tests {
         let rendered = String::from_utf8(output.stdout)
             .expect("Fynd replay gate script doctor mode should emit utf8 diagnostics");
         let expected = format!(
-            "ready=true\nfynd_repo_root={}\nfynd_repo_exists=true\ntest_manifest={}\ntest_count=2\ncargo_state=available\n",
+            "ready=true\nfynd_repo_root={}\nfynd_repo_exists=true\ntest_manifest={}\ntest_count=3\ncargo_state=available\ncargo_target_dir=/tmp/fynd-replay-gate-target\n",
             fynd_repo_root.display(),
             test_manifest.display(),
         );
@@ -10864,6 +11377,10 @@ mod recorder_tests {
             "script should expose the Fynd replay manifest override surface"
         );
         assert!(
+            script.contains("FYND_REPLAY_CARGO_TARGET_DIR"),
+            "script should expose the replay-gate cargo-target-dir override surface"
+        );
+        assert!(
             script.contains("cargo test -p \"${package_name}\" --no-run 2>&1"),
             "script should resolve replay tests through package-scoped cargo test binaries"
         );
@@ -10872,6 +11389,14 @@ mod recorder_tests {
     #[test]
     fn combined_family_validation_script_doctor_reports_expected_diagnostics() {
         let script_path = combined_family_validation_script_path();
+        let extensibility_manifest = combined_family_extensibility_contract_manifest_path();
+        let extensibility_count = combined_family_extensibility_contract_entries().len();
+        let fynd_replay_manifest = combined_family_fynd_replay_gate_manifest_path();
+        let fynd_replay_count = combined_family_fynd_replay_gate_entries().len();
+        let repo_manifest = combined_family_db_gate_manifest_path();
+        let repo_count = combined_family_db_gate_tests().len();
+        let live_manifest = combined_family_live_gate_manifest_path();
+        let live_count = combined_family_live_gate_tests().len();
         let output = std::process::Command::new(&script_path)
             .arg("doctor")
             .env(
@@ -10932,8 +11457,50 @@ mod recorder_tests {
             "doctor output should report managed live readiness separately"
         );
         assert!(
+            rendered.contains("acceptance_managed_ready=false"),
+            "doctor output should report acceptance-managed readiness separately"
+        );
+        assert!(
             rendered.contains("managed_full_ready=false"),
             "doctor output should report managed full readiness separately"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "extensibility_test_manifest={}",
+                extensibility_manifest.display()
+            )),
+            "doctor output should include the extensibility manifest path"
+        );
+        assert!(
+            rendered.contains(&format!("extensibility_test_count={extensibility_count}")),
+            "doctor output should include the extensibility manifest-backed test count"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "fynd_replay_test_manifest={}",
+                fynd_replay_manifest.display()
+            )),
+            "doctor output should include the Fynd replay manifest path"
+        );
+        assert!(
+            rendered.contains(&format!("fynd_replay_test_count={fynd_replay_count}")),
+            "doctor output should include the Fynd replay manifest-backed test count"
+        );
+        assert!(
+            rendered.contains(&format!("repo_test_manifest={}", repo_manifest.display())),
+            "doctor output should include the repo DB manifest path"
+        );
+        assert!(
+            rendered.contains(&format!("repo_test_count={repo_count}")),
+            "doctor output should include the repo DB manifest-backed test count"
+        );
+        assert!(
+            rendered.contains(&format!("live_test_manifest={}", live_manifest.display())),
+            "doctor output should include the live manifest path"
+        );
+        assert!(
+            rendered.contains(&format!("live_test_count={live_count}")),
+            "doctor output should include the live manifest-backed test count"
         );
         assert!(
             rendered.contains("extensibility_gate_script="),
@@ -10990,6 +11557,10 @@ mod recorder_tests {
         assert!(
             rendered.contains("managed_live_run_command="),
             "doctor output should include the managed live run command"
+        );
+        assert!(
+            rendered.contains("acceptance_managed_run_command="),
+            "doctor output should include the acceptance-managed run command"
         );
         assert!(
             rendered.contains("operator_run_command=cd "),
@@ -11262,6 +11833,18 @@ mod recorder_tests {
             "full mode should execute the extensibility gate through the manifest-backed executable index"
         );
         assert!(
+            rendered.contains(combined_family_fynd_replay_quote_test()),
+            "full mode should include the repo-local Fynd quote replay contract gate before live validation"
+        );
+        assert!(
+            rendered.contains(combined_family_fynd_replay_feed_sync_test()),
+            "full mode should include the repo-local Fynd feed sync contract gate before live validation"
+        );
+        assert!(
+            rendered.contains("\"${TEST_BINARY_BY_ENTRY[${entry_key}]}\" \"${TEST_FULL_NAME_BY_ENTRY[${entry_key}]}\" --exact --nocapture"),
+            "full mode should execute the Fynd replay gate through its manifest-backed executable-index loop"
+        );
+        assert!(
             rendered.contains("export DATABASE_URL='postgres://example:secret@127.0.0.1:5888/combined_family_validation_full_gate'"),
             "full mode should include the isolated DB gate database URL"
         );
@@ -11353,6 +11936,31 @@ mod recorder_tests {
             "managed live command should render the script's canonical managed entrypoint"
         );
 
+        let acceptance_managed_output = std::process::Command::new(&script_path)
+            .arg("command")
+            .arg("acceptance-managed")
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected combined-family validation script acceptance-managed command mode at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            acceptance_managed_output.status.success(),
+            "combined-family validation script acceptance-managed command mode should succeed, got {:?}",
+            acceptance_managed_output.status.code()
+        );
+        let acceptance_managed_rendered = String::from_utf8(acceptance_managed_output.stdout)
+            .expect(
+                "combined-family validation script acceptance-managed command should emit utf8",
+            );
+        assert_eq!(
+            acceptance_managed_rendered.trim(),
+            format!("{} run-acceptance-managed", script_path.display()),
+            "acceptance-managed command should render the script's explicit managed acceptance entrypoint"
+        );
+
         let full_output = std::process::Command::new(&script_path)
             .arg("command")
             .arg("full-managed")
@@ -11373,7 +11981,7 @@ mod recorder_tests {
         assert_eq!(
             full_rendered.trim(),
             format!("{} run-full-managed", script_path.display()),
-            "managed full command should render the script's canonical managed entrypoint"
+            "managed full command should remain the compatibility alias entrypoint"
         );
     }
 
@@ -11395,6 +12003,20 @@ mod recorder_tests {
         std::fs::create_dir_all(&fake_fynd).expect("create fake fynd dir");
         std::fs::write(fake_fynd.join("Cargo.toml"), "[package]\nname='fynd'\nversion='0.0.0'\n")
             .expect("write fake fynd Cargo.toml");
+        std::fs::create_dir_all(fake_fynd.join("fynd-rpc").join("src").join("api"))
+            .expect("create fake fynd-rpc api dir");
+        std::fs::create_dir_all(fake_fynd.join("fynd-core").join("src").join("feed"))
+            .expect("create fake fynd-core feed dir");
+        std::fs::write(
+            fake_fynd.join("fynd-rpc").join("src").join("api").join("handlers.rs"),
+            format!("fn {}() {{}}\n", combined_family_fynd_replay_quote_test()),
+        )
+        .expect("write fake fynd-rpc replay source");
+        std::fs::write(
+            fake_fynd.join("fynd-core").join("src").join("feed").join("tycho_feed.rs"),
+            format!("async fn {}() {{}}\n", combined_family_fynd_replay_feed_sync_test()),
+        )
+        .expect("write fake fynd-core replay source");
 
         let write_fake_exec = |name: &str, body: &str| {
             let path = fake_bin.join(name);
@@ -11475,6 +12097,10 @@ mod recorder_tests {
             "managed live readiness must still require the Fynd live prerequisites, not just operator readiness"
         );
         assert!(
+            rendered.contains("acceptance_managed_ready=false"),
+            "acceptance-managed readiness must stay false when managed live prerequisites are missing"
+        );
+        assert!(
             rendered.contains("managed_full_ready=false"),
             "managed full readiness must stay false when managed live prerequisites are missing"
         );
@@ -11502,6 +12128,10 @@ mod recorder_tests {
         std::fs::write(fake_fynd.join("Cargo.toml"), "[package]\nname='fynd'\nversion='0.0.0'\n")
             .expect("write fake fynd Cargo.toml");
         std::fs::create_dir_all(fake_fynd.join("tests")).expect("create fake fynd tests dir");
+        std::fs::create_dir_all(fake_fynd.join("fynd-rpc").join("src").join("api"))
+            .expect("create fake fynd-rpc api dir");
+        std::fs::create_dir_all(fake_fynd.join("fynd-core").join("src").join("feed"))
+            .expect("create fake fynd-core feed dir");
         std::fs::write(
             fake_fynd
                 .join("tests")
@@ -11513,6 +12143,16 @@ mod recorder_tests {
             ),
         )
         .expect("write fake fynd e2e_quote.rs");
+        std::fs::write(
+            fake_fynd.join("fynd-rpc").join("src").join("api").join("handlers.rs"),
+            format!("fn {}() {{}}\n", combined_family_fynd_replay_quote_test()),
+        )
+        .expect("write fake fynd-rpc replay source");
+        std::fs::write(
+            fake_fynd.join("fynd-core").join("src").join("feed").join("tycho_feed.rs"),
+            format!("async fn {}() {{}}\n", combined_family_fynd_replay_feed_sync_test()),
+        )
+        .expect("write fake fynd-core replay source");
 
         let write_fake_exec = |name: &str, body: &str| {
             let path = fake_bin.join(name);
@@ -11601,6 +12241,10 @@ exit 0\n",
         assert!(
             rendered.contains("managed_live_ready=true"),
             "managed live readiness should become true once operator and live prerequisites are both ready"
+        );
+        assert!(
+            rendered.contains("acceptance_managed_ready=true"),
+            "acceptance-managed readiness should become true once acceptance and managed live readiness are both true"
         );
         assert!(
             rendered.contains("managed_full_ready=true"),
@@ -11803,6 +12447,10 @@ exit 0\n",
             "strict doctor output should still report managed live readiness"
         );
         assert!(
+            rendered.contains("acceptance_managed_ready=false"),
+            "strict doctor output should still report acceptance-managed readiness"
+        );
+        assert!(
             rendered.contains("managed_full_ready=false"),
             "strict doctor output should still report managed full readiness"
         );
@@ -11820,10 +12468,14 @@ exit 0\n",
 
         assert!(script.contains("doctor [--strict]"), "script should advertise the doctor mode");
         assert!(
-            script.contains("command [acceptance|repo|live|live-managed|full|full-managed|all]"),
+            script.contains("command [acceptance|acceptance-managed|repo|live|live-managed|full|full-managed|all]"),
             "script should advertise the command mode"
         );
         assert!(script.contains("run-acceptance"), "script should advertise acceptance execution");
+        assert!(
+            script.contains("run-acceptance-managed"),
+            "script should advertise acceptance-managed execution"
+        );
         assert!(script.contains("run-repo"), "script should advertise repo execution");
         assert!(script.contains("run-live"), "script should advertise live execution");
         assert!(
@@ -11942,6 +12594,46 @@ exit 0\n",
             script.contains("TYCHO_COMBINED_FAMILY_MANAGED_INDEXER_LOG"),
             "script should expose the managed indexer log override"
         );
+        assert!(
+            script.contains("acceptance_managed_ready=${acceptance_managed_ready}"),
+            "doctor output should expose acceptance-managed readiness"
+        );
+        assert!(
+            script.contains("acceptance_managed_run_command=$(printf '%s run-acceptance-managed'"),
+            "doctor output should expose the acceptance-managed run command"
+        );
+        assert!(
+            script.contains("extensibility_test_manifest=${extensibility_test_manifest}"),
+            "doctor output should expose the extensibility manifest path"
+        );
+        assert!(
+            script.contains("extensibility_test_count=${extensibility_test_count}"),
+            "doctor output should expose the extensibility manifest-backed test count"
+        );
+        assert!(
+            script.contains("fynd_replay_test_manifest=${fynd_replay_test_manifest}"),
+            "doctor output should expose the Fynd replay manifest path"
+        );
+        assert!(
+            script.contains("fynd_replay_test_count=${fynd_replay_test_count}"),
+            "doctor output should expose the Fynd replay manifest-backed test count"
+        );
+        assert!(
+            script.contains("repo_test_manifest=${repo_test_manifest}"),
+            "doctor output should expose the repo DB manifest path"
+        );
+        assert!(
+            script.contains("repo_test_count=${repo_test_count}"),
+            "doctor output should expose the repo DB manifest-backed test count"
+        );
+        assert!(
+            script.contains("live_test_manifest=${live_test_manifest}"),
+            "doctor output should expose the live manifest path"
+        );
+        assert!(
+            script.contains("live_test_count=${live_test_count}"),
+            "doctor output should expose the live manifest-backed test count"
+        );
     }
 
     #[test]
@@ -11962,9 +12654,15 @@ exit 0\n",
         );
         assert!(
             script.contains(
-                "run-full-managed Execute the repo-local extensibility contract gate, the repo-local Fynd replay"
+                "run-acceptance-managed Execute the repo-local extensibility contract gate, the repo-local Fynd replay"
             ),
-            "usage text should describe run-full-managed as acceptance plus managed live"
+            "usage text should describe run-acceptance-managed as acceptance plus managed live"
+        );
+        assert!(
+            script.contains(
+                "run-full-managed Compatibility alias for `run-acceptance-managed`."
+            ),
+            "usage text should describe run-full-managed as the compatibility alias"
         );
         assert!(
             script
@@ -11988,12 +12686,20 @@ exit 0\n",
             "script should keep run-full wired to acceptance plus live"
         );
         assert!(
+            script.contains("run_acceptance_managed() {\n  run_acceptance\n  run_live_managed\n}"),
+            "script should keep run-acceptance-managed wired to acceptance plus managed live"
+        );
+        assert!(
             script.contains("run_all() {\n  run_repo\n  run_live\n}"),
             "script should keep run-all as the narrower repo-plus-live flow instead of aliasing run-full"
         );
         assert!(
             !script.contains("run_all() {\n  run_full\n}"),
             "script should not let run-all silently widen to the full acceptance-plus-live surface"
+        );
+        assert!(
+            script.contains("run-full-managed)\n    run_acceptance_managed"),
+            "run-full-managed should remain a compatibility alias to run-acceptance-managed"
         );
     }
 
@@ -12039,6 +12745,16 @@ exit 0\n",
         assert!(
             rendered.contains("extractors_config_state=present"),
             "doctor output should confirm the canonical combined-family config is present"
+        );
+        assert!(
+            rendered.contains("extractors_config_contract_state=canonical"),
+            "doctor output should confirm the canonical combined-family config contract"
+        );
+        assert!(
+            rendered.contains(
+                "canonical_extractors_config=crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml"
+            ),
+            "doctor output should report the canonical combined-family config path"
         );
         assert!(
             rendered.contains("database_url=postgres://example:secret@127.0.0.1:1/combined_family_indexer_doctor_db"),
@@ -12177,6 +12893,49 @@ exit 0\n",
     }
 
     #[test]
+    fn combined_family_indexer_run_script_rejects_noncanonical_extractor_config_override() {
+        let script_path = combined_family_indexer_run_script_path();
+        let output = std::process::Command::new(&script_path)
+            .arg("doctor")
+            .env_remove("SUBSTREAMS_API_TOKEN")
+            .env(
+                "TYCHO_INDEXER_DATABASE_URL",
+                "postgres://example:secret@127.0.0.1:1/combined_family_indexer_override_db",
+            )
+            .env(
+                "TYCHO_INDEXER_EXTRACTORS_CONFIG",
+                "crates/tycho-indexer/extractors.ethereum.yaml",
+            )
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected combined-family indexer run script doctor mode with config override at {}: {err}",
+                    script_path.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "combined-family indexer run script doctor mode should still emit diagnostics, got {:?}",
+            output.status.code()
+        );
+
+        let rendered = String::from_utf8(output.stdout)
+            .expect("combined-family indexer run script doctor mode should emit utf8 diagnostics");
+        assert!(
+            rendered.contains("ready=false"),
+            "doctor output should reject noncanonical extractor config overrides"
+        );
+        assert!(
+            rendered.contains("extractors_config=crates/tycho-indexer/extractors.ethereum.yaml"),
+            "doctor output should report the overridden extractor config"
+        );
+        assert!(
+            rendered.contains("extractors_config_contract_state=noncanonical"),
+            "doctor output should explain that the override breaks the canonical combined-family contract"
+        );
+    }
+
+    #[test]
     fn combined_family_indexer_run_script_strict_doctor_fails_when_token_is_missing() {
         let script_path = combined_family_indexer_run_script_path();
         let output = std::process::Command::new(&script_path)
@@ -12241,6 +13000,10 @@ exit 0\n",
         assert!(
             script.contains("extractors.uniswap_v2_v3.combined.yaml"),
             "script should pin the canonical combined-family extractor config"
+        );
+        assert!(
+            script.contains("extractors_config_contract_state"),
+            "script should surface whether the effective extractor config stays on the canonical combined-family contract"
         );
         assert!(
             script.contains("cargo run --bin tycho-indexer --"),

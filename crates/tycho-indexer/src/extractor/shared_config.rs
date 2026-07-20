@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::extractor::{
-    family_registry::{default_family_runtime_registry, FamilyRuntimeRegistry},
+    family_registry::FamilyRuntimeRegistry,
     family_runtime_metadata::canonicalize_shared_route_protocol,
 };
 
@@ -81,17 +81,6 @@ pub fn parse_substreams_params_yaml_with_registry(
     Ok((start_block, substreams_params.join("&")))
 }
 
-pub fn parse_substreams_params_yaml(
-    protocol_system: &str,
-    contents: &str,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    parse_substreams_params_yaml_with_registry(
-        protocol_system,
-        contents,
-        default_family_runtime_registry(),
-    )
-}
-
 pub fn parse_bootstrap_params_yaml_with_filter_and_registry(
     route_protocol_filter: Option<&str>,
     contents: &str,
@@ -130,17 +119,6 @@ pub fn parse_bootstrap_params_yaml_with_filter_and_registry(
         Some(bootstrap_block),
         format!("bootstrap_block={bootstrap_block}&pools={}", all_pools.join(",")),
     ))
-}
-
-pub fn parse_bootstrap_params_yaml(
-    route_protocol_filter: Option<&str>,
-    contents: &str,
-) -> Result<(Option<i64>, String), Box<dyn std::error::Error>> {
-    parse_bootstrap_params_yaml_with_filter_and_registry(
-        route_protocol_filter,
-        contents,
-        default_family_runtime_registry(),
-    )
 }
 
 pub fn resolve_substreams_params_map(

@@ -1,6 +1,3 @@
-#[cfg(test)]
-use std::any::Any;
-
 use tokio::task::JoinHandle;
 
 use crate::extractor::ExtractionError;
@@ -14,92 +11,33 @@ pub enum ManagedRunnerKind {
     Family,
 }
 
-pub(crate) trait ManagedRuntime: Send {
-    fn run(self: Box<Self>) -> JoinHandle<Result<(), ExtractionError>>;
-
-    #[allow(dead_code)]
-    fn kind(&self) -> ManagedRunnerKind;
-
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn Any;
-
-    #[cfg(test)]
-    fn into_any(self: Box<Self>) -> Box<dyn Any>;
-}
-
-impl ManagedRuntime for ExtractorRunner {
-    fn run(self: Box<Self>) -> JoinHandle<Result<(), ExtractionError>> {
-        (*self).run()
-    }
-
-    fn kind(&self) -> ManagedRunnerKind {
-        ManagedRunnerKind::Single
-    }
-
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    #[cfg(test)]
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
-}
-
-impl ManagedRuntime for FamilyExtractorRunner {
-    fn run(self: Box<Self>) -> JoinHandle<Result<(), ExtractionError>> {
-        (*self).run()
-    }
-
-    fn kind(&self) -> ManagedRunnerKind {
-        ManagedRunnerKind::Family
-    }
-
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    #[cfg(test)]
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
-}
-
-pub struct ManagedRunner {
-    runner: Box<dyn ManagedRuntime>,
+pub enum ManagedRunner {
+    Single(ExtractorRunner),
+    Family(FamilyExtractorRunner),
 }
 
 impl ManagedRunner {
-    pub(crate) fn new<T>(runner: T) -> Self
-    where
-        T: ManagedRuntime + 'static,
-    {
-        Self { runner: Box::new(runner) }
+    pub(crate) fn new_single(runner: ExtractorRunner) -> Self {
+        Self::Single(runner)
+    }
+
+    pub(crate) fn new_family(runner: FamilyExtractorRunner) -> Self {
+        Self::Family(runner)
     }
 
     pub fn run(self) -> JoinHandle<Result<(), ExtractionError>> {
-        self.runner.run()
+        match self {
+            Self::Single(runner) => runner.run(),
+            Self::Family(runner) => runner.run(),
+        }
     }
 
     #[allow(dead_code)]
     pub fn kind(&self) -> ManagedRunnerKind {
-        self.runner.kind()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.runner.as_any().downcast_ref::<T>()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_typed<T: 'static>(self) -> T {
-        *self
-            .runner
-            .into_any()
-            .downcast::<T>()
-            .expect("managed runner should contain the requested concrete runtime type")
+        match self {
+            Self::Single(_) => ManagedRunnerKind::Single,
+            Self::Family(_) => ManagedRunnerKind::Family,
+        }
     }
 }
 
@@ -117,14 +55,13 @@ mod test {
             extractor_config::{
                 BootstrapConfig, BootstrapStrategy, DCIType, ExtractorConfig, ProtocolTypeConfig,
             },
-            family_bootstrap_registry::ResolvedSharedBootstrapBranchRuntime,
+            family_registry::default_family_runtime_registry,
             family_dispatch::{FamilyBlockChangesDispatcher, FamilyBranchSpec},
             family_lifecycle::{
                 apply_family_bootstrap_plan, family_bootstrap_already_completed,
                 resolve_family_stream_position, run_family_bootstrap_if_needed,
                 ResolvedFamilyStreamPosition,
             },
-            family_managed_startup::PreparedFamilyRunnerStartup,
             family_runner_wiring::{
                 extractors_by_protocol_system, FamilyBranchRuntimeWiring,
                 FamilyBranchSubscriptionIndex,
@@ -299,6 +236,9 @@ dci_plugin:
             .expect_get_completed_bootstrap_block()
             .returning(|| Ok(None));
         mock_extractor
+            .expect_supports_persisted_state_scope()
+            .return_const(false);
+        mock_extractor
             .expect_flush()
             .returning(|| Ok(()));
         mock_extractor
@@ -361,6 +301,9 @@ dci_plugin:
         mock_extractor
             .expect_get_completed_bootstrap_block()
             .returning(|| Ok(None));
+        mock_extractor
+            .expect_supports_persisted_state_scope()
+            .return_const(false);
         mock_extractor
             .expect_flush()
             .returning(|| Ok(()));
@@ -439,6 +382,9 @@ dci_plugin:
             .expect_get_completed_bootstrap_block()
             .returning(|| Ok(None));
         mock_extractor
+            .expect_supports_persisted_state_scope()
+            .return_const(false);
+        mock_extractor
             .expect_flush()
             .returning(|| Ok(()));
         mock_extractor
@@ -500,6 +446,9 @@ dci_plugin:
             .expect_get_completed_bootstrap_block()
             .returning(|| Ok(Some(42)));
         mock_extractor
+            .expect_supports_persisted_state_scope()
+            .return_const(false);
+        mock_extractor
             .expect_flush()
             .returning(|| Ok(()));
         mock_extractor
@@ -509,6 +458,7 @@ dci_plugin:
         let extractor = Arc::new(mock_extractor);
         let config = ExtractorConfig {
             name: "uniswap_v3".to_owned(),
+            protocol_system: "uniswap_v3".to_owned(),
             implementation_type: ImplementationType::Custom,
             protocol_types: vec![ProtocolTypeConfig {
                 name: "uniswap_v3_pool".to_owned(),
@@ -577,6 +527,8 @@ dci_plugin:
     fn test_validate_bootstrap_config_accepts_matching_runtime_blocks() {
         let config = ExtractorConfig {
             name: "uniswap_v3".to_owned(),
+            protocol_system: "uniswap_v3".to_owned(),
+            chain: Chain::Ethereum,
             start_block: 42,
             ..Default::default()
         };
@@ -586,7 +538,11 @@ dci_plugin:
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         };
 
-        let plan = SharedBootstrapPlan::for_extractor_config(&config, &bootstrap)
+        let plan = SharedBootstrapPlan::for_extractor_config_with_registry(
+            &config,
+            &bootstrap,
+            default_family_runtime_registry(),
+        )
             .expect("matching bootstrap config should validate");
 
         assert_eq!(plan.bootstrap_block, 42);
@@ -597,6 +553,8 @@ dci_plugin:
     fn test_validate_bootstrap_config_rejects_runtime_block_mismatch() {
         let config = ExtractorConfig {
             name: "uniswap_v3".to_owned(),
+            protocol_system: "uniswap_v3".to_owned(),
+            chain: Chain::Ethereum,
             start_block: 43,
             ..Default::default()
         };
@@ -606,7 +564,11 @@ dci_plugin:
             params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
         };
 
-        let err = SharedBootstrapPlan::for_extractor_config(&config, &bootstrap)
+        let err = SharedBootstrapPlan::for_extractor_config_with_registry(
+            &config,
+            &bootstrap,
+            default_family_runtime_registry(),
+        )
             .expect_err("mismatched start blocks must fail");
 
         assert!(err

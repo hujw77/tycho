@@ -6,7 +6,7 @@ use crate::extractor::Extractor;
 #[tokio::test]
 async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() {
     let plan = SharedBootstrapPlan {
-        family_name: Some("uniswap".to_string()),
+        family_name: "uniswap".to_string(),
         bootstrap_block: 42,
         branches: vec![
             crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
@@ -167,7 +167,7 @@ async fn test_apply_family_bootstrap_plan_splits_once_and_updates_each_branch() 
 #[tokio::test]
 async fn test_apply_family_bootstrap_plan_skips_completed_family() {
     let plan = SharedBootstrapPlan {
-        family_name: Some("uniswap".to_string()),
+        family_name: "uniswap".to_string(),
         bootstrap_block: 42,
         branches: vec![crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
             extractor_name: "uniswap_v2".to_string(),
@@ -239,7 +239,7 @@ async fn test_apply_family_bootstrap_plan_skips_completed_family() {
 #[tokio::test]
 async fn test_apply_family_bootstrap_plan_rejects_missing_branch_extractor() {
     let plan = SharedBootstrapPlan {
-        family_name: Some("uniswap".to_string()),
+        family_name: "uniswap".to_string(),
         bootstrap_block: 42,
         branches: vec![crate::extractor::shared_bootstrap::BootstrapBranchDescriptor {
             extractor_name: "uniswap_v2_alias".to_string(),

@@ -13,6 +13,7 @@ use crate::extractor::{
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ResolvedSharedFamilyStream {
+    pub shared_stream_name: String,
     pub spkg: String,
     pub module: String,
     pub extractor_id: String,
@@ -24,6 +25,7 @@ pub struct FamilySharedStreamIdentity<'a> {
     pub shared_stream_name: &'a str,
     pub extractor_id: String,
     pub durability_scope: &'a str,
+    pub shared_progress_owner_protocol_system: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +33,7 @@ pub struct FamilySharedRuntimeMetadata<'a> {
     pub output_module: &'a str,
     pub shared_stream_name: &'a str,
     pub durability_scope: &'a str,
+    pub shared_progress_owner_protocol_system: &'a str,
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -55,9 +58,22 @@ pub struct ResolvedFamilyRuntimeMetadata {
     pub family: String,
     pub shared_stream: SharedStreamTarget,
     pub durability_scope: String,
+    pub shared_progress_owner_protocol_system: String,
 }
 
 impl FamilyRuntimeConfig {
+    pub fn from_resolved_shared_stream(
+        family: impl Into<String>,
+        shared_stream: ResolvedSharedFamilyStream,
+    ) -> Self {
+        Self {
+            family: family.into(),
+            shared_spkg: Some(shared_stream.spkg),
+            shared_module: Some(shared_stream.module),
+            durability_scope: Some(shared_stream.durability_scope),
+        }
+    }
+
     pub fn shared_spkg(&self) -> Option<&str> {
         self.shared_spkg.as_deref()
     }
@@ -145,6 +161,16 @@ impl ExtractorConfig {
                         module: module.to_string(),
                     },
                     durability_scope: durability_scope.to_string(),
+                    shared_progress_owner_protocol_system: registry_metadata
+                        .map(|metadata| metadata.shared_progress_owner_protocol_system)
+                        .ok_or_else(|| {
+                            ExtractionError::Setup(format!(
+                                "extractor `{}` uses family runtime `{}` without a resolved shared_progress_owner_protocol_system",
+                                self.name(),
+                                runtime.family
+                            ))
+                        })?
+                        .to_string(),
                 }))
             }
             None => Ok(None),
@@ -155,6 +181,19 @@ impl ExtractorConfig {
         &self,
     ) -> Result<Option<ResolvedFamilyRuntimeMetadata>, ExtractionError> {
         self.resolve_family_runtime_metadata(None)
+    }
+
+    pub fn require_resolved_family_runtime_metadata_with_registry(
+        &self,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<ResolvedFamilyRuntimeMetadata, ExtractionError> {
+        self.resolve_family_runtime_metadata(Some(registry))?
+            .ok_or_else(|| {
+                ExtractionError::Setup(format!(
+                    "extractor `{}` does not declare a family runtime",
+                    self.name()
+                ))
+            })
     }
 
     pub fn with_family_runtime(mut self, family_runtime: Option<FamilyRuntimeConfig>) -> Self {
@@ -217,6 +256,7 @@ impl<'a> FamilyRuntimeRegistry<'a> {
             output_module: spec.output_module(),
             shared_stream_name: spec.shared_stream_name(),
             durability_scope: spec.durability_scope(),
+            shared_progress_owner_protocol_system: spec.shared_progress_owner_protocol_system(),
         })
     }
 
@@ -253,6 +293,14 @@ impl<'a> FamilyRuntimeRegistry<'a> {
             .map(|metadata| metadata.durability_scope)
     }
 
+    pub fn shared_progress_owner_protocol_system_for_family(
+        &self,
+        family_name: &str,
+    ) -> Option<&'a str> {
+        self.shared_runtime_metadata_for_family(family_name)
+            .map(|metadata| metadata.shared_progress_owner_protocol_system)
+    }
+
     pub fn require_shared_runtime_metadata_for_family(
         &self,
         family_name: &str,
@@ -277,6 +325,7 @@ impl<'a> FamilyRuntimeRegistry<'a> {
             shared_stream_name: metadata.shared_stream_name,
             extractor_id: format!("{chain}:{}", metadata.shared_stream_name),
             durability_scope: metadata.durability_scope,
+            shared_progress_owner_protocol_system: metadata.shared_progress_owner_protocol_system,
         })
     }
 
@@ -291,6 +340,7 @@ impl<'a> FamilyRuntimeRegistry<'a> {
             .shared_stream_identity_for_family(chain, family_name)
             .expect("required family spec must expose shared stream identity");
         Ok(ResolvedSharedFamilyStream {
+            shared_stream_name: identity.shared_stream_name.to_string(),
             spkg: shared_spkg.into(),
             module: identity.output_module.to_string(),
             extractor_id: identity.extractor_id,
@@ -549,16 +599,17 @@ impl<'a> FamilyRuntimeRegistry<'a> {
 mod tests {
     use std::{collections::HashSet, future::Future, pin::Pin};
 
-    use tycho_common::models::Chain;
+    use tycho_common::models::{Chain, ImplementationType};
     use tycho_ethereum::rpc::EthereumRpcClient;
+    use tycho_indexer::canonical_shared_family_runtime_spec_with_explicit_owner;
 
     use super::*;
     use crate::extractor::{
         family_bootstrap_registry::SharedBootstrapParamsParser,
         family_registry::{
-            canonical_shared_family_runtime_spec, default_family_runtime_registry,
+            default_family_runtime_registry,
             shared_family_member_spec, shared_family_member_with_bootstrap,
-            shared_family_runtime_spec, FamilyRuntimeRegistry, FamilyRuntimeSpec,
+            FamilyRuntimeRegistry, FamilyRuntimeSpec,
         },
         models::BlockChanges,
         protocol_message_registry::{
@@ -589,6 +640,35 @@ mod tests {
         default_family_runtime_registry()
             .resolved_shared_stream_for_family(Chain::Ethereum, "uniswap", shared_spkg)
             .expect("registered uniswap shared stream")
+    }
+
+    fn resolved_uniswap_family_runtime_config(shared_spkg: &str) -> FamilyRuntimeConfig {
+        FamilyRuntimeConfig::from_resolved_shared_stream("uniswap", uniswap_shared_stream(shared_spkg))
+    }
+
+    fn extractor_config_with_family_runtime(
+        protocol_system: &str,
+        family_runtime: FamilyRuntimeConfig,
+    ) -> ExtractorConfig {
+        ExtractorConfig::new(
+            protocol_system.to_string(),
+            Chain::Ethereum,
+            ImplementationType::Vm,
+            1,
+            0,
+            None,
+            Vec::new(),
+            "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg".to_string(),
+            "family::uniswap_runtime".to_string(),
+            Vec::new(),
+            0,
+            None,
+            None,
+            Default::default(),
+            None,
+        )
+        .with_protocol_system(protocol_system)
+        .with_family_runtime(Some(family_runtime))
     }
 
     #[test]
@@ -666,7 +746,12 @@ mod tests {
         const OTHER_MEMBER: FamilyMemberSpec = shared_family_member_spec("other_v1", &[], None);
         const OTHER_MEMBERS: &[FamilyMemberSpec] = &[OTHER_MEMBER];
         const OTHER_FAMILY: FamilyRuntimeSpec =
-            canonical_shared_family_runtime_spec!("other_swap", OTHER_MEMBERS, None);
+            canonical_shared_family_runtime_spec_with_explicit_owner!(
+                "other_swap",
+                OTHER_MEMBERS,
+                None,
+                "other_v1",
+            );
         let mut specs = default_family_runtime_registry()
             .specs()
             .to_vec();
@@ -719,6 +804,7 @@ mod tests {
         assert_eq!(metadata.output_module, expected_shared_stream.module);
         assert_eq!(metadata.shared_stream_name, "uniswap_family");
         assert_eq!(metadata.durability_scope, expected_shared_stream.durability_scope);
+        assert_eq!(metadata.shared_progress_owner_protocol_system, "uniswap_v2");
         assert_eq!(registry.shared_runtime_metadata_for_family("curve"), None);
     }
 
@@ -734,6 +820,7 @@ mod tests {
         assert_eq!(metadata.output_module, expected_shared_stream.module);
         assert_eq!(metadata.shared_stream_name, "uniswap_family");
         assert_eq!(metadata.durability_scope, expected_shared_stream.durability_scope);
+        assert_eq!(metadata.shared_progress_owner_protocol_system, "uniswap_v2");
         assert_eq!(registry.shared_runtime_metadata_for_protocol_system("curve"), None);
     }
 
@@ -769,11 +856,16 @@ mod tests {
                     .as_str()
             )
         );
+        assert_eq!(
+            registry.shared_progress_owner_protocol_system_for_family("uniswap"),
+            Some("uniswap_v2")
+        );
         assert_eq!(registry.shared_stream_name_for_family("curve"), None);
         assert_eq!(registry.durability_scope_for_family("curve"), None);
         assert_eq!(identity.output_module, expected_shared_stream.module);
         assert_eq!(identity.extractor_id, expected_shared_stream.extractor_id);
         assert_eq!(identity.durability_scope, expected_shared_stream.durability_scope);
+        assert_eq!(identity.shared_progress_owner_protocol_system, "uniswap_v2");
         assert!(registry
             .shared_stream_identity_for_family(Chain::Ethereum, "curve")
             .is_none());
@@ -891,8 +983,9 @@ mod tests {
 
     #[test]
     fn registry_resolves_family_runtime_config_with_registry_durability_scope_default() {
-        let registry = crate::extractor::test_support::future_family_runtime_registry_for_tests(
+        let registry = crate::extractor::test_support::future_family_runtime_registry_with_explicit_progress_owner_for_tests(
             &["future_v1"],
+            "future_v1",
             "family::future_swap_runtime",
         );
 
@@ -917,6 +1010,61 @@ mod tests {
     }
 
     #[test]
+    fn registry_resolves_family_runtime_metadata_with_shared_progress_owner() {
+        let registry = default_family_runtime_registry();
+        let config = extractor_config_with_family_runtime(
+            "uniswap_v2",
+            {
+                let mut runtime = resolved_uniswap_family_runtime_config(
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                );
+                runtime.shared_module = None;
+                runtime.durability_scope = None;
+                runtime
+            },
+        );
+
+        let resolved = config
+            .resolve_family_runtime_metadata(Some(registry))
+            .expect("family runtime metadata should resolve")
+            .expect("family runtime metadata should be present");
+
+        assert_eq!(resolved.family, "uniswap");
+        assert_eq!(
+            resolved.shared_progress_owner_protocol_system,
+            "uniswap_v2"
+        );
+    }
+
+    #[test]
+    fn registry_resolves_future_family_runtime_metadata_with_shared_progress_owner() {
+        let registry = crate::extractor::test_support::future_family_runtime_registry_with_explicit_progress_owner_for_tests(
+            &["future_v1"],
+            "future_v1",
+            "family::future_swap_runtime",
+        );
+        let config = extractor_config_with_family_runtime(
+            "future_v1",
+            FamilyRuntimeConfig {
+                family: "future_swap".to_string(),
+                shared_spkg: Some(
+                    "protocols/substreams/future-swap-combined/test.spkg".to_string(),
+                ),
+                shared_module: None,
+                durability_scope: None,
+            },
+        );
+
+        let resolved = config
+            .resolve_family_runtime_metadata(Some(registry))
+            .expect("future family runtime metadata should resolve")
+            .expect("future family runtime metadata should be present");
+
+        assert_eq!(resolved.family, "future_swap");
+        assert_eq!(resolved.shared_progress_owner_protocol_system, "future_v1");
+    }
+
+    #[test]
     fn registry_exposes_normalized_shared_route_protocol_filter() {
         let registry = default_family_runtime_registry();
 
@@ -937,7 +1085,7 @@ mod tests {
 
     #[test]
     fn registry_defaults_bootstrap_member_route_aliases_from_protocol_system() {
-        const BROKEN_FAMILY: FamilyRuntimeSpec = shared_family_runtime_spec(
+        const BROKEN_FAMILY: FamilyRuntimeSpec = canonical_shared_family_runtime_spec_with_explicit_owner!(
             "broken_family",
             &[shared_family_member_with_bootstrap(
                 "broken_protocol_v2",
@@ -946,10 +1094,8 @@ mod tests {
                 SharedBootstrapParamsParser::PoolList,
                 noop_materialize_branch,
             )],
-            "map_broken_family",
-            "broken_family_stream",
-            "family::broken_family",
             None,
+            "broken_protocol_v2",
         );
         let registry = FamilyRuntimeRegistry::new(&[BROKEN_FAMILY]);
 
@@ -999,8 +1145,9 @@ mod tests {
                 type_url_suffix: "FutureEvents",
                 build_block_changes: build_future_events,
             }];
-        let registry = crate::extractor::test_support::future_family_runtime_registry_with_member_auxiliary_decoders_for_tests(
+        let registry = crate::extractor::test_support::future_family_runtime_registry_with_member_auxiliary_decoders_and_explicit_progress_owner_for_tests(
             &["future_v1"],
+            "future_v1",
             "future_v1",
             "family::future_swap_runtime",
             FUTURE_DECODERS,
@@ -1015,6 +1162,21 @@ mod tests {
         assert!(registry
             .auxiliary_protocol_message_decoders_for_protocol_system("uniswap_v3")
             .is_none());
+    }
+
+    #[test]
+    fn future_family_test_registry_can_pin_explicit_progress_owner() {
+        let registry = crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_and_explicit_progress_owner_for_tests(
+            &["future_v1", "future_v2"],
+            "future_v2",
+            "family::future_swap_runtime",
+            &[],
+        );
+
+        assert_eq!(
+            registry.shared_progress_owner_protocol_system_for_family("future_swap"),
+            Some("future_v2")
+        );
     }
 
     #[test]

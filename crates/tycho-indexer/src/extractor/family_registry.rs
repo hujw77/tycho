@@ -24,6 +24,7 @@ pub struct FamilyMemberSpec {
 pub struct FamilyRuntimeSpec {
     family_name: &'static str,
     members: &'static [FamilyMemberSpec],
+    shared_progress_owner_protocol_system: &'static str,
     output_module: &'static str,
     shared_stream_name: &'static str,
     durability_scope: &'static str,
@@ -55,6 +56,7 @@ impl FamilyRuntimeSpec {
     pub(crate) const fn new_with_auxiliary_runtime_hooks(
         family_name: &'static str,
         members: &'static [FamilyMemberSpec],
+        shared_progress_owner_protocol_system: &'static str,
         output_module: &'static str,
         shared_stream_name: &'static str,
         durability_scope: &'static str,
@@ -65,6 +67,7 @@ impl FamilyRuntimeSpec {
         Self {
             family_name,
             members,
+            shared_progress_owner_protocol_system,
             output_module,
             shared_stream_name,
             durability_scope,
@@ -80,6 +83,10 @@ impl FamilyRuntimeSpec {
 
     pub const fn members(&self) -> &'static [FamilyMemberSpec] {
         self.members
+    }
+
+    pub const fn shared_progress_owner_protocol_system(&self) -> &'static str {
+        self.shared_progress_owner_protocol_system
     }
 
     pub const fn output_module(&self) -> &'static str {
@@ -279,6 +286,9 @@ pub const fn shared_family_bootstrap_runtime(
     SharedFamilyBootstrapRuntime { materialize_plan }
 }
 
+// Compatibility constructor: infers the shared progress owner from the first
+// declared member. New family declarations should prefer the explicit-owner
+// helpers/macros so ownership is stated directly at the registration site.
 pub const fn shared_family_runtime_spec(
     family_name: &'static str,
     members: &'static [FamilyMemberSpec],
@@ -329,7 +339,7 @@ pub(crate) const fn shared_family_runtime_spec_with_auxiliary_runtime_hooks(
     auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
     auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
 ) -> FamilyRuntimeSpec {
-    FamilyRuntimeSpec::new_with_auxiliary_runtime_hooks(
+    shared_family_runtime_spec_with_inferred_progress_owner(
         family_name,
         members,
         output_module,
@@ -341,6 +351,76 @@ pub(crate) const fn shared_family_runtime_spec_with_auxiliary_runtime_hooks(
     )
 }
 
+pub(crate) const fn shared_family_runtime_spec_with_inferred_progress_owner(
+    family_name: &'static str,
+    members: &'static [FamilyMemberSpec],
+    output_module: &'static str,
+    shared_stream_name: &'static str,
+    durability_scope: &'static str,
+    shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
+    auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
+) -> FamilyRuntimeSpec {
+    shared_family_runtime_spec_with_explicit_progress_owner(
+        family_name,
+        members,
+        members[0].protocol_system,
+        output_module,
+        shared_stream_name,
+        durability_scope,
+        shared_bootstrap_runtime,
+        auxiliary_protocol_message_decoders,
+        auxiliary_protocol_state_hydrators,
+    )
+}
+
+pub const fn shared_family_runtime_spec_with_explicit_progress_owner_no_aux(
+    family_name: &'static str,
+    members: &'static [FamilyMemberSpec],
+    shared_progress_owner_protocol_system: &'static str,
+    output_module: &'static str,
+    shared_stream_name: &'static str,
+    durability_scope: &'static str,
+    shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
+) -> FamilyRuntimeSpec {
+    shared_family_runtime_spec_with_explicit_progress_owner(
+        family_name,
+        members,
+        shared_progress_owner_protocol_system,
+        output_module,
+        shared_stream_name,
+        durability_scope,
+        shared_bootstrap_runtime,
+        &[],
+        &[],
+    )
+}
+
+pub(crate) const fn shared_family_runtime_spec_with_explicit_progress_owner(
+    family_name: &'static str,
+    members: &'static [FamilyMemberSpec],
+    shared_progress_owner_protocol_system: &'static str,
+    output_module: &'static str,
+    shared_stream_name: &'static str,
+    durability_scope: &'static str,
+    shared_bootstrap_runtime: Option<SharedFamilyBootstrapRuntime>,
+    auxiliary_protocol_message_decoders: &'static [AuxiliaryProtocolMessageDecoder],
+    auxiliary_protocol_state_hydrators: &'static [AuxiliaryProtocolStateHydrator],
+) -> FamilyRuntimeSpec {
+    FamilyRuntimeSpec::new_with_auxiliary_runtime_hooks(
+        family_name,
+        members,
+        shared_progress_owner_protocol_system,
+        output_module,
+        shared_stream_name,
+        durability_scope,
+        shared_bootstrap_runtime,
+        auxiliary_protocol_message_decoders,
+        auxiliary_protocol_state_hydrators,
+    )
+}
+
+#[macro_export]
 macro_rules! canonical_shared_family_runtime_spec {
     (
         $family_name:literal,
@@ -353,6 +433,54 @@ macro_rules! canonical_shared_family_runtime_spec {
             concat!("map_", $family_name, "_family_protocol_changes"),
             concat!($family_name, "_family"),
             concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        shared_progress_owner_protocol_system: $shared_progress_owner_protocol_system:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner_no_aux(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        durability_scope: $durability_scope:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec(
+            $family_name,
+            $members,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        shared_progress_owner_protocol_system: $shared_progress_owner_protocol_system:expr,
+        durability_scope: $durability_scope:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner_no_aux(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
             $shared_bootstrap_runtime,
         )
     };
@@ -376,6 +504,62 @@ macro_rules! canonical_shared_family_runtime_spec {
         $family_name:literal,
         $members:expr,
         $shared_bootstrap_runtime:expr,
+        durability_scope: $durability_scope:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_decoders(
+            $family_name,
+            $members,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        shared_progress_owner_protocol_system: $shared_progress_owner_protocol_system:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            &[],
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        shared_progress_owner_protocol_system: $shared_progress_owner_protocol_system:expr,
+        durability_scope: $durability_scope:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            &[],
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
         auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr,
         auxiliary_protocol_state_hydrators: $auxiliary_protocol_state_hydrators:expr $(,)?
     ) => {
@@ -390,9 +574,186 @@ macro_rules! canonical_shared_family_runtime_spec {
             $auxiliary_protocol_state_hydrators,
         )
     };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        durability_scope: $durability_scope:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr,
+        auxiliary_protocol_state_hydrators: $auxiliary_protocol_state_hydrators:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_auxiliary_runtime_hooks(
+            $family_name,
+            $members,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            $auxiliary_protocol_state_hydrators,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        shared_progress_owner_protocol_system: $shared_progress_owner_protocol_system:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr,
+        auxiliary_protocol_state_hydrators: $auxiliary_protocol_state_hydrators:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            $auxiliary_protocol_state_hydrators,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        shared_progress_owner_protocol_system: $shared_progress_owner_protocol_system:expr,
+        durability_scope: $durability_scope:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr,
+        auxiliary_protocol_state_hydrators: $auxiliary_protocol_state_hydrators:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            $auxiliary_protocol_state_hydrators,
+        )
+    };
 }
 
 pub(crate) use canonical_shared_family_runtime_spec;
+
+#[macro_export]
+macro_rules! canonical_shared_family_runtime_spec_with_explicit_owner {
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        $shared_progress_owner_protocol_system:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner_no_aux(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        $shared_progress_owner_protocol_system:expr,
+        durability_scope: $durability_scope:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner_no_aux(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        $shared_progress_owner_protocol_system:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            &[],
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        $shared_progress_owner_protocol_system:expr,
+        durability_scope: $durability_scope:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            &[],
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        $shared_progress_owner_protocol_system:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr,
+        auxiliary_protocol_state_hydrators: $auxiliary_protocol_state_hydrators:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            concat!("family::", $family_name),
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            $auxiliary_protocol_state_hydrators,
+        )
+    };
+    (
+        $family_name:literal,
+        $members:expr,
+        $shared_bootstrap_runtime:expr,
+        $shared_progress_owner_protocol_system:expr,
+        durability_scope: $durability_scope:expr,
+        auxiliary_protocol_message_decoders: $auxiliary_protocol_message_decoders:expr,
+        auxiliary_protocol_state_hydrators: $auxiliary_protocol_state_hydrators:expr $(,)?
+    ) => {
+        $crate::extractor::family_registry::shared_family_runtime_spec_with_explicit_progress_owner(
+            $family_name,
+            $members,
+            $shared_progress_owner_protocol_system,
+            concat!("map_", $family_name, "_family_protocol_changes"),
+            concat!($family_name, "_family"),
+            $durability_scope,
+            $shared_bootstrap_runtime,
+            $auxiliary_protocol_message_decoders,
+            $auxiliary_protocol_state_hydrators,
+        )
+    };
+}
 
 #[cfg(test)]
 mod tests {
@@ -427,6 +788,21 @@ mod tests {
     const FUTURE_MEMBERS: &[FamilyMemberSpec] = &[FUTURE_MEMBER];
     const FUTURE_FAMILY: FamilyRuntimeSpec =
         canonical_shared_family_runtime_spec!("future_swap", FUTURE_MEMBERS, None);
+    const FUTURE_FAMILY_WITH_EXPLICIT_PROGRESS_OWNER: FamilyRuntimeSpec =
+        canonical_shared_family_runtime_spec_with_explicit_owner!(
+            "future_swap",
+            FUTURE_MEMBERS,
+            None,
+            "future_swap_v1",
+        );
+    const FUTURE_FAMILY_WITH_CUSTOM_DURABILITY_SCOPE: FamilyRuntimeSpec =
+        canonical_shared_family_runtime_spec_with_explicit_owner!(
+            "future_swap",
+            FUTURE_MEMBERS,
+            None,
+            "future_swap_v1",
+            durability_scope: "family::future_swap_runtime",
+        );
 
     #[test]
     fn canonical_shared_family_runtime_spec_derives_identity_fields() {
@@ -434,6 +810,10 @@ mod tests {
         assert_eq!(FUTURE_FAMILY.output_module(), "map_future_swap_family_protocol_changes");
         assert_eq!(FUTURE_FAMILY.shared_stream_name(), "future_swap_family");
         assert_eq!(FUTURE_FAMILY.durability_scope(), "family::future_swap");
+        assert_eq!(
+            FUTURE_FAMILY.shared_progress_owner_protocol_system(),
+            "future_swap_v1"
+        );
     }
 
     #[test]
@@ -452,6 +832,55 @@ mod tests {
                 .expect("pool-list helper should declare shared bootstrap runtime")
                 .strategy,
             BootstrapStrategy::UniswapV2Rpc
+        );
+    }
+
+    #[test]
+    fn canonical_shared_family_runtime_spec_supports_explicit_progress_owner_override() {
+        assert_eq!(
+            FUTURE_FAMILY_WITH_EXPLICIT_PROGRESS_OWNER.family_name(),
+            "future_swap"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_EXPLICIT_PROGRESS_OWNER.output_module(),
+            "map_future_swap_family_protocol_changes"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_EXPLICIT_PROGRESS_OWNER.shared_stream_name(),
+            "future_swap_family"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_EXPLICIT_PROGRESS_OWNER.durability_scope(),
+            "family::future_swap"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_EXPLICIT_PROGRESS_OWNER.shared_progress_owner_protocol_system(),
+            "future_swap_v1"
+        );
+    }
+
+    #[test]
+    fn canonical_shared_family_runtime_spec_supports_custom_durability_scope_override() {
+        assert_eq!(
+            FUTURE_FAMILY_WITH_CUSTOM_DURABILITY_SCOPE.family_name(),
+            "future_swap"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_CUSTOM_DURABILITY_SCOPE.output_module(),
+            "map_future_swap_family_protocol_changes"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_CUSTOM_DURABILITY_SCOPE.shared_stream_name(),
+            "future_swap_family"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_CUSTOM_DURABILITY_SCOPE.durability_scope(),
+            "family::future_swap_runtime"
+        );
+        assert_eq!(
+            FUTURE_FAMILY_WITH_CUSTOM_DURABILITY_SCOPE
+                .shared_progress_owner_protocol_system(),
+            "future_swap_v1"
         );
     }
 }

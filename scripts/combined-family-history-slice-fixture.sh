@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/combined-family-common.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -47,15 +50,6 @@ require_env() {
   fi
 }
 
-shell_escape() {
-  local arg="$1"
-  if [[ "${arg}" =~ ^[A-Za-z0-9_./:+=-]+$ ]]; then
-    printf '%s' "${arg}"
-    return
-  fi
-  printf "'%s'" "${arg//\'/\'\"\'\"\'}"
-}
-
 MODE="${1:-}"
 STRICT_DOCTOR="false"
 if [[ -z "${MODE}" || "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
@@ -67,14 +61,13 @@ if [[ "${MODE}" == "doctor" && "${2:-}" == "--strict" ]]; then
   STRICT_DOCTOR="true"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${TYCHO_COMBINED_FAMILY_REPO_ROOT}"
 
 FAMILY_NAME="${TYCHO_COMBINED_FIXTURE_FAMILY:-}"
 START_BLOCK="${TYCHO_COMBINED_FIXTURE_START_BLOCK:-25384601}"
 STOP_BLOCK="${TYCHO_COMBINED_FIXTURE_STOP_BLOCK:-+2}"
 OUTPUT_PATH="${TYCHO_COMBINED_FIXTURE_OUTPUT:-${REPO_ROOT}/crates/tycho-indexer/tests/fixtures/combined_family_real_history_slice.json}"
-EXTRACTORS_CONFIG="${TYCHO_COMBINED_FIXTURE_CONFIG:-${REPO_ROOT}/crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml}"
+EXTRACTORS_CONFIG="${TYCHO_COMBINED_FIXTURE_CONFIG:-${TYCHO_COMBINED_FAMILY_CANONICAL_EXTRACTORS_CONFIG_ABS}}"
 
 BASE_CMD=(
   cargo run --bin tycho-indexer --
@@ -99,17 +92,17 @@ render_record_cmd() {
   local api_token="${SUBSTREAMS_API_TOKEN:-<set SUBSTREAMS_API_TOKEN>}"
   printf '%s\n' "cargo run --bin tycho-indexer -- \\"
   printf '%s\n' "  --database-url postgres://unused \\"
-  printf '%s\n' "  --endpoint $(shell_escape "${endpoint}") \\"
-  printf '%s\n' "  --rpc-url $(shell_escape "${rpc_url}") \\"
+  printf '%s\n' "  --endpoint $(tycho_combined_family_shell_escape "${endpoint}") \\"
+  printf '%s\n' "  --rpc-url $(tycho_combined_family_shell_escape "${rpc_url}") \\"
   printf '%s\n' "  record-substreams \\"
-  printf '%s\n' "  --substreams-api-token $(shell_escape "${api_token}") \\"
-  printf '%s\n' "  --extractors-config $(shell_escape "${EXTRACTORS_CONFIG}") \\"
+  printf '%s\n' "  --substreams-api-token $(tycho_combined_family_shell_escape "${api_token}") \\"
+  printf '%s\n' "  --extractors-config $(tycho_combined_family_shell_escape "${EXTRACTORS_CONFIG}") \\"
   if [[ -n "${FAMILY_NAME}" ]]; then
-    printf '%s\n' "  --family $(shell_escape "${FAMILY_NAME}") \\"
+    printf '%s\n' "  --family $(tycho_combined_family_shell_escape "${FAMILY_NAME}") \\"
   fi
-  printf '%s\n' "  --start-block $(shell_escape "${START_BLOCK}") \\"
-  printf '%s\n' "  --stop-block $(shell_escape "${STOP_BLOCK}") \\"
-  printf '%s\n' "  --output $(shell_escape "${OUTPUT_PATH}")"
+  printf '%s\n' "  --start-block $(tycho_combined_family_shell_escape "${START_BLOCK}") \\"
+  printf '%s\n' "  --stop-block $(tycho_combined_family_shell_escape "${STOP_BLOCK}") \\"
+  printf '%s\n' "  --output $(tycho_combined_family_shell_escape "${OUTPUT_PATH}")"
 }
 
 doctor() {

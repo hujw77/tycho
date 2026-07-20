@@ -23,14 +23,14 @@ use crate::extractor::{
     },
     extractor_config::ExtractorConfig,
     family_registry::FamilyRuntimeRegistry,
-    family_runtime_planning::ResolvedFamilyRuntime,
+    family_runtime::ResolvedFamilyRuntime,
     post_processors::POST_PROCESSOR_REGISTRY,
     protocol_cache::ProtocolMemoryCache,
     protocol_extractor::{ExtractorPgGateway, ProtocolExtractor},
     protocol_message_registry::{
-        default_auxiliary_protocol_message_decoders_for_protocol_system,
-        default_auxiliary_protocol_state_hydrators_for_protocol_system,
+        default_auxiliary_runtime_hooks_for_protocol_system,
         AuxiliaryProtocolMessageDecoder, AuxiliaryProtocolStateHydrator,
+        ProtocolSystemAuxiliaryRuntimeHooks,
     },
     runtime_target_planning::ResolvedStandaloneRuntime,
     ExtractionError, Extractor, ExtractorExtension,
@@ -98,9 +98,10 @@ pub(crate) struct ExtractorBuilder {
     extractor: Option<Arc<dyn Extractor>>,
     rpc_client: Option<EthereumRpcClient>,
     database_insert_batch_size: Option<usize>,
+    persist_cursor_state: bool,
     auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
     auxiliary_protocol_state_hydrators: Vec<AuxiliaryProtocolStateHydrator>,
-    family_runtime_registry: Option<FamilyRuntimeRegistry<'static>>,
+    family_runtime_registry: FamilyRuntimeRegistry<'static>,
     partial_blocks: bool,
 }
 
@@ -110,15 +111,17 @@ impl ExtractorBuilder {
         _endpoint_url: &str,
         _s3_bucket: Option<&str>,
         _substreams_api_token: &str,
+        family_runtime_registry: FamilyRuntimeRegistry<'static>,
     ) -> Self {
         Self {
             config: config.clone(),
             extractor: None,
             rpc_client: None,
             database_insert_batch_size: None,
+            persist_cursor_state: true,
             auxiliary_protocol_message_decoders: Vec::new(),
             auxiliary_protocol_state_hydrators: Vec::new(),
-            family_runtime_registry: None,
+            family_runtime_registry,
             partial_blocks: false,
         }
     }
@@ -130,6 +133,11 @@ impl ExtractorBuilder {
 
     pub fn database_insert_batch_size(mut self, database_insert_batch_size: usize) -> Self {
         self.database_insert_batch_size = Some(database_insert_batch_size);
+        self
+    }
+
+    pub(crate) fn persist_cursor_state(mut self, persist_cursor_state: bool) -> Self {
+        self.persist_cursor_state = persist_cursor_state;
         self
     }
 
@@ -146,14 +154,6 @@ impl ExtractorBuilder {
         hydrators: Vec<AuxiliaryProtocolStateHydrator>,
     ) -> Self {
         self.auxiliary_protocol_state_hydrators = hydrators;
-        self
-    }
-
-    pub(crate) fn family_runtime_registry(
-        mut self,
-        registry: FamilyRuntimeRegistry<'static>,
-    ) -> Self {
-        self.family_runtime_registry = Some(registry);
         self
     }
 
@@ -237,8 +237,15 @@ impl ExtractorBuilder {
 
         let family_durability_scope = self
             .config
-            .resolve_family_runtime_metadata(self.family_runtime_registry)?
-            .map(|metadata| metadata.durability_scope.to_string());
+            .family_runtime()
+            .map(|_| {
+                self.config
+                    .require_resolved_family_runtime_metadata_with_registry(
+                        self.family_runtime_registry,
+                    )
+                    .map(|metadata| metadata.durability_scope)
+            })
+            .transpose()?;
 
         let gw = ExtractorPgGateway::new(
             &self.config.name,
@@ -246,6 +253,7 @@ impl ExtractorBuilder {
             self.config.sync_batch_size,
             cached_gw.clone(),
             family_durability_scope,
+            self.persist_cursor_state,
         );
 
         let post_processor = self
@@ -356,35 +364,18 @@ pub(crate) struct ManagedExtractorBuildContext<'a> {
 }
 
 impl ManagedExtractorBuildContext<'_> {
-    pub(crate) fn auxiliary_protocol_message_decoders_for_protocol_system_with_registry(
+    pub(crate) fn auxiliary_runtime_hooks_for_protocol_system_with_registry(
         protocol_system: &str,
         registry: FamilyRuntimeRegistry<'static>,
-    ) -> Vec<AuxiliaryProtocolMessageDecoder> {
-        default_auxiliary_protocol_message_decoders_for_protocol_system(protocol_system, registry)
+    ) -> ProtocolSystemAuxiliaryRuntimeHooks {
+        default_auxiliary_runtime_hooks_for_protocol_system(protocol_system, registry)
     }
 
-    pub(crate) fn auxiliary_protocol_message_decoders_for_protocol_system(
+    pub(crate) fn auxiliary_runtime_hooks_for_protocol_system(
         &self,
         protocol_system: &str,
-    ) -> Vec<AuxiliaryProtocolMessageDecoder> {
-        Self::auxiliary_protocol_message_decoders_for_protocol_system_with_registry(
-            protocol_system,
-            self.family_runtime_registry,
-        )
-    }
-
-    pub(crate) fn auxiliary_protocol_state_hydrators_for_protocol_system_with_registry(
-        protocol_system: &str,
-        registry: FamilyRuntimeRegistry<'static>,
-    ) -> Vec<AuxiliaryProtocolStateHydrator> {
-        default_auxiliary_protocol_state_hydrators_for_protocol_system(protocol_system, registry)
-    }
-
-    pub(crate) fn auxiliary_protocol_state_hydrators_for_protocol_system(
-        &self,
-        protocol_system: &str,
-    ) -> Vec<AuxiliaryProtocolStateHydrator> {
-        Self::auxiliary_protocol_state_hydrators_for_protocol_system_with_registry(
+    ) -> ProtocolSystemAuxiliaryRuntimeHooks {
+        Self::auxiliary_runtime_hooks_for_protocol_system_with_registry(
             protocol_system,
             self.family_runtime_registry,
         )
@@ -393,6 +384,7 @@ impl ManagedExtractorBuildContext<'_> {
     pub(crate) async fn build_initialized_extractor(
         &self,
         extractor_config: &ExtractorConfig,
+        persist_cursor_state: bool,
         auxiliary_protocol_message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
         auxiliary_protocol_state_hydrators: Vec<AuxiliaryProtocolStateHydrator>,
     ) -> Result<Arc<dyn Extractor>, ExtractionError> {
@@ -401,11 +393,12 @@ impl ManagedExtractorBuildContext<'_> {
             self.endpoint_url,
             self.s3_bucket,
             self.substreams_api_token,
+            self.family_runtime_registry,
         )
         .database_insert_batch_size(self.database_insert_batch_size)
+        .persist_cursor_state(persist_cursor_state)
         .auxiliary_protocol_message_decoders(auxiliary_protocol_message_decoders)
         .auxiliary_protocol_state_hydrators(auxiliary_protocol_state_hydrators)
-        .family_runtime_registry(self.family_runtime_registry)
         .partial_blocks(self.partial_blocks);
 
         let builder = builder
@@ -424,13 +417,10 @@ impl ManagedExtractorBuildContext<'_> {
     pub(crate) async fn build_protocol_system_keyed_extractors(
         &self,
         extractor_configs: &[&ExtractorConfig],
-        auxiliary_protocol_message_decoders_by_protocol_system: &HashMap<
+        shared_progress_owner_protocol_system: Option<&str>,
+        auxiliary_runtime_hooks_by_protocol_system: &HashMap<
             String,
-            Vec<AuxiliaryProtocolMessageDecoder>,
-        >,
-        auxiliary_protocol_state_hydrators_by_protocol_system: &HashMap<
-            String,
-            Vec<AuxiliaryProtocolStateHydrator>,
+            ProtocolSystemAuxiliaryRuntimeHooks,
         >,
     ) -> Result<HashMap<String, Arc<dyn Extractor>>, ExtractionError> {
         let mut extractors = HashMap::with_capacity(extractor_configs.len());
@@ -439,16 +429,19 @@ impl ManagedExtractorBuildContext<'_> {
             let protocol_system = extractor_config
                 .protocol_system()
                 .to_string();
+            let persist_cursor_state = shared_progress_owner_protocol_system
+                .is_none_or(|owner| owner == protocol_system);
             let extractor = self
                 .build_initialized_extractor(
                     extractor_config,
-                    auxiliary_protocol_message_decoders_by_protocol_system
+                    persist_cursor_state,
+                    auxiliary_runtime_hooks_by_protocol_system
                         .get(extractor_config.protocol_system())
-                        .cloned()
+                        .map(|hooks| hooks.message_decoders.clone())
                         .unwrap_or_default(),
-                    auxiliary_protocol_state_hydrators_by_protocol_system
+                    auxiliary_runtime_hooks_by_protocol_system
                         .get(extractor_config.protocol_system())
-                        .cloned()
+                        .map(|hooks| hooks.state_hydrators.clone())
                         .unwrap_or_default(),
                 )
                 .await?;
@@ -472,8 +465,8 @@ impl ManagedExtractorBuildContext<'_> {
     ) -> Result<HashMap<String, Arc<dyn Extractor>>, ExtractionError> {
         self.build_protocol_system_keyed_extractors(
             &runtime_target.extractor_configs(),
-            &runtime_target.auxiliary_protocol_message_decoders_by_protocol_system(self),
-            &runtime_target.auxiliary_protocol_state_hydrators_by_protocol_system(self),
+            runtime_target.shared_progress_owner_protocol_system(),
+            &runtime_target.auxiliary_runtime_hooks_by_protocol_system(self),
         )
         .await
     }
@@ -510,15 +503,14 @@ pub(crate) trait RuntimeTargetExtractorBuildView<'a> {
         None
     }
 
-    fn auxiliary_protocol_message_decoders_by_protocol_system(
-        &self,
-        extractor_build: &ManagedExtractorBuildContext<'_>,
-    ) -> HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>>;
+    fn shared_progress_owner_protocol_system(&self) -> Option<&str> {
+        None
+    }
 
-    fn auxiliary_protocol_state_hydrators_by_protocol_system(
+    fn auxiliary_runtime_hooks_by_protocol_system(
         &self,
         extractor_build: &ManagedExtractorBuildContext<'_>,
-    ) -> HashMap<String, Vec<AuxiliaryProtocolStateHydrator>>;
+    ) -> HashMap<String, ProtocolSystemAuxiliaryRuntimeHooks>;
 }
 
 impl<'a> RuntimeTargetExtractorBuildView<'a> for ResolvedStandaloneRuntime<'a> {
@@ -530,25 +522,13 @@ impl<'a> RuntimeTargetExtractorBuildView<'a> for ResolvedStandaloneRuntime<'a> {
         Some(self.protocol_system)
     }
 
-    fn auxiliary_protocol_message_decoders_by_protocol_system(
+    fn auxiliary_runtime_hooks_by_protocol_system(
         &self,
         extractor_build: &ManagedExtractorBuildContext<'_>,
-    ) -> HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>> {
+    ) -> HashMap<String, ProtocolSystemAuxiliaryRuntimeHooks> {
         HashMap::from([(
             self.protocol_system.to_string(),
-            extractor_build
-                .auxiliary_protocol_message_decoders_for_protocol_system(self.protocol_system),
-        )])
-    }
-
-    fn auxiliary_protocol_state_hydrators_by_protocol_system(
-        &self,
-        extractor_build: &ManagedExtractorBuildContext<'_>,
-    ) -> HashMap<String, Vec<AuxiliaryProtocolStateHydrator>> {
-        HashMap::from([(
-            self.protocol_system.to_string(),
-            extractor_build
-                .auxiliary_protocol_state_hydrators_for_protocol_system(self.protocol_system),
+            extractor_build.auxiliary_runtime_hooks_for_protocol_system(self.protocol_system),
         )])
     }
 }
@@ -558,19 +538,15 @@ impl<'a> RuntimeTargetExtractorBuildView<'a> for ResolvedFamilyRuntime<'a> {
         self.extractor_configs.clone()
     }
 
-    fn auxiliary_protocol_message_decoders_by_protocol_system(
-        &self,
-        _extractor_build: &ManagedExtractorBuildContext<'_>,
-    ) -> HashMap<String, Vec<AuxiliaryProtocolMessageDecoder>> {
-        self.auxiliary_protocol_message_decoders_by_protocol_system()
-            .clone()
+    fn shared_progress_owner_protocol_system(&self) -> Option<&str> {
+        Some(self.shared_progress_owner_protocol_system())
     }
 
-    fn auxiliary_protocol_state_hydrators_by_protocol_system(
+    fn auxiliary_runtime_hooks_by_protocol_system(
         &self,
         _extractor_build: &ManagedExtractorBuildContext<'_>,
-    ) -> HashMap<String, Vec<AuxiliaryProtocolStateHydrator>> {
-        self.auxiliary_protocol_state_hydrators_by_protocol_system()
+    ) -> HashMap<String, ProtocolSystemAuxiliaryRuntimeHooks> {
+        self.auxiliary_runtime_hooks_by_protocol_system()
             .clone()
     }
 }

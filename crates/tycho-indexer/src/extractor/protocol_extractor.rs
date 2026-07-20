@@ -2111,6 +2111,7 @@ pub struct ExtractorPgGateway {
     db_tx_batch_size: usize,
     state_gateway: CachedGateway,
     shared_state_scope: Option<String>,
+    persist_cursor_state: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2334,8 +2335,16 @@ impl ExtractorPgGateway {
         db_tx_batch_size: usize,
         state_gateway: CachedGateway,
         shared_state_scope: Option<String>,
+        persist_cursor_state: bool,
     ) -> Self {
-        Self { name: name.to_owned(), chain, db_tx_batch_size, state_gateway, shared_state_scope }
+        Self {
+            name: name.to_owned(),
+            chain,
+            db_tx_batch_size,
+            state_gateway,
+            shared_state_scope,
+            persist_cursor_state,
+        }
     }
 
     #[instrument(skip_all)]
@@ -2667,8 +2676,10 @@ impl ExtractorGateway for ExtractorPgGateway {
                 .await?;
         }
 
-        self.save_cursor(new_cursor, changes.block.hash.clone())
-            .await?;
+        if self.persist_cursor_state {
+            self.save_cursor(new_cursor, changes.block.hash.clone())
+                .await?;
+        }
 
         let batch_size = if force_commit { 0 } else { self.db_tx_batch_size };
         self.state_gateway
@@ -5736,7 +5747,7 @@ mod test_serial_db {
             .await
             .expect("failed to build postgres gateway");
 
-        let gw = ExtractorPgGateway::new("test", Chain::Ethereum, 1000, cached_gw, None);
+        let gw = ExtractorPgGateway::new("test", Chain::Ethereum, 1000, cached_gw, None, true);
         (gw, chain_id)
     }
 
@@ -5846,6 +5857,7 @@ mod test_serial_db {
                 1000,
                 legacy_gw.state_gateway.clone(),
                 Some("family::uniswap".to_string()),
+                true,
             );
             let block_hash =
                 Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
@@ -5922,6 +5934,7 @@ mod test_serial_db {
                 1000,
                 legacy_gw.state_gateway.clone(),
                 Some("family::uniswap".to_string()),
+                true,
             );
             let block_hash =
                 Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
@@ -5988,6 +6001,7 @@ mod test_serial_db {
                 1000,
                 legacy_gw.state_gateway.clone(),
                 Some("family::uniswap".to_string()),
+                true,
             );
             let block_hash =
                 Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
@@ -6046,6 +6060,7 @@ mod test_serial_db {
                 1000,
                 legacy_gw.state_gateway.clone(),
                 Some("family::uniswap".to_string()),
+                true,
             );
             let reader_gw = ExtractorPgGateway::new(
                 "uniswap_v3",
@@ -6053,6 +6068,7 @@ mod test_serial_db {
                 1000,
                 legacy_gw.state_gateway.clone(),
                 Some("family::uniswap".to_string()),
+                true,
             );
             let block_hash =
                 Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
@@ -6114,6 +6130,7 @@ mod test_serial_db {
                 1000,
                 legacy_gw.state_gateway.clone(),
                 Some("family::uniswap".to_string()),
+                true,
             );
             let block_hash =
                 Bytes::from_str("88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6")
@@ -6157,6 +6174,45 @@ mod test_serial_db {
                 .get_state("test", &Chain::Ethereum)
                 .await;
             assert!(matches!(legacy_state, Err(StorageError::NotFound(_, _))));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_advance_can_skip_shared_cursor_persistence_for_non_owner_branch() {
+        run_against_db(|pool| async move {
+            let (legacy_gw, _) = setup_gw(pool, ImplementationType::Vm).await;
+            let non_owner_gw = ExtractorPgGateway::new(
+                "uniswap_v3",
+                Chain::Ethereum,
+                1000,
+                legacy_gw.state_gateway.clone(),
+                Some("family::uniswap".to_string()),
+                false,
+            );
+            let msg = vm_creation_and_update();
+
+            non_owner_gw
+                .advance(&msg, "cursor@500", true)
+                .await
+                .expect("non-owner branch advance should still persist protocol data");
+
+            let shared_cursor_state = non_owner_gw
+                .state_gateway
+                .get_state("family::uniswap", &Chain::Ethereum)
+                .await;
+            assert!(matches!(
+                shared_cursor_state,
+                Err(StorageError::NotFound(_, _))
+            ));
+
+            let protocol_components = non_owner_gw
+                .state_gateway
+                .get_protocol_components(&Chain::Ethereum, None, None, None, None)
+                .await
+                .expect("protocol components lookup should succeed")
+                .entity;
+            assert_eq!(protocol_components.len(), 1);
         })
         .await;
     }
@@ -6514,6 +6570,7 @@ mod test_serial_db {
                 0,
                 cached_gw.clone(),
                 None,
+                true,
             );
 
             let protocol_types = HashMap::from([
@@ -6702,6 +6759,7 @@ mod test_serial_db {
                 0,
                 cached_gw.clone(),
                 None,
+                true,
             );
             let protocol_types = HashMap::from([
                 ("pt_1".to_string(), ProtocolType::default()),
@@ -6907,8 +6965,14 @@ mod test_serial_db {
                 .await
                 .unwrap();
 
-            let gw =
-                ExtractorPgGateway::new("vm_name", Chain::Ethereum, 0, cached_gw.clone(), None);
+            let gw = ExtractorPgGateway::new(
+                "vm_name",
+                Chain::Ethereum,
+                0,
+                cached_gw.clone(),
+                None,
+                true,
+            );
             let protocol_types = HashMap::from([
                 ("pt_1".to_string(), ProtocolType::default()),
                 ("pt_2".to_string(), ProtocolType::default()),

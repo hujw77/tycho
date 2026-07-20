@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/combined-family-common.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -21,25 +24,20 @@ Environment:
            Default: sibling ../fynd
   TYCHO_COMBINED_FAMILY_FYND_REPLAY_TEST_MANIFEST
            Optional override manifest path for the Fynd replay contract test list.
+  FYND_REPLAY_CARGO_TARGET_DIR
+           Optional cargo target directory override for this gate. Useful when the sibling
+           Fynd workspace target directory is full and the replay gate should build in `/tmp`
+           or another scratch location instead.
 EOF
 }
 
-shell_escape() {
-  local arg="$1"
-  if [[ "${arg}" =~ ^[A-Za-z0-9_./:+=-]+$ ]]; then
-    printf '%s' "${arg}"
-    return
-  fi
-  printf "'%s'" "${arg//\'/\'\"\'\"\'}"
-}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEFAULT_FYND_REPO_ROOT="$(cd "${REPO_ROOT}/.." && pwd)/fynd"
+REPO_ROOT="${TYCHO_COMBINED_FAMILY_REPO_ROOT}"
+DEFAULT_FYND_REPO_ROOT="${TYCHO_COMBINED_FAMILY_DEFAULT_FYND_REPO_ROOT}"
 MODE="${1:-}"
 STRICT_DOCTOR="false"
 FYND_REPO_ROOT="${FYND_REPO_ROOT:-${DEFAULT_FYND_REPO_ROOT}}"
 TEST_MANIFEST="${TYCHO_COMBINED_FAMILY_FYND_REPLAY_TEST_MANIFEST:-${REPO_ROOT}/crates/tycho-indexer/tests/combined_family_fynd_replay_gate.tests}"
+FYND_REPLAY_CARGO_TARGET_DIR="${FYND_REPLAY_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
 
 if [[ -z "${MODE}" || "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
   usage
@@ -59,6 +57,7 @@ load_entries() {
   ENTRY_LINES=()
   ENTRY_PACKAGES=()
   ENTRY_TESTS=()
+  declare -A SEEN_ENTRIES=()
   while IFS= read -r line || [[ -n "${line}" ]]; do
     if [[ -z "${line}" || "${line}" =~ ^# ]]; then
       continue
@@ -72,6 +71,11 @@ load_entries() {
       echo "invalid combined-family Fynd replay gate manifest entry: ${line}" >&2
       exit 1
     fi
+    if [[ -n "${SEEN_ENTRIES[${package_name}:${test_name}]:-}" ]]; then
+      echo "duplicate combined-family Fynd replay gate manifest entry: ${package_name} ${test_name}" >&2
+      exit 1
+    fi
+    SEEN_ENTRIES["${package_name}:${test_name}"]=1
     ENTRY_LINES+=("${line}")
     ENTRY_PACKAGES+=("${package_name}")
     ENTRY_TESTS+=("${test_name}")
@@ -227,6 +231,7 @@ fynd_repo_exists=${fynd_repo_exists}
 test_manifest=${TEST_MANIFEST}
 test_count=${#ENTRY_TESTS[@]}
 cargo_state=${cargo_state}
+cargo_target_dir=${FYND_REPLAY_CARGO_TARGET_DIR:-default}
 EOF
 
   if [[ "${STRICT_DOCTOR}" == "true" && "${ready}" != "true" ]]; then
@@ -239,8 +244,14 @@ list_entries() {
 }
 
 render_run_command() {
-  cat <<EOF
-cd $(shell_escape "${FYND_REPO_ROOT}")
+  local cargo_target_export=""
+  if [[ -n "${FYND_REPLAY_CARGO_TARGET_DIR}" ]]; then
+    cargo_target_export="export CARGO_TARGET_DIR=$(tycho_combined_family_shell_escape "${FYND_REPLAY_CARGO_TARGET_DIR}")"
+  fi
+
+cat <<EOF
+cd $(tycho_combined_family_shell_escape "${FYND_REPO_ROOT}")
+${cargo_target_export}
 ENTRY_PACKAGES=(
 $(printf '  %s\n' "${ENTRY_PACKAGES[@]}")
 )
@@ -265,6 +276,9 @@ run_tests() {
   STRICT_DOCTOR="${previous_strict_doctor}"
 
   cd "${FYND_REPO_ROOT}"
+  if [[ -n "${FYND_REPLAY_CARGO_TARGET_DIR}" ]]; then
+    export CARGO_TARGET_DIR="${FYND_REPLAY_CARGO_TARGET_DIR}"
+  fi
   resolve_test_binary_paths
   build_test_binary_index
   local entry_index

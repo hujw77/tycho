@@ -16,7 +16,8 @@ use tycho_storage::postgres::cache::CachedGateway;
 
 use crate::extractor::runtime_target_planning::{ResolvedInitializedAccountsRequest, ResolvedRuntimeTargets};
 use crate::extractor::{
-    runtime_targets_startup::PreparedRuntimeTargetsStartup, ExtractionError,
+    runtime_targets_startup::{BuiltManagedRunnersBatch, PreparedRuntimeTargetsStartup},
+    ExtractionError,
 };
 
 pub use crate::extractor::runtime_targets_startup::ResolvedRuntimeTargetsBuildContext;
@@ -162,6 +163,16 @@ impl<'a> ResolvedRuntimeTargets<'a> {
         self.prepare_startup(&context)
             .await?
             .build_managed_runners()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn build_managed_runners_batch(
+        self,
+        context: ResolvedRuntimeTargetsBuildContext<'_>,
+    ) -> Result<BuiltManagedRunnersBatch, ExtractionError> {
+        self.prepare_startup(&context)
+            .await?
+            .build_managed_runners_batch()
     }
 
     pub async fn initialize_accounts(&self, rpc: &EthereumRpcClient, cached_gw: &CachedGateway) {

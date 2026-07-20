@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/combined-family-common.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -72,18 +75,8 @@ Examples:
 EOF
 }
 
-shell_escape() {
-  local arg="$1"
-  if [[ "${arg}" =~ ^[A-Za-z0-9_./:+=,-]+$ ]]; then
-    printf '%s' "${arg}"
-    return
-  fi
-  printf "'%s'" "${arg//\'/\'\"\'\"\'}"
-}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEFAULT_FYND_REPO_ROOT="$(cd "${REPO_ROOT}/.." && pwd)/fynd"
+REPO_ROOT="${TYCHO_COMBINED_FAMILY_REPO_ROOT}"
+DEFAULT_FYND_REPO_ROOT="${TYCHO_COMBINED_FAMILY_DEFAULT_FYND_REPO_ROOT}"
 LIVE_TEST_MANIFEST="${TYCHO_COMBINED_FAMILY_LIVE_TEST_MANIFEST:-${REPO_ROOT}/crates/tycho-indexer/tests/combined_family_live_gate.tests}"
 DEFAULT_FYND_E2E_CONNECTOR_TOKENS="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2,0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7,0x6b175474e89094c44da98b954eedeac495271d0f,0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"
 
@@ -107,6 +100,7 @@ TYCHO_COMBINED_FAMILY_CHAIN_VALUE="${TYCHO_COMBINED_FAMILY_CHAIN:-ethereum}"
 
 ROUTE_TEST=""
 SETTLEMENT_TEST=""
+LIVE_TEST_COUNT=0
 
 mode="${1:-}"
 strict="false"
@@ -139,11 +133,21 @@ load_live_tests() {
       exit 1
     fi
 
+    LIVE_TEST_COUNT=$((LIVE_TEST_COUNT + 1))
+
     case "${selection}" in
       route)
+        if [[ -n "${ROUTE_TEST}" ]]; then
+          echo "duplicate combined-family live gate selection in manifest: route" >&2
+          exit 1
+        fi
         ROUTE_TEST="${test_name}"
         ;;
       settlement)
+        if [[ -n "${SETTLEMENT_TEST}" ]]; then
+          echo "duplicate combined-family live gate selection in manifest: settlement" >&2
+          exit 1
+        fi
         SETTLEMENT_TEST="${test_name}"
         ;;
       *)
@@ -194,7 +198,41 @@ fi
 fynd_declares_ignored_test() {
   local test_name="$1"
   local test_file="$2"
-  grep -Eq "fn[[:space:]]+${test_name}[[:space:]]*\\(" "${test_file}"
+  awk -v test_name="${test_name}" '
+    BEGIN {
+      seen_ignore = 0
+      found = 0
+    }
+
+    /^[[:space:]]*#\[ignore([[:space:]]*=.*)?\][[:space:]]*$/ {
+      seen_ignore = 1
+      next
+    }
+
+    /^[[:space:]]*#\[[^]]+\][[:space:]]*$/ {
+      next
+    }
+
+    $0 ~ "^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+" test_name "[[:space:]]*\\(" {
+      if (seen_ignore) {
+        found = 1
+        exit 0
+      }
+      exit 1
+    }
+
+    /^[[:space:]]*$/ {
+      next
+    }
+
+    {
+      seen_ignore = 0
+    }
+
+    END {
+      exit(found ? 0 : 1)
+    }
+  ' "${test_file}"
 }
 
 if [[ "${fynd_test_exists}" == "true" ]]; then
@@ -367,6 +405,7 @@ curl_available=${curl_available}
 tycho_stream_ws_buffer_size=${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE:-default}
 tycho_stream_subscription_buffer_size=${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE:-default}
 test_manifest=${LIVE_TEST_MANIFEST}
+test_count=${LIVE_TEST_COUNT}
 EOF
 
   if [[ "${strict}" == "true" && "${ready}" != "true" ]]; then
@@ -391,7 +430,7 @@ render_command() {
       ;;
     all)
       cat <<EOF
-cd $(shell_escape "${FYND_REPO_ROOT}") && \\
+cd $(tycho_combined_family_shell_escape "${FYND_REPO_ROOT}") && \\
 $(render_env_prefix route)
 cargo test --test e2e_quote ${ROUTE_TEST} -- --ignored --nocapture && \\
 $(render_env_prefix settlement)
@@ -406,7 +445,7 @@ EOF
   esac
 
   cat <<EOF
-cd $(shell_escape "${FYND_REPO_ROOT}") && \\
+cd $(tycho_combined_family_shell_escape "${FYND_REPO_ROOT}") && \\
 $(render_env_prefix "${selected}")
 cargo test --test e2e_quote ${test_name} -- --ignored --nocapture
 EOF
@@ -438,46 +477,46 @@ render_env_prefix() {
   local effective_health_mode
   effective_health_mode="$(effective_health_mode_for_selection "${selection}")"
   printf 'RUST_LOG=%s \\\n' \
-    "$(shell_escape "${FYND_E2E_RUST_LOG}")"
+    "$(tycho_combined_family_shell_escape "${FYND_E2E_RUST_LOG}")"
   printf 'FYND_E2E_TYCHO_URL=%s \\\n' \
-    "$(shell_escape "${FYND_E2E_TYCHO_URL}")"
+    "$(tycho_combined_family_shell_escape "${FYND_E2E_TYCHO_URL}")"
   printf 'FYND_E2E_RPC_URL=%s \\\n' \
-    "$(shell_escape "${FYND_E2E_RPC_URL}")"
+    "$(tycho_combined_family_shell_escape "${FYND_E2E_RPC_URL}")"
   printf 'FYND_E2E_HEALTH_TIMEOUT_SECS=%s \\\n' \
-    "$(shell_escape "${FYND_E2E_HEALTH_TIMEOUT_SECS}")"
+    "$(tycho_combined_family_shell_escape "${FYND_E2E_HEALTH_TIMEOUT_SECS}")"
   printf 'FYND_E2E_TRADED_N_DAYS_AGO=%s \\\n' \
-    "$(shell_escape "${FYND_E2E_TRADED_N_DAYS_AGO}")"
+    "$(tycho_combined_family_shell_escape "${FYND_E2E_TRADED_N_DAYS_AGO}")"
   printf 'FYND_E2E_CLIENT_TIMEOUT_SECS=%s \\\n' \
-    "$(shell_escape "${FYND_E2E_CLIENT_TIMEOUT_SECS}")"
+    "$(tycho_combined_family_shell_escape "${FYND_E2E_CLIENT_TIMEOUT_SECS}")"
   printf 'FYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS=%s \\\n' \
-      "$(shell_escape "${FYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS}")"
+      "$(tycho_combined_family_shell_escape "${FYND_E2E_CLIENT_RETRY_MAX_ATTEMPTS}")"
   printf 'FYND_E2E_MIN_TOKEN_QUALITY=%s \\\n' \
-    "$(shell_escape "${FYND_E2E_MIN_TOKEN_QUALITY}")"
+    "$(tycho_combined_family_shell_escape "${FYND_E2E_MIN_TOKEN_QUALITY}")"
   printf 'FYND_E2E_HEALTH_MODE=%s \\\n' \
-    "$(shell_escape "${effective_health_mode}")"
+    "$(tycho_combined_family_shell_escape "${effective_health_mode}")"
   if [[ -n "${FYND_E2E_QUOTE_TIMEOUT_SECS_VALUE}" ]]; then
     printf 'FYND_E2E_QUOTE_TIMEOUT_SECS=%s \\\n' \
-      "$(shell_escape "${FYND_E2E_QUOTE_TIMEOUT_SECS_VALUE}")"
+      "$(tycho_combined_family_shell_escape "${FYND_E2E_QUOTE_TIMEOUT_SECS_VALUE}")"
   fi
   if [[ -n "${FYND_E2E_CONNECTOR_TOKENS_VALUE}" ]]; then
     printf 'FYND_E2E_CONNECTOR_TOKENS=%s \\\n' \
-      "$(shell_escape "${FYND_E2E_CONNECTOR_TOKENS_VALUE}")"
+      "$(tycho_combined_family_shell_escape "${FYND_E2E_CONNECTOR_TOKENS_VALUE}")"
   fi
   if [[ -n "${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE}" ]]; then
     printf 'FYND_E2E_TOKEN_BALANCE_SLOT=%s \\\n' \
-      "$(shell_escape "${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE}")"
+      "$(tycho_combined_family_shell_escape "${FYND_E2E_TOKEN_BALANCE_SLOT_VALUE}")"
   fi
   if [[ -n "${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE}" ]]; then
     printf 'FYND_E2E_TOKEN_ALLOWANCE_SLOT=%s \\\n' \
-      "$(shell_escape "${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE}")"
+      "$(tycho_combined_family_shell_escape "${FYND_E2E_TOKEN_ALLOWANCE_SLOT_VALUE}")"
   fi
   if [[ -n "${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE}" ]]; then
     printf 'TYCHO_STREAM_WS_BUFFER_SIZE=%s \\\n' \
-      "$(shell_escape "${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE}")"
+      "$(tycho_combined_family_shell_escape "${TYCHO_STREAM_WS_BUFFER_SIZE_VALUE}")"
   fi
   if [[ -n "${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE}" ]]; then
     printf 'TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE=%s \\\n' \
-      "$(shell_escape "${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE}")"
+      "$(tycho_combined_family_shell_escape "${TYCHO_STREAM_SUBSCRIPTION_BUFFER_SIZE_VALUE}")"
   fi
 }
 

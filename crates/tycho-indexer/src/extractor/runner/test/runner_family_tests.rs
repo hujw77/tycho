@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
 };
 
@@ -93,17 +93,7 @@ async fn test_family_runner_dispatches_shared_stream_into_branch_extractors() {
         .await
         .insert(0, v3_tx);
 
-    let dispatcher = FamilyBlockChangesDispatcher::new([
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ])
-    .expect("dispatcher builds");
+    let dispatcher = make_uniswap_family_dispatcher();
 
     let runner = family_runner_for_tests(
         HashMap::from([
@@ -160,17 +150,7 @@ async fn test_family_runner_does_not_propagate_partial_branch_results_when_later
         .await
         .insert(0, v3_tx);
 
-    let dispatcher = FamilyBlockChangesDispatcher::new([
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ])
-    .expect("dispatcher builds");
+    let dispatcher = make_uniswap_family_dispatcher();
 
     let runner = family_runner_for_tests(
         HashMap::from([
@@ -378,17 +358,7 @@ async fn test_family_runner_reconnects_and_dispatches_follow_up_updates() {
         false,
         HashMap::new(),
     );
-    let dispatcher = FamilyBlockChangesDispatcher::new([
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ])
-    .expect("dispatcher builds");
+    let dispatcher = make_uniswap_family_dispatcher();
 
     let runner = family_runner_for_tests(
         HashMap::from([
@@ -475,24 +445,10 @@ async fn test_family_runner_routes_existing_components_after_restart_style_prese
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
         });
 
-    let dispatcher = {
-        let mut dispatcher = FamilyBlockChangesDispatcher::new([
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v2".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-            },
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v3".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-            },
-        ])
-        .expect("dispatcher builds");
-        dispatcher.register_component_systems(HashMap::from([
-            ("v2-pool".to_string(), "uniswap_v2".to_string()),
-            ("v3-pool".to_string(), "uniswap_v3".to_string()),
-        ]));
-        dispatcher
-    };
+    let dispatcher = make_uniswap_family_dispatcher_with_component_systems(HashMap::from([
+        ("v2-pool".to_string(), "uniswap_v2".to_string()),
+        ("v3-pool".to_string(), "uniswap_v3".to_string()),
+    ]));
 
     let runner = family_runner_for_tests(
         HashMap::from([
@@ -570,24 +526,10 @@ async fn test_family_runner_routes_contract_and_storage_follow_ups_after_restart
             Ok(Some(Arc::new(BlockAggregatedChanges::default())))
         });
 
-    let dispatcher = {
-        let mut dispatcher = FamilyBlockChangesDispatcher::new([
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v2".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-            },
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v3".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-            },
-        ])
-        .expect("dispatcher builds");
-        dispatcher.register_contract_systems(HashMap::from([
-            (vec![0x44; 20], "uniswap_v2".to_string()),
-            (vec![0x55; 20], "uniswap_v3".to_string()),
-        ]));
-        dispatcher
-    };
+    let dispatcher = make_uniswap_family_dispatcher_with_contract_systems(HashMap::from([
+        (vec![0x44; 20], "uniswap_v2".to_string()),
+        (vec![0x55; 20], "uniswap_v3".to_string()),
+    ]));
 
     let runner = family_runner_for_tests(
         HashMap::from([
@@ -645,16 +587,7 @@ async fn test_family_dispatcher_from_protocol_cache_preseeds_component_and_contr
         .await
         .expect("seed protocol cache");
 
-    let branch_specs = vec![
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ];
+    let branch_specs = make_uniswap_family_branch_specs();
     let mut dispatcher =
         FamilyBlockChangesDispatcher::from_protocol_cache(&branch_specs, &protocol_cache)
             .await
@@ -770,16 +703,7 @@ async fn test_build_family_dispatcher_from_populated_cache_uses_gateway_seeded_c
         .await
         .expect("populate protocol cache from gateway");
 
-    let branch_specs = vec![
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ];
+    let branch_specs = make_uniswap_family_branch_specs();
     let mut dispatcher =
         FamilyBlockChangesDispatcher::from_protocol_cache(&branch_specs, &protocol_cache)
             .await
@@ -885,37 +809,13 @@ async fn test_family_runner_hydrates_missing_component_ownership_from_protocol_c
         .once()
         .returning(|| Ok(()));
 
-    let dispatcher = FamilyBlockChangesDispatcher::new([
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ])
-    .expect("dispatcher builds");
+    let dispatcher = make_uniswap_family_dispatcher();
 
     let extractors = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let branch_specs = vec![
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ];
-    let runtime_contract =
-        crate::extractor::family_runtime_planning::ResolvedFamilyRuntimeContract {
-            shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
-            branch_specs: branch_specs.clone(),
-        };
+    let runtime_contract = make_uniswap_family_runtime_contract();
     let runtime_state =
         FamilyRuntimeState::new(&runtime_contract, &extractors, dispatcher, protocol_cache);
     let runner = FamilyExtractorRunner::new(
@@ -1049,37 +949,13 @@ async fn test_family_runner_hydrates_missing_contract_and_storage_ownership_from
         .once()
         .returning(|| Ok(()));
 
-    let dispatcher = FamilyBlockChangesDispatcher::new([
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ])
-    .expect("dispatcher builds");
+    let dispatcher = make_uniswap_family_dispatcher();
 
     let extractors = HashMap::from([
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let branch_specs = vec![
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ];
-    let runtime_contract =
-        crate::extractor::family_runtime_planning::ResolvedFamilyRuntimeContract {
-            shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
-            branch_specs: branch_specs.clone(),
-        };
+    let runtime_contract = make_uniswap_family_runtime_contract();
     let runtime_state =
         FamilyRuntimeState::new(&runtime_contract, &extractors, dispatcher, protocol_cache);
     let runner = FamilyExtractorRunner::new(

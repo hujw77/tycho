@@ -1,22 +1,20 @@
 use crate::extractor::{
     bootstrap_lifecycle::{
-        decide_bootstrap_run, execute_bootstrap_run_decision_with_progress_reload,
+        decide_bootstrap_run, load_and_execute_context_prepared_bootstrap_run_and_resolve,
     },
     extractor_config::BootstrapConfig,
-    family_registry::FamilyRuntimeRegistry,
     load_extractor_progress_snapshot,
-    managed_substreams_request::{resolved_stream_position_from_resume, ResolvedStreamPosition},
+    managed_substreams_request::{
+        resolved_stream_position_from_resume, ResolvedStreamPosition,
+        StandalonePreparedRequestContext,
+    },
     shared_bootstrap::{
-        configured_bootstrap_block, execute_materialized_bootstrap_plan,
-        BootstrapCompletionPolicy, BootstrapCompletionSnapshot,
-        MaterializedBootstrapCommitTarget, SharedBootstrapPlan,
+        configured_bootstrap_block, BootstrapCompletionPolicy, BootstrapCompletionSnapshot,
     },
     runtime_target_planning::ResolvedStandaloneRuntime,
     ExtractionError, Extractor, ExtractorProgressSnapshot,
 };
-use std::sync::Arc;
 use tracing::info;
-use tycho_common::models::ExtractorIdentity;
 use tycho_ethereum::rpc::EthereumRpcClient;
 
 pub(crate) use crate::extractor::bootstrap_lifecycle::BootstrapRunDecision as StandaloneBootstrapAction;
@@ -25,58 +23,6 @@ pub(crate) type ResolvedStandaloneStreamPosition = ResolvedStreamPosition;
 
 pub(crate) struct StandaloneLifecycleProgress {
     progress: ExtractorProgressSnapshot,
-}
-
-async fn run_standalone_bootstrap_once(
-    standalone: &ResolvedStandaloneRuntime<'_>,
-    extractor: Arc<dyn Extractor>,
-    extractor_id: &ExtractorIdentity,
-    rpc_client: &EthereumRpcClient,
-    registry: FamilyRuntimeRegistry<'static>,
-) -> Result<(), ExtractionError> {
-    let config = standalone.extractor_config;
-    let bootstrap = config
-        .bootstrap
-        .as_ref()
-        .expect("standalone bootstrap execution requires bootstrap config");
-    let plan =
-        SharedBootstrapPlan::for_extractor_config_with_registry(config, bootstrap, registry)?;
-    let shared_bootstrap_execution = registry
-        .resolve_shared_bootstrap_execution_for_protocol_system(config.protocol_system())?;
-
-    info!(
-        extractor_id = %extractor_id,
-        branches = plan.branches.len(),
-        bootstrap_block = plan.bootstrap_block,
-        "BootstrapExecutorInit"
-    );
-
-    for branch in &plan.branches {
-        info!(
-            extractor_id = %extractor_id,
-            strategy = ?branch.strategy,
-            protocol_system = branch.protocol_system,
-            pools = branch.params.pools.len(),
-            "BootstrapExecutorBranch"
-        );
-    }
-
-    execute_materialized_bootstrap_plan(
-        rpc_client,
-        &plan,
-        &shared_bootstrap_execution,
-        vec![MaterializedBootstrapCommitTarget::whole_block(extractor.clone())],
-        extractor,
-    )
-    .await?;
-
-    info!(
-        extractor_id = %extractor_id,
-        bootstrap_block = plan.bootstrap_block,
-        "BootstrapExecutorCompleted"
-    );
-
-    Ok(())
 }
 
 pub(crate) async fn load_standalone_progress_snapshot(
@@ -162,36 +108,29 @@ pub(crate) fn resolve_standalone_stream_start_block(
 impl<'a> ResolvedStandaloneRuntime<'a> {
     pub(crate) async fn prepare_stream_position_after_bootstrap(
         &self,
-        extractor: Arc<dyn Extractor>,
-        extractor_id: &ExtractorIdentity,
+        context: &StandalonePreparedRequestContext,
         rpc_client: &EthereumRpcClient,
-        registry: FamilyRuntimeRegistry<'static>,
     ) -> Result<ResolvedStandaloneStreamPosition, ExtractionError> {
-        let progress = StandaloneLifecycleProgress::load(extractor.as_ref()).await?;
-        let decision = progress.decide_bootstrap_action(
-            self.extractor_config.name(),
-            self.extractor_config.bootstrap.as_ref(),
-        )?;
-        let bootstrap_extractor = extractor.clone();
-        let progress = execute_bootstrap_run_decision_with_progress_reload(
-            progress,
-            decision,
-            &extractor_id.to_string(),
-            "extractor",
-            || StandaloneLifecycleProgress::load(extractor.as_ref()),
-            move |_| {
-                run_standalone_bootstrap_once(
-                    self,
-                    bootstrap_extractor.clone(),
-                    extractor_id,
-                    rpc_client,
-                    registry,
-                )
-            },
-        )
-        .await?;
-        let stream_position =
-            progress.resolve_stream_position(self.substreams_execution_request()?.start_block)?;
+        let (progress, stream_position) =
+            load_and_execute_context_prepared_bootstrap_run_and_resolve(
+                context,
+                || StandaloneLifecycleProgress::load(context.extractor.as_ref()),
+                |_| Ok(()),
+                |progress| {
+                    progress
+                        .decide_bootstrap_action(
+                            self.extractor_config.name(),
+                            self.extractor_config.bootstrap.as_ref(),
+                        )
+                        .map(Some)
+                },
+                rpc_client,
+                |progress| {
+                    progress
+                        .resolve_stream_position(self.substreams_execution_request()?.start_block)
+                },
+            )
+            .await?;
 
         if let Some(block_number) = progress.last_processed_block() {
             info!(
@@ -215,6 +154,7 @@ mod tests {
 
     use crate::extractor::{
         extractor_config::{BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig},
+        family_registry::default_family_runtime_registry,
         runtime_target_planning::ResolvedStandaloneRuntime,
         MockExtractor, PersistedExtractorStateScope,
     };
@@ -323,10 +263,11 @@ mod tests {
             Default::default(),
             None,
         );
-        let standalone = ResolvedStandaloneRuntime {
-            protocol_system: "curve",
-            extractor_config: &config,
-        };
+        let standalone = ResolvedStandaloneRuntime::from_extractor_config_with_registry(
+            &config,
+            default_family_runtime_registry(),
+        )
+            .expect("standalone runtime should resolve from config");
 
         let mut extractor = MockExtractor::new();
         extractor

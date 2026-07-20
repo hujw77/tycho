@@ -8,23 +8,50 @@
 
 Current Phase 3 operator entrypoint:
 
+- `tycho-indexer index` now defaults its `--extractors-config` argument to the canonical
+  combined-family repo path
+  `./crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml` rather than the legacy
+  `./extractors.yaml` root entrypoint, so the binary default no longer routes operators into a
+  config surface that the family-member standalone guard rejects
 - `scripts/check-combined-family.sh` is now the top-level validation surface
   - `command acceptance` / `run-acceptance` now mean the repo-local shared-runtime acceptance
-    surface: the manifest-backed extensibility contract gate plus the DB-backed shared-runtime
-    gate
+    surface: the manifest-backed extensibility contract gate, the repo-local Fynd replay
+    contract gate, plus the DB-backed shared-runtime gate
+  - `command acceptance-managed` / `run-acceptance-managed` now mean that same repo-local
+    acceptance surface plus the managed live Fynd environment validation step against the
+    canonical combined-family indexer entrypoint
   - `command full` / `run-full` now mean repo acceptance plus live Fynd environment validation
     rather than the looser `all` mode: `main.rs` now locks `full` to
     `extensibility gate -> DB gate -> live gate`, while `all` remains the narrower
     `DB gate -> live gate` operator surface
+  - `command full-managed` / `run-full-managed` now remain compatibility aliases for the
+    explicit `acceptance-managed` path rather than a distinct workflow surface
   - `doctor` now also reports the canonical combined-family indexer operator readiness and
     startup command surface from `scripts/run-combined-family-indexer.sh`, while keeping
     `acceptance_ready` / `full_ready` scoped to the acceptance-vs-live split:
     `acceptance_ready` becomes true once the extensibility and DB gates are ready, while
     `full_ready` stays false until the live Fynd gate is ready too
+  - `doctor` now also reports `acceptance_managed_ready` explicitly so the formal managed
+    acceptance path has its own readiness signal instead of being inferred indirectly from the
+    older `full-managed` alias
   - the top-level live step is no longer locked to the full two-test Fynd pass: setting
     `TYCHO_COMBINED_FAMILY_LIVE_SELECTION=route|settlement|all` narrows `command live`,
     `run-live`, `command full`, and `run-full` without changing the default `all` behavior
 - `scripts/check-combined-family-db.sh` remains the repo-local DB-backed gate
+- `scripts/check-combined-family-fynd-replay.sh` now anchors the repo-local Fynd-side combined
+  family contract:
+  - its manifest-backed package/test list lives in
+    `crates/tycho-indexer/tests/combined_family_fynd_replay_gate.tests`
+  - the canonical replay surface currently locks:
+    `fynd-rpc`'s
+    `test_quote_endpoint_replays_combined_family_fixture`
+    and `fynd-core`'s
+    `test_handle_message_tracks_combined_family_sync_states_and_components`
+    plus
+    `test_combined_uniswap_dynamic_admission_becomes_routable_in_replay`
+  - this closes the previous gap where repo-local acceptance proved Tycho shared-runtime and DB
+    behavior, but left Fynd's local quote/feed semantics outside the standard acceptance gate;
+    dynamic post-bootstrap pool admission is now part of that canonical replay contract too
 - `scripts/check-combined-family-fynd-live-e2e.sh` remains the live Tycho/Fynd gate
   - the live gate is now source-anchored too: its default route/settlement ignored-test
     selectors live in
@@ -69,10 +96,11 @@ Current Phase 3 operator entrypoint:
   `ProtocolExtractor::new_with_runtime_support(...)`, and the first concrete Uniswap V3 hydrator
   reuses the existing bootstrap snapshot helpers to backfill created pools that would otherwise
   land with non-zero liquidity but no tick map
-- `scripts/check-combined-family.sh` now also exposes optional managed live/full modes:
-  `run-live-managed` and `run-full-managed` can start the canonical combined-family indexer
+- `scripts/check-combined-family.sh` now also exposes explicit managed live/acceptance modes:
+  `run-live-managed` and `run-acceptance-managed` can start the canonical combined-family indexer
   entrypoint, wait for live combined-family query readiness, run the live Fynd E2E contract, and
   then tear the managed indexer process down again
+  - `run-full-managed` remains a compatibility alias for `run-acceptance-managed`
   - `managed_live_ready` / `managed_full_ready` are intentionally stricter than
     `operator_ready`: they now require the live Fynd prerequisites too, so the aggregate doctor
     output no longer reports the managed path ready when the indexer could boot but the sibling
@@ -106,12 +134,133 @@ Current Phase 3 operator entrypoint:
   family-level hooks when a member does not override them, and the built-in Uniswap defaults now
   source the V3-specific auxiliary decoder/hydrator wiring directly from the V3 member
   registration; this removes another family-local special case from the extensibility surface
+- built-in Uniswap bootstrap orchestration is narrower now too:
+  the default family registry no longer leaves Uniswap on the generic shared-bootstrap fallback;
+  it now binds the family to an explicit family-owned shared bootstrap materializer, so the
+  built-in V2/V3 family does not reach its bootstrap execution path through the old
+  registry-absent sequential branch loop even though the generic helper still remains available
+  for future families that want the same orchestration shape
+- shared bootstrap execution ownership is narrower now too:
+  non-test execution resolution no longer falls back from a `SharedBootstrapPlan` onto the first
+  branch protocol system when `family_name` is missing; production callers must now resolve a
+  family-owned plan first, and the protocol-system resolver survives only as a test seam
+- shared bootstrap lifecycle ownership is narrower now too:
+  standalone and family startup no longer open-code separate
+  `load progress -> decide bootstrap -> optionally run -> reload -> resolve stream position`
+  control flows; both now enter through one shared lifecycle helper in
+  `bootstrap_lifecycle.rs`, while still keeping protocol-specific progress validation and resume
+  semantics at the concrete lifecycle owner
+- managed startup ownership is narrower now too:
+  standalone and family runtime owners no longer each hand-roll their own
+  `prepared request context + into managed runner` shell; both now reuse one generic
+  `PreparedManagedRuntimeOwner<RunnerFactory, Context>` owner in
+  `runtime_targets_startup.rs`, leaving only the concrete runner-factory state different between
+  single-runtime and family-runtime startup
+- standalone resolution compatibility is narrower now too:
+  production `ResolvedStandaloneRuntime::from_extractor_config_with_registry(...)` no longer
+  admits protocol systems that already belong to a registered family, even when the config omits
+  an explicit `family_runtime`; only the test-only family-member standalone helper survives as an
+  intentional escape hatch, so registered family members cannot silently bypass the canonical
+  shared-stream family runtime path
+- runtime-target selector ownership is narrower now too:
+  family-member protocol systems no longer rely on `record-substreams`-local guardrails to avoid
+  the standalone path; `ResolvedRuntimeTargets` itself now rejects standalone protocol-system
+  selectors that point at registered family members and tells callers to use the canonical family
+  selector instead, so future selector-based entrypoints inherit the same shared-stream routing
+  contract without duplicating that compatibility check
+- family-runtime facade ownership is narrower now too:
+  `family_runtime.rs` no longer re-exports the registry-backed planning helpers as part of the
+  wide public family-runtime facade; the direct planning module APIs still remain public for now
+  because the `tycho-indexer` binary target imports them through the library boundary, which
+  identifies that bin/lib seam as the next place to consolidate if we want to fully hide those
+  helpers behind one canonical family-runtime planning entrypoint later
+  - that bin/lib seam is narrower now too:
+    `FamilyRuntimeRegistry` itself now owns the production `detect -> build plan -> resolve plan
+    -> assemble runtime targets` entrypoints, and `config.rs` enters through those registry
+    methods directly; `family_runtime.rs` remains only as a thin compatibility facade that
+    forwards back to the registry owner instead of still holding the planning logic locally
+- family-runtime default-registry ownership is narrower now too:
+  `extractor/family_runtime.rs` no longer re-exports `default_family_runtime_registry(...)` as
+  part of the general family-runtime facade, and
+  `extractor/family_runtime_detection.rs`, `extractor/family_runtime_planning.rs`, and
+  `extractor/family_runtime_resolution.rs` are now crate-internal modules; built-in family
+  registry ownership stays anchored in the explicit default-registry owner and the CLI/runtime
+  boundary instead of remaining ambient across the broader library facade
+- CLI boundary ownership is narrower now too:
+  the one remaining production built-in registry construction no longer lives in `main.rs`;
+  `cli.rs` now owns `Cli::family_runtime_registry()` as the explicit CLI boundary for the
+  built-in family registry, and the production `main.rs` dispatch path only consumes that
+  boundary instead of constructing the registry itself
+- index startup ownership is narrower now too:
+  `main.rs` no longer resolves a loaded extractor config into a runtime plan and then separately
+  threads that plan into startup for the `index` command; `LoadedIndexerRuntimePlan` now owns the
+  `resolve runtime plan -> start managed indexing` handoff through one
+  `start_indexing(...)` entrypoint in `config.rs`, so the index path stays closer to the same
+  owner that already governs runtime-plan/service-config composition
+- runtime-plan startup ownership is narrower now too:
+  `run_spkg` no longer keeps its own `create_indexing_tasks(...)` startup shell in `main.rs`;
+  `ResolvedIndexerRuntimePlan` itself now owns the
+  `resolved runtime plan -> start managed indexing` handoff for both `index` and `run`,
+  which leaves `ResolvedServiceLaunchConfig` as the lower-level task launcher instead of a second
+  runtime-plan startup facade
+- prepared-bootstrap lifecycle wiring is narrower now too:
+  standalone and family lifecycle owners no longer each wire
+  `load progress -> optional prepared bootstrap execution -> resolve stream position`
+  through their own local `run_logged_optional_prepared_bootstrap_execution(...)` shell;
+  `bootstrap_lifecycle.rs` now owns that prepared-bootstrap execution wrapper too, so the
+  concrete lifecycle owners retain only their progress loading, validation, and stream-position
+  policy differences
+- prepared-bootstrap context ownership is narrower now too:
+  `StandalonePreparedRequestContext` and `FamilyPreparedRequestContext` now both satisfy one
+  `PreparedBootstrapContextView` contract for startup scope id/kind plus optional prepared
+  bootstrap ownership, and the production lifecycle owners now enter through
+  `load_and_execute_context_prepared_bootstrap_run_and_resolve(...)` instead of each
+  re-threading `scope id + scope kind + prepared bootstrap owner` into the shared lifecycle
+  helper by hand
+- managed-startup draft dispatch ownership is narrower now too:
+  family and standalone managed-startup modules no longer each expose an inherent
+  `prepare_managed_startup_draft(...)` wrapper that only forwards into the same
+  `ManagedStartupLifecycleView` default implementation; `runtime_targets_startup.rs` now
+  dispatches directly through the shared lifecycle trait owner, leaving the concrete startup
+  modules responsible only for runtime-owner construction
+- draft-to-startup stream loading ownership is narrower now too:
+  `PreparedRuntimeTargetDraft` no longer relies on a separate
+  `prepare_runtime_target_startup_from_draft(...)` free-function shim to turn
+  `prepared request -> loaded stream -> prepared startup`; the draft owner now owns that final
+  transition itself, so runtime-target startup keeps one canonical draft-to-startup path
+- record-substreams request resolution ownership is narrower now too:
+  `record_substreams.rs` no longer resolves one selected target and then applies its own local
+  request-override reshaping step; the config-backed recorder path now delegates that final
+  `selector -> effective start/stop -> resolved Substreams request` transition to
+  `ResolvedRuntimeTargets::resolve_substreams_execution_request(...)`, so the runtime-target
+  planning owner stays canonical for both indexing startup and recorder-side derived requests
+- prepared-request stream loading ownership is narrower now too:
+  `managed_stream_startup.rs` no longer keeps separate free-function helpers for
+  `prepared request -> loaded package -> stream`; `PreparedSubstreamsRequest` now owns both
+  `build_stream(...)` and `load_stream(...)`, so the same request payload type remains canonical
+  all the way from startup request preparation through final shared-stream materialization
+- bin/lib planning seam is narrower now too:
+  the binary-side config loader no longer reaches straight into
+  `family_runtime_planning::build_resolved_runtime_targets_with_registry(...)`; production config
+  resolution now enters through one library-owned family-runtime facade function instead, so the
+  next step can focus on shrinking the underlying planning helper surface without leaving the
+  binary target coupled to the internal planning module layout
+  - that next step has now partially landed too:
+    production config resolution no longer needs the family-runtime facade as its canonical owner;
+    the registry itself now exposes the planning/runtime-target entrypoints the bin side needs,
+    so the remaining facade can shrink further without re-expanding the binary target's coupling
+    to internal planning module layout
 
 ## Current Audit Run (2026-07-15)
 
 - repo-local shared-runtime acceptance remains green:
   `scripts/check-combined-family-extensibility.sh run` and
   `scripts/check-combined-family-db.sh run` had already passed before this audit slice
+- repo-local acceptance now also covers Fynd's local combined-family semantics instead of only
+  Tycho-owned surfaces:
+  `scripts/check-combined-family-fynd-replay.sh` standardizes the package-backed replay tests that
+  prove the HTTP quote surface and feed sync-state handling still match the combined-family
+  contract without needing a live chain/RPC environment
 - shared bootstrap branch token propagation had a real bug and is now fixed:
   branch-local `new_tokens` are preserved even when a merged bootstrap block introduces tokens
   only through protocol components and not through balance changes
@@ -138,6 +287,122 @@ Current Phase 3 operator entrypoint:
   than in the combined-family indexer itself, and the live gate now exposes
   `FYND_E2E_TOKEN_BALANCE_SLOT` / `FYND_E2E_TOKEN_ALLOWANCE_SLOT` so operators can pin known
   ERC20 storage slots when RPC rate limiting makes repeated slot probing too expensive
+- config-owned family registry state is narrower now too:
+  `ExtractorConfigs` now preserves the exact family runtime registry it was loaded with, so
+  later calls through convenience helpers like `resolved_runtime_targets()` and
+  `resolved_indexer_runtime_plan()` no longer silently fall back to the built-in Uniswap registry
+  after a future-family/custom-registry config has already been accepted at load time
+- CLI/runtime entrypoint ownership is narrower now too:
+  `main.rs` now centralizes built-in registry ownership behind an explicit
+  `CliRuntimeContext` at command dispatch time and threads that same owner through the production
+  `index`, `run`, and `record-substreams` paths, so the top-level Tycho binary no longer lets
+  those three entrypoints independently snap back to built-in defaults while preparing the shared
+  bootstrap / single-stream runtime
+- default-registry compatibility wrappers are narrower now too:
+  the legacy no-registry convenience entrypoints in `config.rs` and `record_substreams.rs` are
+  now test-only surfaces, which keeps existing unit/integration fixtures readable while making
+  the non-test build depend on explicit registry-bearing APIs for config loading and
+  record-substreams planning
+  - that cleanup has started turning into real deletion too:
+    `LoadedIndexerRuntimePlan::from_yaml(...)` and the no-registry
+    `resolve_record_substreams_request(...)` / `record_substreams_fixture(...)` helpers are now
+    removed entirely, and the remaining recorder/config tests call
+    `from_yaml_with_registry(...)`, `resolve_record_substreams_request_with_registry(...)`, and
+    `record_substreams_fixture_with_registry(...)` directly
+  - `ExtractorConfigs::new(...)`, `ExtractorConfigs::from_yaml(...)`, and the default-registry
+    `TryFrom<RawExtractorConfigs>` adapter are now gone as well:
+    test-only construction now lives in local helper functions that explicitly call
+    `new_with_registry(...)` / `from_yaml_with_registry(...)`, so the library surface no longer
+    exposes implicit default-registry config construction at all
+  - after that cleanup, the remaining non-test built-in registry construction is intentionally
+    concentrated at the CLI binary boundary in `main.rs` via `CliRuntimeContext::built_in()`,
+    rather than being spread across config loading or recorder/runtime-planning library surfaces
+- shared bootstrap runtime resolution is narrower now too:
+  `FamilyRuntimeRegistry::build_shared_bootstrap_runtime(...)` now owns the atomic
+  `plan + execution` resolution step, and both standalone bootstrap startup
+  (`extractor_lifecycle.rs`) and family bootstrap planning
+  (`family_runtime_planning.rs`) now consume that single helper instead of reassembling
+  `SharedBootstrapPlan` and `ResolvedSharedBootstrapExecution` through separate call paths
+  keyed by different local assumptions
+- optional shared-bootstrap runtime resolution is narrower now too:
+  the `has bootstrap config? then filter member configs and maybe build runtime` compatibility
+  layer no longer lives partly in `runtime_target_planning.rs` and partly in
+  `family_runtime_resolution.rs`; `FamilyRuntimeRegistry` now owns that optional resolution
+  surface too, so both standalone runtime planning and family runtime resolution delegate the
+  final `config set -> Option<ResolvedSharedBootstrapRuntime>` shaping back to the registry owner
+  - that narrowing is now direct in production too:
+    `family_runtime_resolution.rs` no longer keeps a local
+    `resolve_shared_bootstrap_runtime_for_configs(...)` pass-through helper, so the family
+    shared-runtime owner now calls the registry surface directly instead of preserving one last
+    compatibility wrapper around the same `extractor_configs.iter().copied()` delegation
+- shared bootstrap config ownership is narrower now too:
+  `ExtractorConfigs` now exposes a family-scoped `shared_bootstrap_plan_for_family(...)` helper
+  alongside the lower-level protocol-system variant, so config-time shared bootstrap resolution
+  can anchor directly on the registered family contract instead of requiring future callers to
+  manually reassemble member protocol-system lists before they can reuse the one shared bootstrap
+  pipeline
+  - that family-scoped helper now delegates into
+    `FamilyRuntimeRegistry::build_shared_bootstrap_plan_for_family(...)` instead of rebuilding the
+    member extractor/bootstrap branch set inside `config.rs`, which keeps family membership and
+    required-branch resolution owned by the registry rather than by a config-local compatibility
+    loop
+  - the shared `protocol_system -> ExtractorConfig` lookup contract now lives in
+    `extractor_config.rs` as well, so both family runtime planning and shared bootstrap registry
+    resolution reuse the same duplicate-detection owner instead of letting that lookup remain
+    implicitly owned by `family_runtime_planning.rs`
+  - after that split, the protocol-system-scoped bootstrap-config helpers in `config.rs` are now
+    test-only compatibility surfaces; the non-test config surface keeps only the family-scoped
+    entrypoint instead of advertising a production path that starts from per-member enumeration
+  - the same narrowing now reaches the lower shared-bootstrap plan helpers too:
+    `SharedBootstrapPlan::for_extractor_config_with_registry(...)` and
+    `for_extractor_configs_with_registry(...)` are test-only compatibility constructors, while
+    non-test code is expected to enter through registry-owned family/runtime resolution instead of
+    reconstructing shared plans from ad hoc member tuples
+- standalone managed-startup test wiring no longer has a hidden default-registry fallback:
+  the test-only single-runner helper in `managed_stream_startup.rs` now accepts an explicit
+  registry, and `standalone_managed_startup.rs` carries a regression proving prepared request
+  context construction preserves a custom family registry instead of silently snapping back to
+  the built-in Uniswap defaults
+- startup-owned managed runner assembly is narrower now too:
+  both standalone and family startup paths now materialize through the same generic
+  `PreparedManagedRuntimePayload<Owner>` shape, and both runtime owners hand runner control
+  channel/subscription/handle construction off to explicit wiring helpers
+  (`SingleRuntimeWiring` and `FamilyBranchRuntimeWiring`) instead of open-coding those details
+  inside owner-local startup methods
+- `record-substreams` request derivation is narrower now too:
+  the derived-mode path now resolves onto `ResolvedRuntimeTargets` directly before selecting the
+  final Substreams request, instead of bouncing back through config-owned wrapper helpers; that
+  keeps family-vs-standalone request selection anchored on the same resolved runtime-target layer
+  that the managed startup path already uses
+  - the runtime-target layer now also owns the consuming selector path explicitly through
+    `ResolvedRuntimeTargets::into_resolved_target(...)`, so callers that need to take ownership
+    of the selected target no longer have to open-code the same selector-vs-unique branching that
+    borrowed callers already got from `resolve_target(...)`
+- production indexing startup ownership is narrower now too:
+  `ResolvedIndexerRuntimePlan` now keeps the family runtime registry that was used to resolve the
+  plan in the first place, and the production `run_indexer -> create_indexing_tasks ->
+  start_indexing_runtime_plan` path no longer threads that registry a second time through
+  `ResolvedIndexerTaskContext`; startup/build now consumes the resolved plan as the single owner
+  of both runtime targets and the registry needed to build them
+- detection-vs-runtime family ownership is narrower now too:
+  `ResolvedFamilyRuntime` now carries only `FamilyRuntimeMembership` from the detection layer,
+  while full shared-stream identity remains owned by `ResolvedFamilyRuntimeContract`;
+  `DetectedFamilyRuntime` itself now stores only membership plus the minimal shared target
+  (`shared_spkg` / `shared_module`), and restores full shared-stream identity through the family
+  runtime registry on demand instead of caching `extractor_id`, `shared_stream_name`, and
+  `durability_scope` directly at detection time
+- the live operator gate is source-anchored to ignored-test semantics now too:
+  `check-combined-family-fynd-live-e2e.sh` no longer treats any matching `fn test_name(...)`
+  as sufficient; doctor readiness now requires the manifest-mapped Fynd tests to remain actual
+  `#[ignore]`-guarded E2E entrypoints, and `main.rs` carries a regression proving that
+  non-ignored lookalike functions are rejected instead of being mistaken for the live contract
+- the combined-family indexer operator entrypoint is narrower now too:
+  `scripts/run-combined-family-indexer.sh` no longer treats any existing extractor config as
+  sufficient readiness; doctor readiness now requires the effective
+  `TYCHO_INDEXER_EXTRACTORS_CONFIG` to stay on the canonical
+  `crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml` contract, so the documented
+  combined-family startup path cannot silently drift onto a different extractor topology while
+  still reporting `ready=true`
 - the repo-local operator contract around that live gate is now re-verified too:
   `cargo test -p tycho-indexer combined_family_fynd_live_e2e_script_forwards_token_slot_overrides -- --nocapture`
   and
@@ -225,6 +490,11 @@ Current implementation status:
   construction: if bootstrap-adjusted `start_block` values diverge across family members, the
   shared runtime plan is rejected at planning time instead of deferring that mismatch to runner
   startup
+- the shared bootstrap runtime itself now has one canonical resolution surface:
+  registry-owned planning can derive the effective family execution directly from the same config
+  set that produced the plan, so standalone and family paths no longer need separate
+  `protocol_system`-vs-`family_name` resolution choreography just to execute the same shared
+  bootstrap pipeline
 - family runtime resolution now also rejects incompatible merged `substreams_params` at planning
   time, so family members cannot drift on shared stream module parameters and only discover the
   conflict when the runner tries to assemble one combined request
@@ -543,6 +813,12 @@ Current implementation status:
   artifacts into separate typed collections before the final runner fan-out, so the orchestration
   surface that turns runtime targets into managed runners no longer depends on a generic
   family-or-standalone startup enum in the live path
+  - that typed split is explicit in the prepared startup owner now too:
+    `PreparedRuntimeTargetsStartup` no longer stores one generic `prepared_targets` vector at the
+    end of startup preparation; it keeps `family_targets` and `standalone_targets` in separate
+    slots all the way to final managed-runner assembly, so the single shared-stream family path
+    can stay distinguishable from standalone startup without reopening a second generic target
+    list at the last orchestration step
 - shared runtime-target startup environment is narrower now too:
   protocol-cache population plus initialized-account preload for resolved runtime targets now live
   in `extractor/startup.rs` via a dedicated `prepare_startup(...)` step, so
@@ -1249,6 +1525,33 @@ The core Phase 3 runtime architecture is now in place:
   path for shared stream shutdown/error mapping plus shared block-number derivation, while
   standalone and family runtimes only provide their response-specific `BlockResponse ->
   RuntimeLoopControlFlow` handling
+- shared family progress persistence is tighter now too:
+  combined-family branch extractors can still share one durability scope for cursor/bootstrap
+  reads, but only one canonical branch now persists the shared cursor state; non-owner branches
+  still commit protocol/account/component data without racing to rewrite the same family cursor
+- shared family progress-owner selection is less implicit now too:
+  the canonical shared-progress owner is now an explicit `FamilyRuntimeSpec` field instead of
+  being inferred from `branch_specs[0]`; default helpers still preserve first-member behavior as
+  a compatibility fallback, but the production Uniswap family now declares its owner directly and
+  registry validation rejects owners that are not actual family members
+- shared family commit ordering is tighter now too:
+  `family_runtime_execution.rs` now sorts branch payload execution so the shared-progress owner
+  branch runs last, which keeps the persisted shared cursor aligned with the point where all
+  earlier branch writes for the block have already committed
+- shared bootstrap completion ownership is aligned with that same explicit owner now too:
+  `FamilyBootstrapCommitWiring::from_runtime_contract(...)` no longer picks the first branch
+  extractor as the bootstrap-completion writer; it now resolves the completion extractor from the
+  same explicit shared-progress owner field, so shared bootstrap completion markers and shared
+  stream cursor persistence are committed through one consistent family owner
+- those semantics are now directly covered by focused tests:
+  `sorts_shared_progress_owner_last` proves owner-last branch ordering, and
+  `test_advance_can_skip_shared_cursor_persistence_for_non_owner_branch` proves a non-owner
+  branch can durably write protocol data without persisting the shared cursor key;
+  `registry_rejects_shared_progress_owner_outside_member_set` and
+  `resolved_runtime_plan_precomputes_family_execution_settings` now also lock explicit-owner
+  registry validation and runtime-plan propagation, while
+  `bootstrap_commit_wiring_uses_shared_progress_owner_as_completion_extractor` locks bootstrap
+  completion-writer alignment to that same explicit owner
 - the runtime control-message plumbing is now shared too:
   `extractor/execution_loop.rs` now owns the common `ControlMessage::{Stop, Subscribe}` dispatch
   shell, while standalone and family runtimes only provide their stop logging and subscribe-side
@@ -1643,37 +1946,46 @@ partially evidenced or still missing a dedicated regression.
   `combined_family_runner_reverts_dynamically_admitted_components_across_branches`
   proves that once a shared-family block has durably admitted both a V2 and a V3 component,
   a later `BlockUndoSignal` can remove both branches' component/state visibility from storage and
-  from `/v1/protocol_components` and `/v1/protocol_state`
+  from `/v1/protocol_components` and `/v1/protocol_state`; this multi-branch revert path is now
+  also part of the strict DB-backed combined-family gate
 - DB-backed shared-family reorg recovery semantics are now also directly covered across multiple
   protocol branches:
   `combined_family_runner_recovers_after_revert_and_reapplies_multi_branch_state`
   proves that after such a shared-family revert, the same single upstream family stream can ingest
   the new canonical branch for both V2 and V3, re-materialize both components, persist later
   follow-up state updates, and expose that recovered post-reorg state through both direct storage
-  reads and `/v1/protocol_components` and `/v1/protocol_state`
+  reads and `/v1/protocol_components` and `/v1/protocol_state`; this multi-branch reorg-recovery
+  path is now also part of the strict DB-backed combined-family gate
 - dynamic admission is directly covered through the real extractor/gateway path:
   `combined_family_runner_persists_dynamically_admitted_component`
-  proves that a newly admitted family pool is persisted and externally queryable
+  proves that a newly admitted family pool is persisted and externally queryable; this
+  base dynamic-admission persistence path is now also part of the strict DB-backed
+  combined-family gate
 - dynamic follow-up state after admission is directly covered at the latest-view storage path:
   `combined_family_runner_persists_follow_up_state_for_dynamically_admitted_component`
   proves that a pool admitted through the shared family stream can receive a later state update
   and that the latest storage view, explicit timestamp-version storage path, and RPC default
-  timestamp path all expose the updated attribute value
+  timestamp path all expose the updated attribute value; this latest-view follow-up-state
+  exposure path is now also part of the strict DB-backed combined-family gate
 - seeded-universe plus dynamic factory-style onboarding is directly covered:
   `combined_family_runner_factory_style_dynamic_component_joins_seeded_universe_and_receives_follow_up_state`
   proves that a shared-bootstrap-seeded family universe can accept a newly arriving pool on the
   shared stream and keep serving both the seeded component and the newly joined component with
-  correct follow-up state persistence
+  correct follow-up state persistence; this V2 seeded-universe onboarding path is now also part
+  of the strict DB-backed combined-family gate
 - dispatcher-level routing now also covers the tighter same-block dynamic-admission shape:
   `routes_same_block_dynamic_admission_and_follow_up_updates`
   proves that a newly created family component can be admitted and receive entity, balance,
   contract, and storage follow-ups in the very same combined family block, without requiring a
-  second block to establish component or contract ownership first
+  second block to establish component or contract ownership first; this dispatcher invariant is
+  now also part of the manifest-backed repo-local extensibility acceptance surface instead of
+  remaining a standalone unit proof only
 - the same seeded-universe contract is now directly covered for V3 as well:
   `combined_family_runner_v3_dynamic_component_joins_seeded_universe_and_receives_follow_up_state`
   proves that a shared-bootstrap-seeded V3 universe is not treated as a permanent bootstrap
   allowlist, and that a later V3 `PoolCreated -> Swap` path can admit a new pool while keeping
-  the pre-seeded V3 component visible in the same combined runtime
+  the pre-seeded V3 component visible in the same combined runtime; this V3 seeded-universe
+  onboarding path is now also part of the strict DB-backed combined-family gate
 - shared-family restart semantics are now also covered after dynamic admission:
   `combined_family_runner_restart_applies_follow_up_state_after_dynamic_component_admission`
   and `combined_family_runner_restart_applies_v3_follow_up_state_after_dynamic_component_admission`
@@ -1875,11 +2187,29 @@ partially evidenced or still missing a dedicated regression.
   bootstrap-adjusted `start_block`, `stop_block`, and merged substreams params by iterating member
   configs itself; it now consumes `ResolvedFamilyRuntime.execution`, which keeps fixture capture
   and live runtime startup aligned on one family-level source of truth
+- default-registry convenience entrypoints are now more explicitly isolated from production-family
+  orchestration:
+  `tycho-indexer index` and `record-substreams` already load runtime plans through explicit
+  registry-aware entrypoints, and the remaining default-registry wrappers in `config.rs` are now
+  marked as convenience/test-facing surfaces so future family additions do not accidentally treat
+  them as the extensibility boundary
+- family shared-stream identity is narrower now too:
+  `ResolvedSharedFamilyStream` now carries the shared stream name alongside package/module,
+  extractor id, and durability scope, `DetectedFamilyRuntime` no longer stores a parallel
+  `shared_stream_name` string, and `ResolvedFamilyRuntimeContract` now owns that resolved shared
+  stream identity directly instead of only a copied `shared_extractor_id`; family runtime wiring,
+  prepared request ownership, and future-family tests therefore consume one registry-resolved
+  identity object rather than reassembling family stream naming piecemeal
 - shared request shaping now converges on that same runtime surface as well:
   `ResolvedRuntimeTarget::substreams_execution_request_with_start_block(...)` lets the runtime
   layer emit the fully shaped family or standalone request for an already resolved effective
   start block, so `build_family_runner(...)` no longer mutates `request.start_block` after
   request construction
+- runtime-family membership is narrower now too:
+  `ResolvedFamilyRuntime` no longer embeds the full `DetectedFamilyRuntime` with its resolved
+  shared-stream identity; it now carries only `FamilyRuntimeMembership` while the resolved shared
+  stream remains owned by `ResolvedFamilyRuntimeContract`, so the live runtime path has one fewer
+  duplicated copy of shared stream metadata to keep aligned
 - that recorder convergence is now also structurally unified at the selector layer:
   derived `record-substreams` request resolution no longer maintains separate family and
   standalone config-walk branches; both modes now select one `ResolvedRuntimeTarget` and then
@@ -2108,8 +2438,8 @@ partially evidenced or still missing a dedicated regression.
   `scripts/check-combined-family-extensibility.sh run` passed after aligning the custom-family
   protocol-extractor tests with the current persisted-scope startup contract
 - repo-local DB-backed shared-runtime acceptance is currently green:
-  `scripts/check-combined-family-db.sh run` passed all 9 manifest-backed close-out tests against
-  local Postgres
+  `scripts/check-combined-family-db.sh run` passed the full manifest-backed close-out surface
+  against local Postgres
 - the top-level combined-family doctor can still report `repo_ready=false` in restricted
   environments that cannot reach local Postgres from the current shell/sandbox; that is an
   environment visibility issue, not current evidence of a shared-runtime regression
@@ -2122,11 +2452,14 @@ partially evidenced or still missing a dedicated regression.
 
 - automatically exercised live combined-runtime Fynd E2E proof covering route return and
   quote settlement against a local Tycho + live RPC environment
-- that remaining live check is now at least operationally standardized:
-  `scripts/check-combined-family-fynd-live-e2e.sh` provides `doctor`, `command`,
-  `run-route`, `run-settlement`, and `run-all` modes against the sibling `fynd` repository, so
-  the only remaining gap is whether to promote that live operator workflow into a formal
-  acceptance requirement rather than leaving it as a manual gate
+- that remaining live check is now formalized at the script-contract layer too:
+  `scripts/check-combined-family.sh` exposes `acceptance-managed` / `run-acceptance-managed` as
+  the canonical managed acceptance path, and
+  `scripts/check-combined-family-fynd-live-e2e.sh` provides the manifest-backed live route and
+  settlement contract it delegates to
+- the remaining gap is now operational proof rather than gate shape:
+  the explicit managed acceptance path still needs repeatable end-to-end validation against a real
+  local Tycho + live RPC environment before this goal can be closed with confidence
 - that live gate is slightly less flaky now too:
   both the route and settlement checks default to `FYND_E2E_HEALTH_MODE=quote_ready`, so the live
   combined-family gate now waits for Tycho/Fynd quote-path readiness and lets the existing quote
@@ -2152,6 +2485,11 @@ partially evidenced or still missing a dedicated regression.
   `AUTH_API_KEY=dummy` default and the safe `export SUBSTREAMS_API_TOKEN=...` pattern that avoids
   the shell-expansion bug where `--api_token "$SUBSTREAMS_API_TOKEN"` becomes empty when the token
   is only assigned inline for that single command
+- the operator-side combined-family contract is now owned in one shell helper as well:
+  `scripts/combined-family-common.sh` is the single owner for repo-root resolution, the canonical
+  combined-family extractors config path, the default sibling Fynd repo path, and shared shell
+  escaping, so startup, live validation, replay validation, and fixture recording do not each
+  re-declare that contract independently
 - that startup entrypoint is also less name-locked now: `TYCHO_INDEXER_ENTRYPOINT_LABEL` can
   override the human-facing label reported by `doctor` and usage text, while the default contract
   remains the canonical combined-family startup path and config
@@ -2176,8 +2514,8 @@ The next implementation slice should be:
 1. keep the manifest-backed DB gate green as the shared-family runtime continues to converge
 2. keep the checked-in live-history fixture aligned with the combined config and refresh it when
    the combined package or seed universe changes materially
-3. decide whether live Fynd E2E should become an explicit operational gate or remain a manual
-   environment validation outside the repository acceptance surface
+3. execute and stabilize the explicit `acceptance-managed` path in a real local Tycho + live RPC
+   environment so the formal managed acceptance workflow is proven rather than only specified
 
 ## Current Phase 3 Execution Plan
 
@@ -2192,9 +2530,9 @@ The remaining Phase 3 close-out sequence should be:
 4. keep the DB-backed combined-family restart/reconnect/history-slice regressions green as the
    runtime converges further, now that the checked-in strict gate passes in a local Postgres-backed
    environment
-5. decide whether live Fynd E2E remains a manual/operator validation or is promoted into a formal
-   acceptance gate, now that the top-level shared gate can optionally manage indexer startup rather
-   than depending on a separately launched healthy Tycho instance
+5. keep the explicit `acceptance-managed` path aligned with the canonical startup surface and
+   prove it in a real local Tycho + live RPC environment, now that the top-level shared gate can
+   manage indexer startup instead of depending on a separately launched healthy Tycho instance
 6. only then treat the Uniswap-family shared bootstrap + single-stream runtime as closed and use
    it as the template for the next protocol family
 
@@ -2211,6 +2549,12 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   `list` prints the exact restart/reconnect/history-slice test set, and `run` executes those
   tests with `TYCHO_REQUIRE_TEST_DB=1` so the shared-family runtime can be validated without
   rediscovering the correct serial-db subset by hand
+- the DB gate doctor is narrower about local Docker failure modes now too:
+  when Docker is available it also reports the repo-local compose `db` container id, container
+  state, and container error string, and upgrades `database_state` from a generic
+  `unreachable` to values such as `compose_db_exited` or `compose_db_exited_io_error`; this
+  makes host-level Docker/Desktop corruption show up directly in the operator diagnostics instead
+  of looking like an opaque Postgres reachability failure
 - that same DB gate now diagnoses the most common local readiness failure directly too:
   `doctor` reports Docker CLI / daemon availability plus the exact `TYCHO_IMAGE=alpine docker
   compose ... up -d db` command needed to start the local Postgres dependency, and `run` now
@@ -2231,11 +2575,12 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   entrypoint would do
 - that external DB-backed execution gap has now also been re-verified in a real local Postgres
   environment through `scripts/check-combined-family-db.sh run`: the checked-in strict manifest
-  completed end-to-end for the current seven-test close-out surface, spanning fixture-backed
-  history-slice / restart / reconnect coverage plus the completed-shared-bootstrap fresh-start
-  invariant, so the remaining Phase 3 gap is no longer whether the repo-local DB gate runs
-  successfully, but whether additional live-environment promotion is warranted beyond that
-  repo-backed proof surface
+  completed end-to-end for the current manifest-backed close-out surface, spanning fixture-backed
+  history-slice / restart / reconnect coverage, dynamic-admission persistence and follow-up-state
+  exposure, multi-branch revert/reorg recovery, seeded-universe onboarding, and the
+  completed-shared-bootstrap fresh-start invariant, so the remaining Phase 3 gap is no longer
+  whether the repo-local DB gate runs successfully, but whether additional live-environment
+  promotion is warranted beyond that repo-backed proof surface
 - the DB gate manifest itself is now constrained to keep the strongest shared-session external
   semantics proof in scope: `main.rs` verifies that
   `test_serial_db::combined_family_runner_replays_fixture_backed_v2_and_v3_history_slice_in_one_shared_session`
@@ -2514,15 +2859,15 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
 - the batch startup tail is flatter for the same reason:
   `PreparedRuntimeTargetStartup::build_managed_runner(...)` now owns the final
   prepared-startup-to-runner step for both shared-family and standalone paths, and
-  `PreparedRuntimeTargetsStartup::build_managed_runners(...)` just iterates one unified prepared
-  target list instead of maintaining separate family and standalone prepared-artifact collections,
-  so the runtime-target collection no longer re-enters a second shape-specific startup branch once
-  the shared startup preflight has already produced the prepared startup artifacts
+  `PreparedRuntimeTargetsStartup` now keeps explicit `family_targets` /
+  `standalone_targets` slots plus a typed managed-runner batch before the final compatibility
+  flattening step, so the runtime-target collection no longer has to discard the
+  family-vs-standalone distinction immediately after shared startup preflight finishes
 - that same startup convergence is now directly regression-covered too:
   `test_resolved_runtime_targets_prepare_startup_prepares_family_and_standalone_targets_together`
-  proves mixed runtime targets now prepare one unified typed startup list, preserve the expected
-  one-family-plus-one-standalone split at the artifact level, and still build the same managed
-  runner set from that single prepared-target surface
+  proves mixed runtime targets now preserve the expected one-family-plus-one-standalone split at
+  both the prepared-startup and managed-runner-batch levels, and still build the same managed
+  runner set after the final compatibility flattening step
 - family final assembly is narrower now too: `FamilyExtractorRunner::new(...)` now lives beside
   the family managed-startup path in `family_managed_startup.rs`, so the protocol-system keyed
   subscription-index initialization and final family-runner construction no longer have to stay
@@ -2746,6 +3091,22 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   `start_indexing_runtime_plan(...)` entrypoint, so `main.rs` no longer has to unpack
   `service_config + runtime_targets` just to pass them straight back into config-owned startup
   orchestration
+- the managed indexing launch tail is narrower now too:
+  production startup no longer collapses family and standalone extraction work into one raw
+  `Vec<JoinHandle<_>>` at `ManagedIndexerTasks` construction time; `config.rs` now keeps a typed
+  `ManagedExtractionTasksBatch` with explicit `family_extraction_tasks` /
+  `standalone_extraction_tasks` slots, and `ManagedIndexerTasks` now owns the final
+  `into_task_groups(...)` / `into_all_tasks(...)` flattening handoff itself instead of leaving
+  `main.rs` to reach into raw task fields; that keeps one more layer of shared-family vs
+  standalone runtime structure intact across the production index/run handoff while narrowing the
+  entrypoint seam to config-owned task-consumption methods
+- the managed-runner batch seam is narrower now too:
+  `config.rs` no longer rebuilds family-vs-standalone grouping by repartitioning a flattened
+  `Vec<ManagedRunner>` after startup preparation; `ResolvedRuntimeTargets::build_managed_runners_batch(...)`
+  now stays visible across the bin/lib boundary, `BuiltManagedRunnersBatch` exposes one typed
+  `into_parts(...)` handoff, and `config.rs` converts that directly into
+  `ManagedExtractionTasksBatch::from_managed_runners(...)`, so the runtime-target owner remains
+  the canonical place where family and standalone managed-runner structure is preserved
 - the shared startup build-context surface is narrower now too:
   production indexer startup and test-only extractor assembly no longer each open-code
   `ResolvedRuntimeTargetsBuildContext` field-by-field; both now construct it through the same
@@ -2828,9 +3189,10 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   with less registry policy and more focus on detected family/runtime-plan assembly
 - family runtime detection/plan-assembly ownership is narrower now too:
   explicit family detection, shared-stream eligibility checks, family member resolution,
-  runtime-plan assembly, and resolved family execution settings now live in
-  `extractor/family_runtime_planning.rs`, while `family_runtime.rs` is reduced further toward
-  core family runtime types, small shared helpers, and test-local scaffolding
+  runtime-plan assembly, and resolved family runtime-plan selection still live in
+  `extractor/family_runtime_planning.rs`, while the resolved execution/shared-runtime assembly
+  path now lives in `extractor/family_runtime_resolution.rs`; `family_runtime.rs` is reduced
+  further toward core family runtime types, small shared helpers, and test-local scaffolding
 - family shared-bootstrap runtime ownership is narrower now too:
   the shared-bootstrap parser/materializer function types, resolved branch-runtime list, and
   `ResolvedSharedBootstrapExecution` now live in `extractor/family_bootstrap_registry.rs`
@@ -2861,11 +3223,11 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   the narrower owner directly
 - family planning/execution shape ownership is narrower now too:
   `DetectedFamilyRuntime`, `FamilyRuntimeBuildPlan`, `ResolvedFamilyRuntime`,
-  `ResolvedFamilyExecutionConfig`, and `ResolvedFamilyRuntimePlan` now live in
-  `extractor/family_runtime_planning.rs` next to the detection, membership validation, shared
-  stream convergence checks, and resolved execution-plan assembly that produce them; the legacy
-  `family_runtime.rs` surface is reduced further toward shared-stream primitives, small merge
-  helpers, compatibility re-exports, and test scaffolding
+  `ResolvedFamilyExecutionConfig`, and `ResolvedFamilyRuntimePlan` now still anchor on the
+  family planning model, but the concrete resolved execution/shared-runtime assembly helpers have
+  moved into `extractor/family_runtime_resolution.rs` instead of remaining mixed into the
+  detection/planning owner; the legacy `family_runtime.rs` surface is reduced further toward
+  shared-stream primitives, small merge helpers, compatibility re-exports, and test scaffolding
 - shared-stream metadata ownership is narrower now too:
   `ResolvedSharedFamilyStream`, `FamilySharedStreamIdentity`, and
   `FamilySharedRuntimeMetadata` now live in `extractor/family_runtime_metadata.rs` beside the
@@ -3042,6 +3404,62 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   future shared-family runtimes would otherwise need to extend parallel
   family-vs-standalone prepared-startup enums just to preserve the same final runner assembly
   semantics
+- prepared-startup naming shells are narrower now too:
+  the intermediate `PreparedFamilyRunnerDraft` / `PreparedSingleRunnerDraft` and
+  `PreparedFamilyRunnerStartup` / `PreparedSingleRunnerStartup` aliases are now removed from the
+  production startup path entirely, so family and standalone startup flow through the shared
+  generic `PreparedManagedStartupDraft<Owner>` and `PreparedManagedRuntimeStartup<Owner>` shapes
+  directly; the remaining runtime-specific difference is the owner implementation itself, not an
+  extra layer of family-vs-standalone startup type names
+- managed-startup payload ownership is narrower now too:
+  family and standalone managed startup no longer each keep their own bespoke
+  `Prepared*RunnerPayload` wrapper plus duplicated
+  `PreparedManagedStartupPayload` / `ManagedStartupPreparedRequestPayload` impls just to carry a
+  runtime owner into the shared `prepare request -> load stream -> build runner` lifecycle;
+  `runtime_targets_startup.rs` now owns a generic `PreparedManagedRuntimePayload<O>` plus a
+  `ManagedPreparedRequestContextOwner` contract, while family and standalone startup only provide
+  the runtime-owner-specific request-context construction they actually own
+- managed-runner assembly now converges one step further too:
+  `PreparedFamilyWiredRuntime` / `PreparedSingleWiredRuntime` and the extra
+  `WiredManagedRuntime` indirection are gone from the production startup path, so
+  `PreparedManagedRuntimeOwner<RunnerFactory, Context>` now satisfies the canonical
+  `ManagedRunnerFactory` contract itself for the final
+  `stream -> managed runner + handles` assembly; family and standalone startup still differ in
+  their wiring helpers
+  (`FamilyBranchRuntimeWiring` vs `SingleRuntimeWiring`), but the top-level startup contract no
+  longer widens that difference into an extra intermediate runtime-shell layer
+- prepared runtime-target startup ownership is narrower again too:
+  `PreparedRuntimeTargetStartup` no longer hides one more
+  `PreparedRuntimeTargetStartupOwner` trait object just to forward into the same canonical
+  managed-runner build step; it now stores `Box<dyn ManagedRunnerFactory>` plus the loaded stream
+  directly, so the last prepared-startup container on the production path is closer to the real
+  end-state contract future protocol families will extend
+- prepared managed-startup naming shells are narrower again too:
+  `PreparedManagedRuntimeStartup<Owner>` is now gone from the production path entirely; even test
+  helpers that need a directly assembled prepared startup now enter through
+  `PreparedRuntimeTargetStartup::new(...)`, which keeps the final prepared-startup owner aligned
+  with the same canonical container production uses
+- prepared family bootstrap ownership is narrower now too:
+  `FamilyPreparedRequestContext` no longer carries a raw
+  `ResolvedSharedBootstrapRuntime` on one side and `FamilyBootstrapCommitWiring` on the other for
+  lifecycle code to reassemble; it now materializes one prepared shared-bootstrap owner for the
+  optional family bootstrap path, and `family_lifecycle.rs` delegates shared-bootstrap block
+  lookup and execution through that owner instead of open-coding
+  `plan + execution + branch targets + completion extractor` wiring at each call site
+- prepared family request ownership is narrower now too:
+  `PreparedFamilyRuntimeRequest` is gone from the production request path, and
+  `FamilyPreparedRequestContext` now owns the shared extractor id, durability scope, configured
+  start block, and optional prepared bootstrap owner directly instead of carrying a second
+  wrapper that only re-exposed those same fields through getters; this leaves the family request
+  context closer to a single owner for shared-family startup request preparation rather than a
+  context-plus-facade pair
+- prepared shared-bootstrap ownership is narrower now too:
+  `PreparedFamilySharedBootstrap` and `PreparedStandaloneBootstrap` are gone from the production
+  startup path; both `FamilyPreparedRequestContext` and `StandalonePreparedRequestContext` now
+  carry the same `PreparedSharedBootstrap` owner, with family-vs-standalone behavior reduced to a
+  commit-mode detail instead of two separate wrapper types. This keeps shared bootstrap execution
+  on one startup abstraction while preserving the different commit-target wiring required by
+  family and standalone runtimes
 - runtime-target draft ownership is narrower now too:
   `ResolvedRuntimeTarget::prepare_managed_startup_draft(...)` no longer widens the common
   `PreparedManagedStartupDraft<_>` surface back into a family-vs-standalone enum before stream
@@ -3203,3 +3621,127 @@ The DB-backed gate is now explicit at the shared test harness boundary too:
   contract for mixed fresh-vs-resumed branch rejection and aligned resume-block enforcement, and
   both family lifecycle validation and shared resume-state parsing delegate through that helper
   instead of keeping separate copies of the same branch-progress rules in the family path
+- shared progress-owner ownership is narrower one step further too:
+  family runtime metadata now carries the explicit `shared_progress_owner_protocol_system`
+  alongside the shared stream target and durability scope, config-path metadata resolution has
+  direct regression coverage for both Uniswap and future-family registries, and the future-family
+  test registry helpers now build through the explicit-owner family-spec constructor instead of
+  continuing to normalize `members[0]` as an implicit owner contract
+- the implicit-owner compatibility constructor is no longer exercised by active family-runtime
+  callsites either:
+  future-family config, bootstrap, metadata, and record-substreams regressions now all register
+  test families through explicit-owner builders, leaving `shared_family_runtime_spec(...)` as a
+  narrow compatibility surface instead of the pattern new family tests copy by default
+- the constructor layer now makes that compatibility boundary explicit in code as well:
+  `shared_family_runtime_spec_with_inferred_progress_owner(...)` now owns the old
+  `members[0]` fallback, and the higher-level compatibility constructors delegate through that
+  named path instead of embedding the inference inline, which makes it clearer that explicit
+  owner registration is the extensibility contract while inferred-owner construction is legacy
+  compatibility behavior
+- production standalone runtime construction is narrower now too:
+  `ResolvedStandaloneRuntime::from_extractor_config_with_registry(...)` now rejects configs that
+  already declare `family_runtime`, so once a protocol member has entered the explicit
+  shared-family runtime model it can no longer silently fall back into the production standalone
+  path through a lower-level runtime-construction seam
+- bootstrap/resume lifecycle orchestration is narrower now too:
+  family and standalone startup both now delegate the shared `optional bootstrap run -> reload
+  progress -> resolve stream position` control flow through
+  `bootstrap_lifecycle::execute_optional_bootstrap_run_and_resolve_with_progress_reload(...)`,
+  which removes another duplicated lifecycle branch future runtime shapes would otherwise have to
+  re-copy when extending the shared-stream model
+- production family runtime type ownership is narrower now too:
+  `ResolvedFamilyRuntime` is now re-exported through `extractor/family_runtime.rs`, and the
+  active production runtime path pieces that consume it directly
+  (`family_lifecycle.rs`, `managed_substreams_request.rs`,
+  `managed_extractor_initialization.rs`, `family_managed_startup.rs`, and
+  `runtime_target_planning.rs`) now import that canonical facade entrypoint instead of reaching
+  back into `family_runtime_planning.rs`, which keeps more of the shared bootstrap / single-stream
+  runtime surface pointed at one public family-runtime boundary before we collapse the deeper
+  planning internals further
+- shared-stream settings ownership is narrower now too:
+  `FamilySharedSubstreamsParams` and `FamilySharedStreamSettings` now live in
+  `extractor/family_runtime_resolution.rs` instead of `family_runtime_planning.rs`, so the merged
+  substreams-param contract and shared start/stop block resolution now sit with the runtime
+  resolution layer that actually consumes them; family planning is one step closer to owning only
+  family detection/membership while shared bootstrap + shared stream execution config resolution
+  stays on the runtime side of the boundary
+- family branch-config resolution ownership is narrower now too:
+  `family_extractor_configs(...)` and `validate_family_runtime_membership(...)` now live in
+  `extractor/family_runtime_resolution.rs` as well, so the step that turns a detected family into
+  the exact branch extractor set required for one shared runtime no longer lives in
+  `family_runtime_planning.rs`; planning keeps moving toward pure family detection while runtime
+  resolution owns the branch-input validation needed before shared bootstrap and shared-stream
+  execution can begin
+- resolved family-runtime build ownership is narrower now too:
+  `build_resolved_family_runtime_plan_with_registry(...)` in
+  `extractor/family_runtime_planning.rs` is now a thin wrapper over
+  `family_runtime_resolution::resolve_family_runtime_plan_with_registry(...)`, and the actual
+  per-family resolution path now goes through resolution-owned helpers
+  (`resolve_detected_family_runtime(...)`, `resolve_family_runtime_plan_with_registry(...)`)
+  instead of open-coding that assembly inside the planning module; this moves the detected-family
+  to resolved-runtime construction step closer to the same side of the boundary that already owns
+  shared bootstrap and shared-stream execution config resolution
+- public family-runtime facade coverage is narrower and more complete now too:
+  `extractor/family_runtime.rs` now re-exports the remaining public family-runtime identity types
+  (`DetectedFamilyRuntime`, `FamilyRuntimeMembership`, `FamilyRuntimeMembershipView`) and exposes a
+  `build_resolved_family_runtime_plan_via_registry(...)` facade entrypoint alongside the existing
+  runtime-target and runtime-plan entrypoints; outer test/support callsites that only need the
+  public shared-family shape no longer need to reach directly into
+  `family_runtime_planning.rs` for those public types
+- family runtime now has an explicit shared type layer too:
+  the core family-runtime identity and plan structs
+  (`DetectedFamilyRuntime`, `FamilyRuntimeMembership`, `ResolvedFamilyRuntime`,
+  `FamilyRuntimeBuildPlan`, `ResolvedFamilyRuntimePlan`) now live in
+  `extractor/family_runtime_types.rs`, while `family_runtime_planning.rs` re-exports them for
+  compatibility; this gives the shared bootstrap / single-stream runtime model a dedicated type
+  home that is no longer implicitly owned by the planning module
+- runtime-target facade ownership is narrower now too:
+  `extractor/family_runtime.rs` now assembles `ResolvedRuntimeTargets` itself from the
+  facade-owned resolved family-runtime plan instead of delegating that last runtime-target build
+  step back into `family_runtime_planning.rs`; the runner/support and runtime-target test call
+  sites that only need the canonical shared-family surface now import through the facade as well,
+  so the remaining direct planning dependency is smaller and more obviously about internal
+  family-plan construction rather than outer runtime-target wiring
+- build-plan assembly ownership is narrower now too:
+  `FamilyRuntimeBuildPlan::from_detected_families(...)` now lives in
+  `extractor/family_runtime_types.rs` and owns the “family members vs standalone protocol
+  systems” split derived from the configured extractor set; both
+  `family_runtime_planning.rs` and the `family_runtime.rs` facade now reuse that same type-layer
+  assembly path, so the facade no longer depends on planning's build-plan helper and planning no
+  longer has to carry a second copy of that standalone derivation logic
+- family detection ownership is narrower now too:
+  the explicit shared-family detection path now lives in
+  `extractor/family_runtime_detection.rs`, which owns the “declared family members + resolved
+  shared spkg/module + shared chain” validation used before any shared bootstrap or shared-stream
+  runtime plan is built; `family_runtime.rs` and `family_runtime_planning.rs` now both depend on
+  that dedicated detection owner instead of keeping the detection logic embedded inside planning,
+  so phase 3 is one step closer to a clean split of `detection -> plan assembly -> runtime
+  resolution`
+- detection-owner regression coverage is narrower now too:
+  the explicit-opt-in / missing-member / mismatched-spkg / mismatched-chain / duplicate-
+  protocol-system detection regressions now live beside the detection owner in
+  `extractor/family_runtime_detection.rs` instead of remaining bundled inside
+  `family_runtime_planning.rs`; planning keeps fewer detection-specific test fixtures now, which
+  makes the remaining planning test surface line up better with the runtime-plan assembly it still
+  actually owns
+- planning compatibility seams are thinner now too:
+  the test-only `detect_family_runtimes(...)` wrapper and the
+  `resolved_family_runtime_from_extractor_configs_for_tests(...)` helper no longer live behind
+  `family_runtime_planning.rs`; the planning tests that still need detection now import the
+  dedicated detection owner directly, and the family-runtime test helper now lives on
+  `extractor/family_runtime.rs` itself, so the planning module carries fewer leftover compatibility
+  hooks that are unrelated to runtime-plan assembly
+- planning wrapper ownership is narrower now too:
+  `family_runtime_planning.rs` no longer owns duplicate default-registry or registry-backed
+  `build_*` / `resolved_*` / `runtime_targets` wrapper entrypoints; its remaining tests now enter
+  through the canonical `family_runtime.rs` facade helpers instead, which removes another
+  compatibility-only planning surface and leaves the module closer to pure type ownership plus
+  owner-local regression coverage
+- config-owner canonical entrypoint ownership is narrower now too:
+  `ExtractorConfigs` now owns the family build-plan query surface as well, so config-side tests
+  no longer need to reach into raw `extractors` maps to rebuild family planning manually; the
+  repo-level regression coverage now also codifies that the checked-in canonical Uniswap-family
+  entrypoint is `extractors.uniswap_v2_v3.combined.yaml`, while legacy standalone-member repo
+  entrypoints such as `extractors.yaml`, `extractors.uniswap_v2.yaml`, and
+  `extractors.uniswap_v2_v3.yaml` are expected to be rejected by the registered-family standalone
+  guard instead of silently persisting as alternative production launch shapes

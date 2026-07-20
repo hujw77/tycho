@@ -73,6 +73,53 @@ impl MessageSender for ExtractorHandle {
 pub(crate) type SubscriptionsMap = HashMap<u64, Sender<ExtractorMsg>>;
 pub(crate) type BranchSubscriptionsMap = HashMap<String, Arc<Mutex<SubscriptionsMap>>>;
 
+pub(crate) struct RuntimeControlWiring {
+    pub(crate) control_rx: Receiver<ControlMessage>,
+    pub(crate) handles: Vec<ExtractorHandle>,
+}
+
+pub(crate) fn new_control_channel(
+) -> (Sender<ControlMessage>, Receiver<ControlMessage>) {
+    mpsc::channel(128)
+}
+
+pub(crate) fn new_subscriptions_map() -> Arc<Mutex<SubscriptionsMap>> {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn new_branch_subscriptions_map(
+    branch_protocol_systems: impl IntoIterator<Item = impl Into<String>>,
+) -> BranchSubscriptionsMap {
+    branch_protocol_systems
+        .into_iter()
+        .map(|protocol_system| (protocol_system.into(), new_subscriptions_map()))
+        .collect()
+}
+
+pub(crate) fn build_extractor_handles(
+    ids: impl IntoIterator<Item = ExtractorIdentity>,
+    control_tx: &Sender<ControlMessage>,
+) -> Vec<ExtractorHandle> {
+    ids.into_iter()
+        .map(|id| ExtractorHandle::new(id, control_tx.clone()))
+        .collect()
+}
+
+pub(crate) fn build_runtime_control_handles(
+    ids: impl IntoIterator<Item = ExtractorIdentity>,
+) -> (Receiver<ControlMessage>, Vec<ExtractorHandle>) {
+    let (control_tx, control_rx) = new_control_channel();
+    let handles = build_extractor_handles(ids, &control_tx);
+    (control_rx, handles)
+}
+
+pub(crate) fn build_runtime_control_wiring(
+    ids: impl IntoIterator<Item = ExtractorIdentity>,
+) -> RuntimeControlWiring {
+    let (control_rx, handles) = build_runtime_control_handles(ids);
+    RuntimeControlWiring { control_rx, handles }
+}
+
 pub(crate) fn allocate_subscriber_id(next_subscriber_id: &mut u64) -> u64 {
     let subscriber_id = *next_subscriber_id;
     *next_subscriber_id += 1;

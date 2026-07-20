@@ -2,102 +2,106 @@ use async_trait::async_trait;
 
 use crate::extractor::{
     managed_extractor_initialization::ManagedExtractorBuildContext,
-    managed_stream_startup::PreparedSingleRunnerStartup,
-    managed_substreams_request::StandalonePreparedRequestContext,
+    managed_stream_startup::SingleRuntimeWiring,
+    managed_substreams_request::{PreparedSharedBootstrap, StandalonePreparedRequestContext},
     runtime_targets_startup::{
-        prepare_managed_startup_request_from_payload, ManagedStartupLifecycleView,
-        ManagedStartupPreparedRequestPayload, PreparedManagedStartupDraft,
-        PreparedManagedStartupPayload,
+        ManagedRunnerFactory, ManagedStartupLifecycleView, PreparedManagedRuntimeOwner,
     },
     runtime_target_planning::ResolvedStandaloneRuntime,
     ExtractionError, Extractor,
 };
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 use tycho_common::models::ExtractorIdentity;
 
 use crate::substreams::stream::SubstreamsStream;
 
-pub(crate) type PreparedSingleRunnerDraft = PreparedManagedStartupDraft<PreparedSingleRunnerPayload>;
-
-pub(crate) struct PreparedSingleRunnerPayload {
-    pub(crate) extractor: Arc<dyn Extractor>,
-    pub(crate) extractor_id: ExtractorIdentity,
+#[derive(Clone)]
+pub(crate) struct SingleRuntimeRunnerFactory {
+    extractor: Arc<dyn Extractor>,
 }
 
-impl<'a> ResolvedStandaloneRuntime<'a> {
-    pub(crate) async fn prepare_managed_startup_draft(
-        self,
-        extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Result<PreparedSingleRunnerDraft, ExtractionError> {
-        <Self as ManagedStartupLifecycleView>::prepare_managed_startup_draft(
-            &self,
-            extractor_build,
-        )
-        .await
+pub(crate) type PreparedSingleRuntimeOwner =
+    PreparedManagedRuntimeOwner<SingleRuntimeRunnerFactory, StandalonePreparedRequestContext>;
+
+impl SingleRuntimeRunnerFactory {
+    fn new(extractor: Arc<dyn Extractor>) -> Self {
+        Self { extractor }
+    }
+}
+
+pub(crate) fn prepared_single_runtime_owner(
+    extractor: Arc<dyn Extractor>,
+    extractor_id: ExtractorIdentity,
+) -> PreparedSingleRuntimeOwner {
+    PreparedManagedRuntimeOwner::new(
+        SingleRuntimeRunnerFactory::new(extractor.clone()),
+        StandalonePreparedRequestContext {
+            extractor,
+            startup_scope_id: extractor_id.to_string(),
+            shared_bootstrap: None,
+        },
+    )
+}
+
+impl ManagedRunnerFactory for SingleRuntimeRunnerFactory {
+    fn into_managed_runner(
+        self: Box<Self>,
+        stream: SubstreamsStream,
+        runtime_handle: Option<Handle>,
+        partial_blocks: bool,
+    ) -> Result<
+        (
+            crate::extractor::runner::ManagedRunner,
+            Vec<crate::extractor::control::ExtractorHandle>,
+        ),
+        ExtractionError,
+    > {
+        let wiring = SingleRuntimeWiring::from_extractor(self.extractor);
+        let runner = crate::extractor::single_runtime_execution::ExtractorRunner::new(
+            wiring.extractor,
+            stream,
+            wiring.subscriptions,
+            wiring.control.control_rx,
+            runtime_handle,
+            partial_blocks,
+        );
+
+        Ok((
+            crate::extractor::runner::ManagedRunner::new_single(runner),
+            wiring.control.handles,
+        ))
     }
 }
 
 #[async_trait]
 impl<'a> ManagedStartupLifecycleView<'a> for ResolvedStandaloneRuntime<'a> {
-    type Payload = PreparedSingleRunnerPayload;
+    type RuntimeOwner = PreparedSingleRuntimeOwner;
 
-    async fn build_managed_startup_payload(
+    async fn build_managed_runtime_owner(
         &self,
         extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Result<PreparedSingleRunnerPayload, ExtractionError> {
+    ) -> Result<Self::RuntimeOwner, ExtractionError> {
         let extractor = extractor_build
             .build_unique_runtime_target_extractor(self)
             .await?;
         let extractor_id = extractor.get_id();
-        Ok(PreparedSingleRunnerPayload { extractor, extractor_id })
-    }
-
-    async fn prepare_substreams_request_for_managed_startup(
-        &self,
-        payload: &Self::Payload,
-        extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Result<crate::extractor::managed_substreams_request::PreparedSubstreamsRequest, ExtractionError>
-    {
-        prepare_managed_startup_request_from_payload(self, payload, extractor_build).await
-    }
-}
-
-impl PreparedManagedStartupPayload for PreparedSingleRunnerPayload {
-    type PreparedStartup = PreparedSingleRunnerStartup;
-
-    fn into_prepared_startup(
-        self,
-        stream: SubstreamsStream,
-    ) -> PreparedSingleRunnerStartup {
-        PreparedSingleRunnerStartup {
-            extractor: self.extractor,
-            extractor_id: self.extractor_id,
-            stream,
-        }
-    }
-}
-
-impl ManagedStartupPreparedRequestPayload for PreparedSingleRunnerPayload {
-    type PreparedRequestContext = StandalonePreparedRequestContext;
-
-    fn prepared_request_context(
-        &self,
-        extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Self::PreparedRequestContext {
-        StandalonePreparedRequestContext {
-            extractor: self.extractor.clone(),
-            extractor_id: self.extractor_id.clone(),
-            registry: extractor_build.family_runtime_registry,
-        }
+        let mut runtime_owner = prepared_single_runtime_owner(extractor.clone(), extractor_id);
+        runtime_owner.prepared_request_context_mut().shared_bootstrap = self
+            .bootstrap_runtime()
+            .cloned()
+            .map(|runtime| PreparedSharedBootstrap::for_standalone(runtime, extractor));
+        Ok(runtime_owner)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use tycho_common::models::{Chain, FinancialType, ImplementationType};
+    use tycho_common::models::{Chain, ExtractorIdentity, FinancialType, ImplementationType};
 
     use super::*;
     use crate::extractor::{
@@ -106,6 +110,7 @@ mod tests {
             AuxiliaryProtocolMessageBuildFuture, AuxiliaryProtocolMessageContext,
             AuxiliaryProtocolMessageDecoder,
         },
+        MockExtractor,
     };
 
     fn build_future_events_for_startup_test<'a>(
@@ -128,8 +133,9 @@ mod tests {
                 build_block_changes: build_future_events_for_startup_test,
             }];
         let registry =
-            crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_for_tests(
+            crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_and_explicit_progress_owner_for_tests(
                 &["future_v1"],
+                "future_v1",
                 "family::future_swap",
                 FUTURE_DECODERS,
             );
@@ -153,13 +159,45 @@ mod tests {
         .with_protocol_system("future_v1");
 
         let decoders = ManagedExtractorBuildContext::
-            auxiliary_protocol_message_decoders_for_protocol_system_with_registry(
+            auxiliary_runtime_hooks_for_protocol_system_with_registry(
                 config.protocol_system(),
                 registry,
-            );
+            )
+            .message_decoders;
 
         assert_eq!(decoders.len(), 1);
         assert_eq!(decoders[0].protocol_system, "future_v1");
         assert_eq!(decoders[0].type_url_suffix, "FutureEvents");
+    }
+
+    #[test]
+    fn prepared_request_context_preserves_custom_family_registry() {
+        let registry = crate::extractor::test_support::future_family_runtime_registry_with_explicit_progress_owner_for_tests(
+            &["future_v1"],
+            "future_v1",
+            "family::future_swap",
+        );
+        let extractor = Arc::new(MockExtractor::new());
+        let runtime_owner = prepared_single_runtime_owner(
+            extractor.clone(),
+            ExtractorIdentity::new(Chain::Ethereum, "future_v1_alias"),
+        );
+        let context = crate::extractor::runtime_targets_startup::ManagedStartupPreparedRequestContext::prepared_request_context(&runtime_owner);
+        let extractor_trait: Arc<dyn crate::extractor::Extractor> = extractor.clone();
+        assert_eq!(context.startup_scope_id, "ethereum:future_v1_alias");
+        assert!(
+            Arc::ptr_eq(&context.extractor, &extractor_trait),
+            "prepared request context should retain the built extractor"
+        );
+
+        assert_eq!(
+            registry
+                .require_family_name_for_protocol_systems(
+                    ["future_v1"].into_iter(),
+                    "standalone prepared request test",
+                )
+                .expect("custom registry should resolve future family"),
+            "future_swap"
+        );
     }
 }

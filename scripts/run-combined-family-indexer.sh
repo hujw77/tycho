@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/combined-family-common.sh"
+
 usage() {
   cat <<EOF
 Usage:
@@ -34,17 +37,9 @@ Notes:
 EOF
 }
 
-shell_escape() {
-  local arg="$1"
-  if [[ "${arg}" =~ ^[A-Za-z0-9_./:+=,-]+$ ]]; then
-    printf '%s' "${arg}"
-    return
-  fi
-  printf "'%s'" "${arg//\'/\'\"\'\"\'}"
-}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${TYCHO_COMBINED_FAMILY_REPO_ROOT}"
+CANONICAL_EXTRACTORS_CONFIG="${TYCHO_COMBINED_FAMILY_CANONICAL_EXTRACTORS_CONFIG}"
+CANONICAL_ABS_EXTRACTORS_CONFIG="${TYCHO_COMBINED_FAMILY_CANONICAL_EXTRACTORS_CONFIG_ABS}"
 
 MODE="${1:-}"
 STRICT_DOCTOR="false"
@@ -64,7 +59,7 @@ TYCHO_INDEXER_ENTRYPOINT_LABEL_VALUE="${TYCHO_INDEXER_ENTRYPOINT_LABEL:-combined
 TYCHO_INDEXER_ENDPOINT_VALUE="${TYCHO_INDEXER_ENDPOINT:-https://mainnet.eth.streamingfast.io}"
 TYCHO_INDEXER_DATABASE_URL_VALUE="${TYCHO_INDEXER_DATABASE_URL:-postgres://postgres:mypassword@localhost:5431/tycho_indexer_0}"
 TYCHO_INDEXER_RPC_URL_VALUE="${TYCHO_INDEXER_RPC_URL:-https://rpc.mevblocker.io}"
-TYCHO_INDEXER_EXTRACTORS_CONFIG_VALUE="${TYCHO_INDEXER_EXTRACTORS_CONFIG:-crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml}"
+TYCHO_INDEXER_EXTRACTORS_CONFIG_VALUE="${TYCHO_INDEXER_EXTRACTORS_CONFIG:-${CANONICAL_EXTRACTORS_CONFIG}}"
 TYCHO_INDEXER_RUST_LOG_VALUE="${TYCHO_INDEXER_RUST_LOG:-info}"
 
 ABS_EXTRACTORS_CONFIG="${REPO_ROOT}/${TYCHO_INDEXER_EXTRACTORS_CONFIG_VALUE}"
@@ -76,6 +71,7 @@ doctor() {
   local ready="true"
   local cargo_state="available"
   local config_state="present"
+  local config_contract_state="canonical"
   local token_state="set"
   local db_state="unverified"
   local psql_state="missing"
@@ -87,6 +83,11 @@ doctor() {
 
   if [[ ! -f "${ABS_EXTRACTORS_CONFIG}" ]]; then
     config_state="missing"
+    ready="false"
+  fi
+
+  if [[ "${ABS_EXTRACTORS_CONFIG}" != "${CANONICAL_ABS_EXTRACTORS_CONFIG}" ]]; then
+    config_contract_state="noncanonical"
     ready="false"
   fi
 
@@ -112,6 +113,8 @@ repo_root=${REPO_ROOT}
 cargo_state=${cargo_state}
 extractors_config=${TYCHO_INDEXER_EXTRACTORS_CONFIG_VALUE}
 extractors_config_state=${config_state}
+extractors_config_contract_state=${config_contract_state}
+canonical_extractors_config=${CANONICAL_EXTRACTORS_CONFIG}
 database_url=${TYCHO_INDEXER_DATABASE_URL_VALUE}
 database_state=${db_state}
 psql_state=${psql_state}
@@ -128,17 +131,17 @@ EOF
 }
 
 render_command() {
-  cat <<EOF
-cd $(shell_escape "${REPO_ROOT}")
-export AUTH_API_KEY=$(shell_escape "${AUTH_API_KEY_VALUE}")
-export SUBSTREAMS_API_TOKEN=$(shell_escape "${SUBSTREAMS_API_TOKEN_VALUE:-<set SUBSTREAMS_API_TOKEN>}")
-export RUST_LOG=$(shell_escape "${TYCHO_INDEXER_RUST_LOG_VALUE}")
+cat <<EOF
+cd $(tycho_combined_family_shell_escape "${REPO_ROOT}")
+export AUTH_API_KEY=$(tycho_combined_family_shell_escape "${AUTH_API_KEY_VALUE}")
+export SUBSTREAMS_API_TOKEN=$(tycho_combined_family_shell_escape "${SUBSTREAMS_API_TOKEN_VALUE:-<set SUBSTREAMS_API_TOKEN>}")
+export RUST_LOG=$(tycho_combined_family_shell_escape "${TYCHO_INDEXER_RUST_LOG_VALUE}")
 cargo run --bin tycho-indexer -- \\
-  --endpoint $(shell_escape "${TYCHO_INDEXER_ENDPOINT_VALUE}") \\
-  --database-url $(shell_escape "${TYCHO_INDEXER_DATABASE_URL_VALUE}") \\
-  --rpc-url $(shell_escape "${TYCHO_INDEXER_RPC_URL_VALUE}") \\
+  --endpoint $(tycho_combined_family_shell_escape "${TYCHO_INDEXER_ENDPOINT_VALUE}") \\
+  --database-url $(tycho_combined_family_shell_escape "${TYCHO_INDEXER_DATABASE_URL_VALUE}") \\
+  --rpc-url $(tycho_combined_family_shell_escape "${TYCHO_INDEXER_RPC_URL_VALUE}") \\
   index \\
-  --extractors-config $(shell_escape "${TYCHO_INDEXER_EXTRACTORS_CONFIG_VALUE}") \\
+  --extractors-config $(tycho_combined_family_shell_escape "${TYCHO_INDEXER_EXTRACTORS_CONFIG_VALUE}") \\
   --api_token "\$SUBSTREAMS_API_TOKEN"
 EOF
 }

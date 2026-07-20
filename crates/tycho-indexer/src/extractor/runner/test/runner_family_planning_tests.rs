@@ -4,32 +4,10 @@ use super::*;
 fn test_resolved_family_execution_config_rejects_partial_shared_bootstrap_config() {
     let configs = [
         ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            start_block: 42,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            bootstrap: Some(BootstrapConfig {
-                strategy: BootstrapStrategy::UniswapV2Rpc,
-                start_block: 42,
-                params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                    .to_owned(),
-            }),
-            ..Default::default()
+            bootstrap: Some(make_uniswap_member_bootstrap_config("uniswap_v2", 42)),
+            ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 42)
         },
-        ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            start_block: 43,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            bootstrap: None,
-            ..Default::default()
-        },
+        make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 43),
     ];
     let config_refs = configs.iter().collect::<Vec<_>>();
     let err = try_resolved_family_runtime_from_configs_for_tests(
@@ -49,29 +27,14 @@ fn test_resolved_family_execution_config_rejects_partial_shared_bootstrap_config
 #[test]
 fn test_resolved_family_execution_config_derives_shared_branch_and_stream_settings() {
     let v2 = ExtractorConfig {
-        name: "uniswap_v2".to_owned(),
-        protocol_system: "uniswap_v2".to_string(),
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        substreams_params: HashMap::from([(
-            "map_pool_events".to_string(),
-            "factory=0x01".to_string(),
-        )]),
-        ..Default::default()
+        substreams_params: make_uniswap_member_substreams_params("uniswap_v2"),
+        ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 0)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3".to_owned(),
-        protocol_system: "uniswap_v3".to_string(),
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        substreams_params: HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
-        ..Default::default()
+        substreams_params: make_uniswap_member_substreams_params("uniswap_v3"),
+        ..make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 0)
     };
 
     let resolved_family =
@@ -83,14 +46,9 @@ fn test_resolved_family_execution_config_derives_shared_branch_and_stream_settin
     assert!(resolved_family
         .shared_bootstrap_plan()
         .is_none());
-    assert_eq!(resolved_family.family.output_module(), expected_shared_stream.module);
+    assert_eq!(resolved_family.output_module(), expected_shared_stream.module);
     assert_eq!(resolved_family.shared_extractor_id(), expected_shared_stream.extractor_id);
-    assert_eq!(
-        resolved_family
-            .family
-            .durability_scope(),
-        expected_shared_stream.durability_scope
-    );
+    assert_eq!(resolved_family.durability_scope(), expected_shared_stream.durability_scope);
     assert_eq!(
         FamilyBranchSpec::protocol_system_set(resolved_family.branch_specs().iter()),
         HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
@@ -108,29 +66,14 @@ fn test_resolved_family_execution_config_derives_shared_branch_and_stream_settin
 #[test]
 fn test_resolved_family_execution_config_uses_protocol_systems_for_aliased_members() {
     let v2 = ExtractorConfig {
-        name: "uniswap_v2_alias".to_owned(),
-        protocol_system: "uniswap_v2".to_string(),
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        substreams_params: HashMap::from([(
-            "map_pool_events".to_string(),
-            "factory=0x01".to_string(),
-        )]),
-        ..Default::default()
+        substreams_params: make_uniswap_member_substreams_params("uniswap_v2"),
+        ..make_uniswap_member_runtime_test_config("uniswap_v2_alias", "uniswap_v2", 0)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3_alias".to_owned(),
-        protocol_system: "uniswap_v3".to_string(),
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        substreams_params: HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
-        ..Default::default()
+        substreams_params: make_uniswap_member_substreams_params("uniswap_v3"),
+        ..make_uniswap_member_runtime_test_config("uniswap_v3_alias", "uniswap_v3", 0)
     };
 
     let resolved_family =
@@ -142,14 +85,9 @@ fn test_resolved_family_execution_config_uses_protocol_systems_for_aliased_membe
     assert!(resolved_family
         .shared_bootstrap_plan()
         .is_none());
-    assert_eq!(resolved_family.family.output_module(), expected_shared_stream.module);
+    assert_eq!(resolved_family.output_module(), expected_shared_stream.module);
     assert_eq!(resolved_family.shared_extractor_id(), expected_shared_stream.extractor_id);
-    assert_eq!(
-        resolved_family
-            .family
-            .durability_scope(),
-        expected_shared_stream.durability_scope
-    );
+    assert_eq!(resolved_family.durability_scope(), expected_shared_stream.durability_scope);
     assert_eq!(
         FamilyBranchSpec::protocol_system_set(resolved_family.branch_specs().iter()),
         HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
@@ -167,29 +105,14 @@ fn test_resolved_family_execution_config_uses_protocol_systems_for_aliased_membe
 #[test]
 fn test_resolved_family_execution_config_is_reused_from_resolved_family_runtime() {
     let v2 = ExtractorConfig {
-        name: "uniswap_v2_primary".to_owned(),
-        protocol_system: "uniswap_v2".to_string(),
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        substreams_params: HashMap::from([(
-            "map_pool_events".to_string(),
-            "factory=0x01".to_string(),
-        )]),
-        ..Default::default()
+        substreams_params: make_uniswap_member_substreams_params("uniswap_v2"),
+        ..make_uniswap_member_runtime_test_config("uniswap_v2_primary", "uniswap_v2", 0)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3_primary".to_owned(),
-        protocol_system: "uniswap_v3".to_string(),
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        substreams_params: HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
-        ..Default::default()
+        substreams_params: make_uniswap_member_substreams_params("uniswap_v3"),
+        ..make_uniswap_member_runtime_test_config("uniswap_v3_primary", "uniswap_v3", 0)
     };
     let config_refs = vec![&v2, &v3];
     let resolved_family =
@@ -217,36 +140,14 @@ fn test_resolved_family_execution_config_is_reused_from_resolved_family_runtime(
 #[test]
 fn test_resolved_family_runtime_precomputes_shared_bootstrap_plan_and_start_block() {
     let v2 = ExtractorConfig {
-        name: "uniswap_v2".to_owned(),
-        protocol_system: "uniswap_v2".to_string(),
-        start_block: 42,
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        bootstrap: Some(BootstrapConfig {
-            strategy: BootstrapStrategy::UniswapV2Rpc,
-            start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234".to_owned(),
-        }),
-        ..Default::default()
+        bootstrap: Some(make_uniswap_member_bootstrap_config("uniswap_v2", 42)),
+        ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 42)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3".to_owned(),
-        protocol_system: "uniswap_v3".to_string(),
-        start_block: 42,
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        bootstrap: Some(BootstrapConfig {
-            strategy: BootstrapStrategy::UniswapV3Rpc,
-            start_block: 42,
-            params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678".to_owned(),
-        }),
-        ..Default::default()
+        bootstrap: Some(make_uniswap_member_bootstrap_config("uniswap_v3", 42)),
+        ..make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 42)
     };
 
     let resolved_family =
@@ -258,30 +159,18 @@ fn test_resolved_family_runtime_precomputes_shared_bootstrap_plan_and_start_bloc
         .expect("shared bootstrap plan should be precomputed");
     assert_eq!(bootstrap_plan.bootstrap_block, 42);
     assert_eq!(bootstrap_plan.branches.len(), 2);
-    assert_eq!(bootstrap_plan.family_name.as_deref(), Some("uniswap"));
+    assert_eq!(bootstrap_plan.family_name, "uniswap");
 }
 
 #[test]
 fn test_resolved_family_execution_config_rejects_conflicting_stop_blocks() {
     let v2 = ExtractorConfig {
-        name: "uniswap_v2".to_owned(),
-        protocol_system: "uniswap_v2".to_string(),
         stop_block: Some(110),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 0)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3".to_owned(),
-        protocol_system: "uniswap_v3".to_string(),
         stop_block: Some(120),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 0)
     };
 
     let err = try_resolved_family_runtime_from_configs_for_tests(
@@ -298,30 +187,18 @@ fn test_resolved_family_execution_config_rejects_conflicting_stop_blocks() {
 #[test]
 fn test_resolved_family_execution_config_rejects_conflicting_substreams_params() {
     let v2 = ExtractorConfig {
-        name: "uniswap_v2".to_owned(),
-        protocol_system: "uniswap_v2".to_string(),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
         substreams_params: HashMap::from([(
             "map_pool_events".to_string(),
             "factory=0x01".to_string(),
         )]),
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 0)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3".to_owned(),
-        protocol_system: "uniswap_v3".to_string(),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
         substreams_params: HashMap::from([(
             "map_pool_events".to_string(),
             "factory=0x02".to_string(),
         )]),
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 0)
     };
 
     let err = try_resolved_family_runtime_from_configs_for_tests(
@@ -372,24 +249,12 @@ fn test_validate_family_progress_consistency_rejects_mixed_progress() {
 #[test]
 fn test_validate_family_runner_membership_accepts_exact_member_set() {
     let v2 = ExtractorConfig {
-        name: "uniswap_v2".to_string(),
         chain: Chain::Ethereum,
-        protocol_system: "uniswap_v2".to_string(),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 0)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3".to_string(),
         chain: Chain::Ethereum,
-        protocol_system: "uniswap_v3".to_string(),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 0)
     };
     let resolved_family = resolved_family_runtime_from_configs_for_tests(
         &[&v2, &v3],
@@ -403,24 +268,12 @@ fn test_validate_family_runner_membership_accepts_exact_member_set() {
 #[test]
 fn test_validate_family_runner_membership_rejects_missing_or_extra_members() {
     let only_v2 = ExtractorConfig {
-        name: "uniswap_v2".to_string(),
         chain: Chain::Ethereum,
-        protocol_system: "uniswap_v2".to_string(),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v2_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 0)
     };
     let v3 = ExtractorConfig {
-        name: "uniswap_v3".to_string(),
         chain: Chain::Ethereum,
-        protocol_system: "uniswap_v3".to_string(),
-        protocol_types: vec![ProtocolTypeConfig::new(
-            "uniswap_v3_pool".to_string(),
-            FinancialType::Swap,
-        )],
-        ..Default::default()
+        ..make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 0)
     };
     let curve = ExtractorConfig {
         name: "curve".to_string(),

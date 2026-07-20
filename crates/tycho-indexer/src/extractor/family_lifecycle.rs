@@ -8,23 +8,24 @@ use crate::extractor::shared_bootstrap::{
 };
 use crate::extractor::{
     bootstrap_lifecycle::{
-        decide_bootstrap_run, execute_bootstrap_run_decision_with_progress_reload,
+        decide_bootstrap_run, load_and_execute_context_prepared_bootstrap_run_and_resolve,
         BootstrapRunDecision,
     },
     collect_shared_bootstrap_completion_snapshot, collect_shared_resume_progress,
-    family_runtime_planning::ResolvedFamilyRuntime, load_extractor_progress_snapshot,
+    family_runtime::ResolvedFamilyRuntime, load_extractor_progress_snapshot,
     load_named_extractor_progress_snapshots,
     managed_substreams_request::{
-        resolved_stream_position_from_resume, FamilyPreparedRequestContext, ResolvedStreamPosition,
+        resolved_stream_position_from_resume, FamilyPreparedRequestContext,
+        PreparedBootstrapExecution, ResolvedStreamPosition,
     },
-    shared_bootstrap::{
-        execute_materialized_bootstrap_plan, BootstrapCompletionPolicy,
-        BootstrapCompletionSnapshot,
-    },
+    shared_bootstrap::{BootstrapCompletionPolicy, BootstrapCompletionSnapshot},
     resolve_shared_resume_state, validate_shared_progress_consistency,
     validate_named_progress_scope, ExtractionError, Extractor,
     NamedExtractorProgressSnapshot, PersistedExtractorStateKind, PersistedSharedCursorState,
 };
+
+#[cfg(test)]
+use crate::extractor::bootstrap_lifecycle::run_logged_prepared_bootstrap_execution;
 
 #[cfg(test)]
 use crate::extractor::{
@@ -188,38 +189,31 @@ impl<'a> ResolvedFamilyRuntime<'a> {
         context: &FamilyPreparedRequestContext,
         rpc_client: &EthereumRpcClient,
     ) -> Result<ResolvedFamilyStreamPosition, ExtractionError> {
-        let mut progress = FamilyLifecycleProgress::load(&context.extractors).await?;
-        progress.validate_cursor_scope(&self.family.durability_scope())?;
-        progress.validate_progress_consistency("before bootstrap")?;
-
-        progress = if let Some(plan) = self.shared_bootstrap_plan() {
-            progress.validate_bootstrap_scope(&self.family.durability_scope())?;
-            let decision = progress.decide_bootstrap_run(plan.bootstrap_block)?;
-            execute_bootstrap_run_decision_with_progress_reload(
-                progress,
-                decision,
-                self.shared_extractor_id(),
-                "family",
+        let (_, stream_position) =
+            load_and_execute_context_prepared_bootstrap_run_and_resolve(
+                context,
                 || FamilyLifecycleProgress::load(&context.extractors),
-                |_| async move {
-                    execute_materialized_bootstrap_plan(
-                        rpc_client,
-                        plan,
-                        self.shared_bootstrap_execution(),
-                        context.bootstrap_commit_wiring.branch_targets(),
-                        context.bootstrap_commit_wiring.completion_extractor(),
-                    )
-                    .await
+                |progress| {
+                    progress.validate_cursor_scope(context.durability_scope())?;
+                    progress.validate_progress_consistency("before bootstrap")?;
+                    progress.validate_bootstrap_scope(context.durability_scope())
+                },
+                |progress| {
+                    context
+                        .shared_bootstrap
+                        .as_ref()
+                        .map(|runtime| progress.decide_bootstrap_run(runtime.bootstrap_block()))
+                        .transpose()
+                },
+                rpc_client,
+                |progress| {
+                    progress.validate_cursor_scope(context.durability_scope())?;
+                    progress.validate_bootstrap_scope(context.durability_scope())?;
+                    progress.resolve_stream_position(context.configured_start_block())
                 },
             )
-            .await?
-        } else {
-            progress
-        };
-
-        progress.validate_cursor_scope(&self.family.durability_scope())?;
-        progress.validate_bootstrap_scope(&self.family.durability_scope())?;
-        progress.resolve_stream_position(self.configured_start_block())
+            .await?;
+        Ok(stream_position)
     }
 
 }
@@ -230,32 +224,29 @@ pub(crate) async fn run_family_bootstrap_if_needed(
     family: &ResolvedFamilyRuntime<'_>,
     rpc_client: &EthereumRpcClient,
 ) -> Result<(), ExtractionError> {
+    let context = family.prepared_request_context(extractors)?;
+    let shared_extractor_id = context.shared_extractor_id().to_string();
     let progress = FamilyLifecycleProgress::load(extractors).await?;
-    progress.validate_cursor_scope(&family.family.durability_scope())?;
+    progress.validate_cursor_scope(context.durability_scope())?;
     progress.validate_progress_consistency("before bootstrap")?;
 
-    let Some(plan) = family.shared_bootstrap_plan() else {
+    let Some(runtime) = context.shared_bootstrap.clone() else {
         return Ok(());
     };
 
-    progress.validate_bootstrap_scope(&family.family.durability_scope())?;
-    let decision = progress.decide_bootstrap_run(plan.bootstrap_block)?;
+    progress.validate_bootstrap_scope(context.durability_scope())?;
+    let decision = progress.decide_bootstrap_run(runtime.bootstrap_block())?;
+    let bootstrap_scope_id = shared_extractor_id.clone();
     execute_bootstrap_run_decision(
         decision,
-        family.shared_extractor_id(),
+        &shared_extractor_id,
         "family",
         |_| async move {
-            let bootstrap_commit_wiring =
-                FamilyBootstrapCommitWiring::from_runtime_contract(
-                    &family.runtime_contract(),
-                    extractors,
-                )?;
-            execute_materialized_bootstrap_plan(
+            run_logged_prepared_bootstrap_execution(
+                &bootstrap_scope_id,
+                "family",
+                &runtime,
                 rpc_client,
-                plan,
-                family.shared_bootstrap_execution(),
-                bootstrap_commit_wiring.branch_targets(),
-                bootstrap_commit_wiring.completion_extractor(),
             )
             .await
         },
@@ -288,19 +279,12 @@ pub(crate) async fn apply_family_bootstrap_plan(
     }
 
     let bootstrap_block_hash = merged_changes.block.hash.clone();
-    let runtime_contract = crate::extractor::family_runtime_planning::ResolvedFamilyRuntimeContract {
-        shared_extractor_id: "family::test".to_string(),
-        branch_specs: plan
-            .branches
-            .iter()
-            .map(|branch| crate::extractor::family_dispatch::FamilyBranchSpec {
-                protocol_system: branch.protocol_system.clone(),
-                protocol_type_names: std::collections::HashSet::new(),
-            })
-            .collect(),
-    };
     let bootstrap_commit_wiring =
-        FamilyBootstrapCommitWiring::from_runtime_contract(&runtime_contract, extractors)?;
+        FamilyBootstrapCommitWiring::from_shared_bootstrap_plan_with_registry(
+            plan,
+            crate::extractor::family_registry::default_family_runtime_registry(),
+            extractors,
+        )?;
     let commit_targets =
         resolve_materialized_bootstrap_commit_targets(
             bootstrap_commit_wiring.branch_targets(),
@@ -320,10 +304,11 @@ pub(crate) async fn resolve_family_stream_position(
     extractors: &HashMap<String, Arc<dyn Extractor>>,
     family: &ResolvedFamilyRuntime<'_>,
 ) -> Result<ResolvedFamilyStreamPosition, ExtractionError> {
+    let context = family.prepared_request_context(extractors)?;
     let progress = FamilyLifecycleProgress::load(extractors).await?;
-    progress.validate_cursor_scope(&family.family.durability_scope())?;
-    progress.validate_bootstrap_scope(&family.family.durability_scope())?;
-    progress.resolve_stream_position(family.configured_start_block())
+    progress.validate_cursor_scope(context.durability_scope())?;
+    progress.validate_bootstrap_scope(context.durability_scope())?;
+    progress.resolve_stream_position(context.configured_start_block())
 }
 
 #[cfg(test)]

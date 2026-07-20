@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/combined-family-common.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -36,25 +39,17 @@ Notes:
   - `run` executes against an isolated temporary database derived from `DATABASE_URL`, so a
     dirty local dev database does not invalidate the shared-family regression gate.
   - `run` executes the focused Phase 3 close-out tests, not the entire serial_db suite.
-  - The selected tests cover fixture-backed history-slice replay, restart resume, and
-    reconnect / restart behavior after dynamic component admission.
+  - The selected tests cover fixture-backed history-slice replay, restart resume,
+    base dynamic-admission persistence, latest-view follow-up state exposure,
+    multi-branch revert/reorg recovery, seeded-universe dynamic onboarding,
+    and reconnect / restart behavior after dynamic component admission.
   - `db-command` uses `TYCHO_IMAGE=alpine` because the repo docker compose file also declares
     a `tycho-indexer` service and Compose requires that image variable to be non-empty even when
     only the `db` service is started.
 EOF
 }
 
-shell_escape() {
-  local arg="$1"
-  if [[ "${arg}" =~ ^[A-Za-z0-9_./:+=-]+$ ]]; then
-    printf '%s' "${arg}"
-    return
-  fi
-  printf "'%s'" "${arg//\'/\'\"\'\"\'}"
-}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${TYCHO_COMBINED_FAMILY_REPO_ROOT}"
 MODE="${1:-}"
 STRICT_DOCTOR="false"
 TEST_MANIFEST="${TYCHO_COMBINED_FAMILY_DB_TEST_MANIFEST:-${REPO_ROOT}/crates/tycho-indexer/tests/combined_family_db_gate.tests}"
@@ -119,9 +114,9 @@ MAINTENANCE_DATABASE_URL="$(postgres_url_with_db_name "${BASE_DATABASE_URL_VALUE
 SKIP_DB_DOCTOR="${TYCHO_COMBINED_FAMILY_SKIP_DB_DOCTOR:-0}"
 
 render_db_start_command() {
-  cat <<EOF
-cd $(shell_escape "${REPO_ROOT}")
-TYCHO_IMAGE=alpine docker compose -f $(shell_escape "${DOCKER_COMPOSE_FILE}") up -d db
+cat <<EOF
+cd $(tycho_combined_family_shell_escape "${REPO_ROOT}")
+TYCHO_IMAGE=alpine docker compose -f $(tycho_combined_family_shell_escape "${DOCKER_COMPOSE_FILE}") up -d db
 EOF
 }
 
@@ -132,10 +127,16 @@ load_tests() {
   fi
 
   TESTS=()
+  declare -A SEEN_TESTS=()
   while IFS= read -r line || [[ -n "${line}" ]]; do
     if [[ -z "${line}" || "${line}" =~ ^# ]]; then
       continue
     fi
+    if [[ -n "${SEEN_TESTS[${line}]:-}" ]]; then
+      echo "duplicate combined-family DB gate manifest entry: ${line}" >&2
+      exit 1
+    fi
+    SEEN_TESTS["${line}"]=1
     TESTS+=("${line}")
   done < "${TEST_MANIFEST}"
 }
@@ -165,6 +166,9 @@ doctor() {
   local db_state="reachable"
   local docker_cli="available"
   local docker_daemon="unknown"
+  local compose_db_container_id=""
+  local compose_db_state="unknown"
+  local compose_db_error=""
 
   if ! command -v docker >/dev/null 2>&1; then
     docker_cli="missing"
@@ -180,6 +184,29 @@ doctor() {
     db_state="unreachable"
   fi
 
+  if [[ "${docker_cli}" == "available" && "${docker_daemon}" == "reachable" ]]; then
+    compose_db_container_id="$(
+      TYCHO_IMAGE=alpine docker compose -f "${DOCKER_COMPOSE_FILE}" ps -q db 2>/dev/null | tail -n 1
+    )"
+    if [[ -n "${compose_db_container_id}" ]]; then
+      compose_db_state="$(
+        docker inspect "${compose_db_container_id}" --format '{{.State.Status}}' 2>/dev/null || printf 'inspect_failed'
+      )"
+      compose_db_error="$(
+        docker inspect "${compose_db_container_id}" --format '{{.State.Error}}' 2>/dev/null || true
+      )"
+      compose_db_error="$(printf '%s' "${compose_db_error}" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+
+      if [[ "${db_state}" == "unreachable" && "${compose_db_state}" == "exited" ]]; then
+        if [[ "${compose_db_error}" == *"input/output error"* ]]; then
+          db_state="compose_db_exited_io_error"
+        else
+          db_state="compose_db_exited"
+        fi
+      fi
+    fi
+  fi
+
   cat <<EOF
 ready=${ready}
 base_database_url=${BASE_DATABASE_URL_VALUE}
@@ -190,6 +217,9 @@ database_state=${db_state}
 docker_cli=${docker_cli}
 docker_daemon=${docker_daemon}
 docker_compose_file=${DOCKER_COMPOSE_FILE}
+compose_db_container_id=${compose_db_container_id}
+compose_db_state=${compose_db_state}
+compose_db_error=${compose_db_error}
 database_start_command=$(render_db_start_command | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g; s/ $//')
 test_count=${#TESTS[@]}
 test_manifest=${TEST_MANIFEST}
@@ -206,13 +236,13 @@ list_tests() {
 
 render_run_command() {
   cat <<EOF
-cd $(shell_escape "${REPO_ROOT}")
-export DATABASE_URL=$(shell_escape "${RUN_DATABASE_URL}")
+cd $(tycho_combined_family_shell_escape "${REPO_ROOT}")
+export DATABASE_URL=$(tycho_combined_family_shell_escape "${RUN_DATABASE_URL}")
 export TYCHO_REQUIRE_TEST_DB=1
-psql $(shell_escape "${MAINTENANCE_DATABASE_URL}") -v ON_ERROR_STOP=1 \\
+psql $(tycho_combined_family_shell_escape "${MAINTENANCE_DATABASE_URL}") -v ON_ERROR_STOP=1 \\
   -c "DROP DATABASE IF EXISTS \\"${RUN_DATABASE_NAME}\\";" \\
   -c "CREATE DATABASE \\"${RUN_DATABASE_NAME}\\";"
-trap 'psql $(shell_escape "${MAINTENANCE_DATABASE_URL}") -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \\"${RUN_DATABASE_NAME}\\";" >/dev/null' EXIT
+trap 'psql $(tycho_combined_family_shell_escape "${MAINTENANCE_DATABASE_URL}") -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \\"${RUN_DATABASE_NAME}\\";" >/dev/null' EXIT
 $(render_test_binary_resolve_command)
 for test_name in \\
 $(printf '  %s \\\n' "${TESTS[@]}")

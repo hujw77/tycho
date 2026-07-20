@@ -13,12 +13,14 @@ use crate::{
         extractor_config::{BootstrapConfig, ExtractorConfig, ProtocolTypeConfig},
         family_dispatch::{FamilyBlockChangesDispatcher, FamilyBranchSpec},
         family_registry::default_family_runtime_registry,
+        family_runtime::{
+            resolved_family_runtime_from_extractor_configs_for_tests,
+            FamilyRuntimeMembershipView, ResolvedFamilyRuntime,
+        },
         family_runtime_execution::FamilyRuntimeState,
         family_runtime_metadata::ResolvedSharedFamilyStream,
-        family_runtime_planning::resolved_family_runtime_from_extractor_configs_for_tests,
-        family_runtime_planning::{
-            validate_family_runtime_membership, DetectedFamilyRuntime, ResolvedFamilyRuntime,
-            ResolvedFamilyRuntimeContract,
+        family_runtime_resolution::{
+            validate_family_runtime_membership, ResolvedFamilyRuntimeContract,
         },
         protocol_cache::ProtocolMemoryCache,
         ExtractionError, Extractor,
@@ -44,18 +46,78 @@ pub(super) fn family_runtime_state_for_tests(
         chrono::Duration::seconds(60),
         Arc::new(MockGateway::new()),
     );
-    let runtime_contract = ResolvedFamilyRuntimeContract {
-        shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
-        branch_specs: extractors
-            .keys()
-            .cloned()
-            .map(|protocol_system| FamilyBranchSpec {
-                protocol_system,
-                protocol_type_names: Default::default(),
-            })
-            .collect::<Vec<_>>(),
-    };
+    let runtime_contract = family_runtime_contract_for_test_extractors(extractors);
     FamilyRuntimeState::new(&runtime_contract, extractors, dispatcher, protocol_cache)
+}
+
+fn family_runtime_contract_for_test_extractors(
+    extractors: &HashMap<String, Arc<dyn Extractor>>,
+) -> ResolvedFamilyRuntimeContract {
+    let branch_specs = extractors
+        .keys()
+        .cloned()
+        .map(|protocol_system| FamilyBranchSpec {
+            protocol_system,
+            protocol_type_names: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    let shared_progress_owner_protocol_system =
+        crate::extractor::family_registry::default_family_runtime_registry()
+            .shared_progress_owner_protocol_system_for_family("uniswap")
+            .map(str::to_string)
+            .or_else(|| {
+                branch_specs
+                    .first()
+                    .map(|branch| branch.protocol_system.clone())
+            })
+            .expect("family runtime test helper requires at least one branch");
+    ResolvedFamilyRuntimeContract::new(
+        uniswap_shared_stream_for_tests(""),
+        branch_specs,
+        shared_progress_owner_protocol_system,
+    )
+}
+
+pub(super) fn make_uniswap_family_branch_specs() -> [FamilyBranchSpec; 2] {
+    [
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v2".to_string(),
+            protocol_type_names: std::collections::HashSet::from(["uniswap_v2_pool".to_string()]),
+        },
+        FamilyBranchSpec {
+            protocol_system: "uniswap_v3".to_string(),
+            protocol_type_names: std::collections::HashSet::from(["uniswap_v3_pool".to_string()]),
+        },
+    ]
+}
+
+pub(super) fn make_uniswap_family_dispatcher() -> FamilyBlockChangesDispatcher {
+    FamilyBlockChangesDispatcher::new(make_uniswap_family_branch_specs())
+        .expect("dispatcher builds")
+}
+
+pub(super) fn make_uniswap_family_dispatcher_with_component_systems(
+    component_systems: HashMap<String, String>,
+) -> FamilyBlockChangesDispatcher {
+    let mut dispatcher = make_uniswap_family_dispatcher();
+    dispatcher.register_component_systems(component_systems);
+    dispatcher
+}
+
+pub(super) fn make_uniswap_family_dispatcher_with_contract_systems(
+    contract_systems: HashMap<Vec<u8>, String>,
+) -> FamilyBlockChangesDispatcher {
+    let mut dispatcher = make_uniswap_family_dispatcher();
+    dispatcher.register_contract_systems(contract_systems);
+    dispatcher
+}
+
+pub(super) fn make_uniswap_family_runtime_contract() -> ResolvedFamilyRuntimeContract {
+    ResolvedFamilyRuntimeContract::new(
+        uniswap_shared_stream_for_tests(""),
+        make_uniswap_family_branch_specs().into_iter().collect(),
+        "uniswap_v2",
+    )
 }
 
 pub(super) fn family_runner_for_tests(
@@ -65,17 +127,7 @@ pub(super) fn family_runner_for_tests(
     dispatcher: FamilyBlockChangesDispatcher,
 ) -> FamilyExtractorRunner {
     let runtime_state = family_runtime_state_for_tests(&extractors, dispatcher);
-    let runtime_contract = ResolvedFamilyRuntimeContract {
-        shared_extractor_id: uniswap_shared_stream_for_tests("").extractor_id,
-        branch_specs: extractors
-            .keys()
-            .cloned()
-            .map(|protocol_system| FamilyBranchSpec {
-                protocol_system,
-                protocol_type_names: Default::default(),
-            })
-            .collect::<Vec<_>>(),
-    };
+    let runtime_contract = family_runtime_contract_for_test_extractors(&extractors);
     FamilyExtractorRunner::new(
         runtime_contract,
         extractors,
@@ -89,7 +141,7 @@ pub(super) fn family_runner_for_tests(
 }
 
 pub(super) fn validate_family_runner_membership(
-    family: &DetectedFamilyRuntime,
+    family: &impl FamilyRuntimeMembershipView,
     extractor_configs: &[&ExtractorConfig],
 ) -> Result<(), ExtractionError> {
     validate_family_runtime_membership(family, extractor_configs)
@@ -183,44 +235,14 @@ pub(super) fn make_family_block_scoped_data() -> BlockScopedData {
 pub(super) fn make_uniswap_family_bootstrap_test_configs() -> [ExtractorConfig; 2] {
     [
         ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            start_block: 42,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_pool_events".to_string(),
-                "factory=0x01".to_string(),
-            )]),
-            bootstrap: Some(BootstrapConfig {
-                strategy: BootstrapStrategy::UniswapV2Rpc,
-                start_block: 42,
-                params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000001234"
-                    .to_owned(),
-            }),
-            ..Default::default()
+            substreams_params: make_uniswap_member_substreams_params("uniswap_v2"),
+            bootstrap: Some(make_uniswap_member_bootstrap_config("uniswap_v2", 42)),
+            ..make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", 42)
         },
         ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            start_block: 42,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            substreams_params: HashMap::from([(
-                "map_events".to_string(),
-                "factory=0x02".to_string(),
-            )]),
-            bootstrap: Some(BootstrapConfig {
-                strategy: BootstrapStrategy::UniswapV3Rpc,
-                start_block: 42,
-                params: "bootstrap_block=42&pool=0x0000000000000000000000000000000000005678"
-                    .to_owned(),
-            }),
-            ..Default::default()
+            substreams_params: make_uniswap_member_substreams_params("uniswap_v3"),
+            bootstrap: Some(make_uniswap_member_bootstrap_config("uniswap_v3", 42)),
+            ..make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", 42)
         },
     ]
 }
@@ -230,27 +252,64 @@ pub(super) fn make_uniswap_family_runtime_test_configs(
     v3_start_block: i64,
 ) -> [ExtractorConfig; 2] {
     [
-        ExtractorConfig {
-            name: "uniswap_v2".to_owned(),
-            protocol_system: "uniswap_v2".to_string(),
-            start_block: v2_start_block,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v2_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        },
-        ExtractorConfig {
-            name: "uniswap_v3".to_owned(),
-            protocol_system: "uniswap_v3".to_string(),
-            start_block: v3_start_block,
-            protocol_types: vec![ProtocolTypeConfig::new(
-                "uniswap_v3_pool".to_string(),
-                FinancialType::Swap,
-            )],
-            ..Default::default()
-        },
+        make_uniswap_member_runtime_test_config("uniswap_v2", "uniswap_v2", v2_start_block),
+        make_uniswap_member_runtime_test_config("uniswap_v3", "uniswap_v3", v3_start_block),
     ]
+}
+
+pub(super) fn make_uniswap_member_runtime_test_config(
+    name: &str,
+    protocol_system: &str,
+    start_block: i64,
+) -> ExtractorConfig {
+    ExtractorConfig {
+        name: name.to_owned(),
+        protocol_system: protocol_system.to_string(),
+        start_block,
+        protocol_types: vec![ProtocolTypeConfig::new(
+            match protocol_system {
+                "uniswap_v2" => "uniswap_v2_pool",
+                "uniswap_v3" => "uniswap_v3_pool",
+                other => panic!("unsupported uniswap-family protocol system `{other}`"),
+            }
+            .to_string(),
+            FinancialType::Swap,
+        )],
+        ..Default::default()
+    }
+}
+
+pub(super) fn make_uniswap_member_substreams_params(
+    protocol_system: &str,
+) -> HashMap<String, String> {
+    match protocol_system {
+        "uniswap_v2" => HashMap::from([("map_pool_events".to_string(), "factory=0x01".to_string())]),
+        "uniswap_v3" => HashMap::from([("map_events".to_string(), "factory=0x02".to_string())]),
+        other => panic!("unsupported uniswap-family protocol system `{other}`"),
+    }
+}
+
+pub(super) fn make_uniswap_member_bootstrap_config(
+    protocol_system: &str,
+    start_block: i64,
+) -> BootstrapConfig {
+    match protocol_system {
+        "uniswap_v2" => BootstrapConfig {
+            strategy: BootstrapStrategy::UniswapV2Rpc,
+            start_block,
+            params: format!(
+                "bootstrap_block={start_block}&pool=0x0000000000000000000000000000000000001234"
+            ),
+        },
+        "uniswap_v3" => BootstrapConfig {
+            strategy: BootstrapStrategy::UniswapV3Rpc,
+            start_block,
+            params: format!(
+                "bootstrap_block={start_block}&pool=0x0000000000000000000000000000000000005678"
+            ),
+        },
+        other => panic!("unsupported uniswap-family protocol system `{other}`"),
+    }
 }
 
 pub(super) fn try_resolved_family_runtime_from_configs_for_tests<'a>(

@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use futures03::StreamExt;
 use tokio::sync::Mutex;
 use tycho_ethereum::rpc::EthereumRpcClient;
 
@@ -9,12 +8,15 @@ use crate::{
     extractor::{
         protocol_cache::ProtocolMemoryCache,
         runtime_targets_startup::{
-            prepare_runtime_target_startup_from_draft, PreparedRuntimeTargetKind,
-            PreparedRuntimeTargetStartup, ResolvedRuntimeTargetsBuildContext,
+            ResolvedRuntimeTargetsBuildContext,
         },
         Extractor,
     },
     pb::sf::substreams::rpc::v2::BlockScopedData,
+    testing::{
+        uniswap_family_runtime_config_for_tests,
+        uniswap_family_runtime_config_for_tests_with_durability_scope,
+    },
 };
 
 #[tokio::test]
@@ -171,7 +173,8 @@ async fn test_family_runner_does_not_durably_persist_failing_block_across_branch
             .await
             .expect("populate protocol cache");
 
-        let v2_gateway = ExtractorPgGateway::new("uniswap_v2", chain, 1000, cached_gw.clone(), None);
+        let v2_gateway =
+            ExtractorPgGateway::new("uniswap_v2", chain, 1000, cached_gw.clone(), None, true);
         let v2_extractor = Arc::new(
             ProtocolExtractor::<
                 ExtractorPgGateway,
@@ -226,17 +229,7 @@ async fn test_family_runner_does_not_durably_persist_failing_block_across_branch
                 });
         }
 
-        let dispatcher = FamilyBlockChangesDispatcher::new([
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v2".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-            },
-            FamilyBranchSpec {
-                protocol_system: "uniswap_v3".to_string(),
-                protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-            },
-        ])
-        .expect("dispatcher builds");
+        let dispatcher = make_uniswap_family_dispatcher();
 
         let runner = family_runner_for_tests(
             HashMap::from([
@@ -344,25 +337,19 @@ async fn test_family_runner_does_not_durably_persist_failing_block_across_branch
 #[tokio::test]
 async fn test_family_runner_flushes_all_branches_on_stream_end() {
     let mut v2 = MockExtractor::new();
+    v2.expect_get_id()
+        .returning(|| ExtractorIdentity::new(Chain::Ethereum, "uniswap_v2"));
     v2.expect_flush()
         .once()
         .returning(|| Ok(()));
     let mut v3 = MockExtractor::new();
+    v3.expect_get_id()
+        .returning(|| ExtractorIdentity::new(Chain::Ethereum, "uniswap_v3"));
     v3.expect_flush()
         .once()
         .returning(|| Ok(()));
 
-    let dispatcher = FamilyBlockChangesDispatcher::new([
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ])
-    .expect("dispatcher builds");
+    let dispatcher = make_uniswap_family_dispatcher();
 
     let runner = family_runner_for_tests(
         HashMap::from([
@@ -400,17 +387,7 @@ async fn test_family_runner_subscribe_resolves_alias_named_handle_to_protocol_sy
     v3.expect_protocol_system()
         .return_const("uniswap_v3".to_string());
 
-    let dispatcher = FamilyBlockChangesDispatcher::new([
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v2".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v2_pool".to_string()]),
-        },
-        FamilyBranchSpec {
-            protocol_system: "uniswap_v3".to_string(),
-            protocol_type_names: HashSet::from(["uniswap_v3_pool".to_string()]),
-        },
-    ])
-    .expect("dispatcher builds");
+    let dispatcher = make_uniswap_family_dispatcher();
 
     let v2_subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let v3_subscriptions = Arc::new(Mutex::new(HashMap::new()));
@@ -446,7 +423,7 @@ async fn test_family_runner_subscribe_resolves_alias_named_handle_to_protocol_sy
 }
 
 #[test]
-fn test_family_branch_subscription_index_learns_aliases_from_extractors() {
+fn test_family_branch_subscription_index_resolves_aliases_without_runtime_scans() {
     let mut v2 = MockExtractor::new();
     v2.expect_get_id()
         .return_const(ExtractorIdentity {
@@ -464,7 +441,7 @@ fn test_family_branch_subscription_index_learns_aliases_from_extractors() {
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let mut index = FamilyBranchSubscriptionIndex::from_branch_protocol_systems(
+    let index = FamilyBranchSubscriptionIndex::from_branch_protocol_systems(
         ["uniswap_v2", "uniswap_v3"],
         &extractors,
     );
@@ -472,9 +449,8 @@ fn test_family_branch_subscription_index_learns_aliases_from_extractors() {
     assert_eq!(index.get("uniswap_v2"), Some("uniswap_v2"));
     assert_eq!(index.get("uniswap_v2_alias"), Some("uniswap_v2"));
     assert_eq!(
-        index.resolve_or_learn(
+        index.resolve(
             &ExtractorIdentity { chain: Chain::Ethereum, name: "uniswap_v2_alias".to_string() },
-            &extractors,
         ),
         Some("uniswap_v2".to_string())
     );
@@ -500,9 +476,7 @@ async fn test_family_branch_runtime_wiring_uses_protocol_system_keys_and_emits_h
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let (control_tx, _control_rx) = mpsc::channel(4);
-
-    let wiring = FamilyBranchRuntimeWiring::from_extractors(extractors, &control_tx);
+    let wiring = FamilyBranchRuntimeWiring::from_extractors(extractors);
 
     let subscription_keys = wiring
         .subscriptions
@@ -518,6 +492,7 @@ async fn test_family_branch_runtime_wiring_uses_protocol_system_keys_and_emits_h
     }
 
     let handle_names = wiring
+        .control
         .handles
         .into_iter()
         .map(|handle| handle.get_id().name)
@@ -596,26 +571,20 @@ async fn test_family_runner_build_managed_from_startup_preserves_protocol_system
         ("uniswap_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
         ("uniswap_v3".to_string(), Arc::new(v3) as Arc<dyn Extractor>),
     ]);
-    let runtime_contract = resolved_family.runtime_contract();
-    let dispatcher = FamilyBlockChangesDispatcher::from_protocol_cache_for_runtime_contract(
-        &runtime_contract,
-        &protocol_cache,
-    )
-    .await
-    .expect("dispatcher should seed from protocol cache");
-    let prepared_startup = PreparedFamilyRunnerStartup {
-        extractors: extractors.clone(),
-        runtime_contract: runtime_contract.clone(),
-        stream: SubstreamsStream::from_stream(Box::pin(stream::empty())),
-        runtime_state: FamilyRuntimeState::new(
-            &runtime_contract,
+    let runtime_owner =
+        crate::extractor::family_managed_startup::prepared_family_runtime_owner_for_runtime(
+            &resolved_family,
             &extractors,
-            dispatcher,
             protocol_cache.clone(),
-        ),
-    };
+        )
+        .await
+        .expect("family runtime owner should assemble from resolved runtime");
+    let prepared_startup = crate::extractor::runtime_targets_startup::PreparedRuntimeTargetStartup::new(
+        runtime_owner,
+        SubstreamsStream::from_stream(Box::pin(stream::empty())),
+    );
 
-    let (runner, handles) = PreparedRuntimeTargetStartup::new(prepared_startup)
+    let (runner, handles) = prepared_startup
         .build_managed_runner(None, false)
         .expect("family-owned managed build should assemble runner from prepared startup");
 
@@ -628,29 +597,35 @@ async fn test_family_runner_build_managed_from_startup_preserves_protocol_system
         HashSet::from(["uniswap_v2_alias".to_string(), "uniswap_v3_alias".to_string()])
     );
 
-    let runner = runner.into_typed::<FamilyExtractorRunner>();
-    assert_eq!(
-        runner
-            .runtime_contract
-            .shared_extractor_id,
-        resolved_family.shared_extractor_id()
-    );
-    assert_eq!(
-        runner
-            .extractors
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>(),
-        HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
-    );
-    assert_eq!(
-        runner
-            .subscriptions
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>(),
-        HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
-    );
+    match runner {
+        ManagedRunner::Family(runner) => {
+            assert_eq!(
+                runner
+                    .runtime_contract
+                    .shared_extractor_id(),
+                resolved_family.shared_extractor_id()
+            );
+            assert_eq!(
+                runner
+                    .extractors
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
+            );
+            assert_eq!(
+                runner
+                    .subscriptions
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
+            );
+        }
+        ManagedRunner::Single(_) => {
+            panic!("family-owned managed build should produce a family managed runner")
+        }
+    }
 }
 
 #[tokio::test]
@@ -726,14 +701,9 @@ async fn test_prepare_family_managed_startup_uses_shared_spkg_and_preserves_prot
                 None,
             )
             .with_protocol_system("uniswap_v2")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "uniswap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some(family_output_module_for_tests("uniswap")),
-                durability_scope: Some(crate::testing::family_durability_scope_for_tests(
-                    "uniswap",
-                )),
-            })),
+            .with_family_runtime(Some(uniswap_family_runtime_config_for_tests(
+                shared_spkg_path.clone(),
+            ))),
             ExtractorConfig::new(
                 "uniswap_v3_alias".to_string(),
                 chain,
@@ -752,21 +722,18 @@ async fn test_prepare_family_managed_startup_uses_shared_spkg_and_preserves_prot
                 None,
             )
             .with_protocol_system("uniswap_v3")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "uniswap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some(family_output_module_for_tests("uniswap")),
-                durability_scope: Some(crate::testing::family_durability_scope_for_tests(
-                    "uniswap",
-                )),
-            })),
+            .with_family_runtime(Some(uniswap_family_runtime_config_for_tests(
+                shared_spkg_path.clone(),
+            ))),
         ];
         let config_refs = configs.iter().collect::<Vec<_>>();
         let family =
             resolved_family_runtime_from_configs_for_tests(&config_refs, &shared_spkg_path);
 
-        let prepared_startup = family
-            .prepare_managed_startup_draft(ManagedExtractorBuildContext {
+        let prepared_startup =
+            <crate::extractor::family_runtime::ResolvedFamilyRuntime<'_> as crate::extractor::runtime_targets_startup::ManagedStartupLifecycleView>::prepare_managed_startup_draft(
+                &family,
+                ManagedExtractorBuildContext {
                 chain_state: ChainState::default(),
                 endpoint_url: "https://mainnet.eth.streamingfast.io",
                 s3_bucket: None,
@@ -779,7 +746,8 @@ async fn test_prepare_family_managed_startup_uses_shared_spkg_and_preserves_prot
                 partial_blocks: false,
                 family_runtime_registry:
                     crate::extractor::family_registry::default_family_runtime_registry(),
-            })
+            },
+            )
             .await
             .expect(
                 "family startup should use shared spkg even when member spkg paths are missing",
@@ -799,22 +767,13 @@ async fn test_prepare_family_managed_startup_uses_shared_spkg_and_preserves_prot
             crate::extractor::family_registry::default_family_runtime_registry(),
         );
         let prepared_startup =
-            prepare_runtime_target_startup_from_draft(Box::new(prepared_startup), &context)
+            crate::extractor::runtime_targets_startup::PreparedRuntimeTargetDraft::new(
+                prepared_startup,
+            )
+            .into_prepared_startup(&context)
                 .await
                 .expect("family startup stream");
-        let prepared_startup: crate::extractor::family_managed_startup::PreparedFamilyRunnerStartup =
-            prepared_startup.into_typed();
-
-        assert_eq!(
-            prepared_startup
-                .extractors
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>(),
-            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
-        );
-
-        let (runner, handles) = PreparedRuntimeTargetStartup::new(prepared_startup)
+        let (runner, handles) = prepared_startup
             .build_managed_runner(None, false)
             .expect("prepared startup should build a managed family runner");
         let handle_names = handles
@@ -826,15 +785,21 @@ async fn test_prepare_family_managed_startup_uses_shared_spkg_and_preserves_prot
             HashSet::from(["uniswap_v2_alias".to_string(), "uniswap_v3_alias".to_string()])
         );
 
-        let runner = runner.into_typed::<FamilyExtractorRunner>();
-        assert_eq!(
-            runner
-                .extractors
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>(),
-            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
-        );
+        match runner {
+            ManagedRunner::Family(runner) => {
+                assert_eq!(
+                    runner
+                        .extractors
+                        .keys()
+                        .cloned()
+                        .collect::<HashSet<_>>(),
+                    HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()])
+                );
+            }
+            ManagedRunner::Single(_) => {
+                panic!("prepared family startup should build a family managed runner")
+            }
+        }
 
         let _ = std::fs::remove_file(&shared_spkg_path);
     })
@@ -913,6 +878,7 @@ async fn test_prepare_family_managed_startup_reuses_persisted_shared_bootstrap_c
             1000,
             cached_gw.clone(),
             Some(family_scope.clone()),
+            true,
         );
         cached_gw
             .start_transaction(&persisted_block, Some("seed-shared-bootstrap-startup-progress"))
@@ -984,12 +950,12 @@ async fn test_prepare_family_managed_startup_reuses_persisted_shared_bootstrap_c
                 }),
             )
             .with_protocol_system("uniswap_v2")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "uniswap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some(family_output_module_for_tests("uniswap")),
-                durability_scope: Some(family_scope.clone()),
-            })),
+            .with_family_runtime(Some(
+                uniswap_family_runtime_config_for_tests_with_durability_scope(
+                    shared_spkg_path.clone(),
+                    family_scope.clone(),
+                ),
+            )),
             ExtractorConfig::new(
                 "uniswap_v3".to_string(),
                 chain,
@@ -1017,19 +983,21 @@ async fn test_prepare_family_managed_startup_reuses_persisted_shared_bootstrap_c
                 }),
             )
             .with_protocol_system("uniswap_v3")
-            .with_family_runtime(Some(FamilyRuntimeConfig {
-                family: "uniswap".to_string(),
-                shared_spkg: Some(shared_spkg_path.clone()),
-                shared_module: Some(family_output_module_for_tests("uniswap")),
-                durability_scope: Some(family_scope.clone()),
-            })),
+            .with_family_runtime(Some(
+                uniswap_family_runtime_config_for_tests_with_durability_scope(
+                    shared_spkg_path.clone(),
+                    family_scope.clone(),
+                ),
+            )),
         ];
         let config_refs = configs.iter().collect::<Vec<_>>();
         let family =
             resolved_family_runtime_from_configs_for_tests(&config_refs, &shared_spkg_path);
 
-        let prepared_startup = family
-            .prepare_managed_startup_draft(ManagedExtractorBuildContext {
+        let prepared_startup =
+            <crate::extractor::family_runtime::ResolvedFamilyRuntime<'_> as crate::extractor::runtime_targets_startup::ManagedStartupLifecycleView>::prepare_managed_startup_draft(
+                &family,
+                ManagedExtractorBuildContext {
                 chain_state: ChainState::default(),
                 endpoint_url: &format!("http://{addr}"),
                 s3_bucket: None,
@@ -1042,7 +1010,8 @@ async fn test_prepare_family_managed_startup_reuses_persisted_shared_bootstrap_c
                 partial_blocks: false,
                 family_runtime_registry:
                     crate::extractor::family_registry::default_family_runtime_registry(),
-            })
+            },
+            )
             .await
             .expect("fresh startup should reuse persisted shared bootstrap completion");
         let endpoint_url = format!("http://{addr}");
@@ -1061,18 +1030,20 @@ async fn test_prepare_family_managed_startup_reuses_persisted_shared_bootstrap_c
             crate::extractor::family_registry::default_family_runtime_registry(),
         );
         let prepared_startup =
-            prepare_runtime_target_startup_from_draft(Box::new(prepared_startup), &context)
+            crate::extractor::runtime_targets_startup::PreparedRuntimeTargetDraft::new(
+                prepared_startup,
+            )
+            .into_prepared_startup(&context)
                 .await
                 .expect("family startup stream");
-        let mut prepared_startup: crate::extractor::family_managed_startup::PreparedFamilyRunnerStartup =
-            prepared_startup.into_typed();
-
-        let _ = prepared_startup
-            .stream
-            .next()
+        let (runner, _handles) = prepared_startup
+            .build_managed_runner(None, false)
+            .expect("prepared startup should build a managed family runner");
+        runner
+            .run()
             .await
-            .expect("mock stream should yield one terminal response")
-            .expect("mock stream response should be ok");
+            .expect("managed runner task should join")
+            .expect("managed runner should finish cleanly");
 
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 1, "expected exactly one gRPC request");
@@ -1099,7 +1070,7 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
 
     use crate::extractor::{
         extractor_config::{ExtractorConfig, ProtocolTypeConfig},
-        family_runtime_planning::build_resolved_runtime_targets_with_registry,
+        family_runtime::resolve_runtime_targets_with_registry,
         protocol_message_registry::{
             AuxiliaryProtocolMessageBuildFuture, AuxiliaryProtocolMessageContext,
             AuxiliaryProtocolMessageDecoder,
@@ -1127,8 +1098,9 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
         }];
     let chain = Chain::Ethereum;
     let registry =
-        crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_for_tests(
+        crate::extractor::test_support::future_family_runtime_registry_with_auxiliary_decoders_and_explicit_progress_owner_for_tests(
             &["future_v1", "future_v2"],
+            "future_v1",
             "family::future_swap",
             FUTURE_DECODERS,
         );
@@ -1203,7 +1175,7 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
         ),
     ]);
 
-    let family = build_resolved_runtime_targets_with_registry(&extractors, registry)
+    let family = resolve_runtime_targets_with_registry(&extractors, registry)
         .expect("future family runtime target should resolve")
         .into_iter()
         .find_map(|target| match target {
@@ -1212,20 +1184,20 @@ async fn test_prepare_family_managed_startup_injects_custom_registry_decoders() 
         })
         .expect("custom family target should be present");
 
-    let decoders_by_protocol_system =
-        family.auxiliary_protocol_message_decoders_by_protocol_system();
+    let hooks_by_protocol_system = family.auxiliary_runtime_hooks_by_protocol_system();
 
-    assert_eq!(decoders_by_protocol_system.len(), 2);
-    let future_v1_decoders = decoders_by_protocol_system
+    assert_eq!(hooks_by_protocol_system.len(), 2);
+    let future_v1_decoders = hooks_by_protocol_system
         .get("future_v1")
-        .expect("future_v1 decoders should be present");
-    assert_eq!(future_v1_decoders.len(), 1);
-    assert_eq!(future_v1_decoders[0].protocol_system, "future_v1");
-    assert_eq!(future_v1_decoders[0].type_url_suffix, "FutureEvents");
+        .expect("future_v1 hooks should be present");
+    assert_eq!(future_v1_decoders.message_decoders.len(), 1);
+    assert_eq!(future_v1_decoders.message_decoders[0].protocol_system, "future_v1");
+    assert_eq!(future_v1_decoders.message_decoders[0].type_url_suffix, "FutureEvents");
     assert_eq!(
-        decoders_by_protocol_system
+        hooks_by_protocol_system
             .get("future_v2")
-            .expect("future_v2 decoder slot should be present for the family member")
+            .expect("future_v2 hook slot should be present for the family member")
+            .message_decoders
             .len(),
         1,
         "family startup wiring should carry the family-level auxiliary decoder set across all members that share the stream"
@@ -1242,7 +1214,7 @@ async fn test_build_all_extractors_managed_startup_collapses_custom_family_into_
     use crate::extractor::{
         extractor_config::{ExtractorConfig, ProtocolTypeConfig},
         family_runner_wiring::FamilyBranchRuntimeWiring,
-        family_runtime_planning::build_resolved_runtime_targets_with_registry,
+        family_runtime::resolve_runtime_targets_with_registry,
         runtime_target_planning::ResolvedRuntimeTarget,
     };
 
@@ -1306,11 +1278,12 @@ async fn test_build_all_extractors_managed_startup_collapses_custom_family_into_
         ),
     ]);
 
-    let registry = crate::extractor::test_support::future_family_runtime_registry_for_tests(
+    let registry = crate::extractor::test_support::future_family_runtime_registry_with_explicit_progress_owner_for_tests(
         &["future_v1", "future_v2"],
+        "future_v1",
         "family::future_swap",
     );
-    let runtime_targets = build_resolved_runtime_targets_with_registry(&configs, registry)
+    let runtime_targets = resolve_runtime_targets_with_registry(&configs, registry)
         .expect("runtime targets should resolve custom future family startup");
     assert_eq!(
         runtime_targets.len(),
@@ -1352,8 +1325,7 @@ async fn test_build_all_extractors_managed_startup_collapses_custom_family_into_
         ("future_v1".to_string(), Arc::new(v1) as Arc<dyn Extractor>),
         ("future_v2".to_string(), Arc::new(v2) as Arc<dyn Extractor>),
     ]);
-    let (control_tx, _control_rx) = mpsc::channel(8);
-    let wiring = FamilyBranchRuntimeWiring::from_extractors(extractors, &control_tx);
+    let wiring = FamilyBranchRuntimeWiring::from_extractors(extractors);
 
     assert_eq!(
         wiring
@@ -1366,6 +1338,7 @@ async fn test_build_all_extractors_managed_startup_collapses_custom_family_into_
     );
 
     let handle_names = wiring
+        .control
         .handles
         .into_iter()
         .map(|handle| handle.get_id().name)
@@ -1392,12 +1365,10 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
         extractor::{
             chain_state::ChainState, extractor_config::ExtractorConfig,
             family_registry::default_family_runtime_registry,
-            family_runtime_metadata::FamilyRuntimeConfig,
+            startup::ResolvedRuntimeTargetsBuildContext,
         },
         testing::{
-            build_all_extractors_for_tests, family_durability_scope_for_tests,
-            family_output_module_for_tests, write_temp_substreams_package_for_tests,
-            BuildExtractorsTestContext,
+            build_all_extractors_for_tests, write_temp_substreams_package_for_tests,
         },
     };
 
@@ -1445,7 +1416,8 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
             .expect("Failed to create stub RPC client");
         let token_processor = EthereumTokenPreProcessor::new(&rpc, chain, AlloyAddress::ZERO);
 
-        let extractors = ExtractorConfigs::new(HashMap::from([
+        let registry = default_family_runtime_registry();
+        let extractors = ExtractorConfigs::new_with_registry(HashMap::from([
             (
                 "uniswap_v2_alias".to_string(),
                 ExtractorConfig::new(
@@ -1469,12 +1441,9 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
                     None,
                 )
                 .with_protocol_system("uniswap_v2")
-                .with_family_runtime(Some(FamilyRuntimeConfig {
-                    family: "uniswap".to_string(),
-                    shared_spkg: Some(shared_spkg_path.clone()),
-                    shared_module: Some(family_output_module_for_tests("uniswap")),
-                    durability_scope: Some(family_durability_scope_for_tests("uniswap")),
-                })),
+                .with_family_runtime(Some(uniswap_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                ))),
             ),
             (
                 "uniswap_v3_alias".to_string(),
@@ -1499,12 +1468,9 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
                     None,
                 )
                 .with_protocol_system("uniswap_v3")
-                .with_family_runtime(Some(FamilyRuntimeConfig {
-                    family: "uniswap".to_string(),
-                    shared_spkg: Some(shared_spkg_path.clone()),
-                    shared_module: Some(family_output_module_for_tests("uniswap")),
-                    durability_scope: Some(family_durability_scope_for_tests("uniswap")),
-                })),
+                .with_family_runtime(Some(uniswap_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                ))),
             ),
             (
                 "curve_alias".to_string(),
@@ -1530,10 +1496,9 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
                 )
                 .with_protocol_system("curve"),
             ),
-        ]));
-        let registry = default_family_runtime_registry();
+        ]), registry);
         let runtime_targets = extractors
-            .resolved_indexer_runtime_plan_with_registry(registry)
+            .resolved_indexer_runtime_plan()
             .expect("runtime plan should resolve mixed family + standalone startup")
             .into_runtime_targets();
 
@@ -1541,19 +1506,20 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
 
         let (runners, handles) = build_all_extractors_for_tests(
             &extractors,
-            BuildExtractorsTestContext {
-                chain_state: ChainState::default(),
-                endpoint_url: "https://mainnet.eth.streamingfast.io",
-                s3_bucket: None,
-                substreams_api_token: "",
-                cached_gw: &cached_gw,
-                database_insert_batch_size: 1000,
-                token_pre_processor: &token_processor,
-                rpc_client: &rpc,
-                runtime: None,
-                partial_blocks: false,
-                family_runtime_registry: registry,
-            },
+            ResolvedRuntimeTargetsBuildContext::new(
+                ChainState::default(),
+                "https://mainnet.eth.streamingfast.io",
+                None,
+                "",
+                &cached_gw,
+                1000,
+                &token_processor,
+                &rpc,
+                None,
+                false,
+                false,
+                registry,
+            ),
         )
         .await
         .expect("mixed runtime targets should build one family runner plus one standalone runner");
@@ -1562,7 +1528,7 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
         assert_eq!(
             runners
                 .iter()
-                .filter(|runner| runner.kind() == ManagedRunnerKind::Family)
+                .filter(|runner| matches!(runner, ManagedRunner::Family(_)))
                 .count(),
             1,
             "expected exactly one managed family runner"
@@ -1570,7 +1536,7 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
         assert_eq!(
             runners
                 .iter()
-                .filter(|runner| runner.kind() == ManagedRunnerKind::Single)
+                .filter(|runner| matches!(runner, ManagedRunner::Single(_)))
                 .count(),
             1,
             "expected exactly one managed standalone runner"
@@ -1578,7 +1544,10 @@ async fn test_build_all_extractors_managed_startup_supports_family_and_standalon
 
         let family_runner = runners
             .iter()
-            .find_map(|runner| runner.downcast_ref::<FamilyExtractorRunner>())
+            .find_map(|runner| match runner {
+                ManagedRunner::Family(runner) => Some(runner),
+                ManagedRunner::Single(_) => None,
+            })
             .expect("family runner should be present");
         assert_eq!(
             family_runner
@@ -1625,13 +1594,9 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
         extractor::{
             chain_state::ChainState, extractor_config::ExtractorConfig,
             family_registry::default_family_runtime_registry,
-            family_runtime_metadata::FamilyRuntimeConfig,
             startup::ResolvedRuntimeTargetsBuildContext,
         },
-        testing::{
-            family_durability_scope_for_tests, family_output_module_for_tests,
-            write_temp_substreams_package_for_tests,
-        },
+        testing::write_temp_substreams_package_for_tests,
     };
 
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -1678,7 +1643,8 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
             .expect("Failed to create stub RPC client");
         let token_processor = EthereumTokenPreProcessor::new(&rpc, chain, AlloyAddress::ZERO);
 
-        let extractors = ExtractorConfigs::new(HashMap::from([
+        let registry = default_family_runtime_registry();
+        let extractors = ExtractorConfigs::new_with_registry(HashMap::from([
             (
                 "uniswap_v2_alias".to_string(),
                 ExtractorConfig::new(
@@ -1702,12 +1668,9 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
                     None,
                 )
                 .with_protocol_system("uniswap_v2")
-                .with_family_runtime(Some(FamilyRuntimeConfig {
-                    family: "uniswap".to_string(),
-                    shared_spkg: Some(shared_spkg_path.clone()),
-                    shared_module: Some(family_output_module_for_tests("uniswap")),
-                    durability_scope: Some(family_durability_scope_for_tests("uniswap")),
-                })),
+                .with_family_runtime(Some(uniswap_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                ))),
             ),
             (
                 "uniswap_v3_alias".to_string(),
@@ -1732,12 +1695,9 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
                     None,
                 )
                 .with_protocol_system("uniswap_v3")
-                .with_family_runtime(Some(FamilyRuntimeConfig {
-                    family: "uniswap".to_string(),
-                    shared_spkg: Some(shared_spkg_path.clone()),
-                    shared_module: Some(family_output_module_for_tests("uniswap")),
-                    durability_scope: Some(family_durability_scope_for_tests("uniswap")),
-                })),
+                .with_family_runtime(Some(uniswap_family_runtime_config_for_tests(
+                    shared_spkg_path.clone(),
+                ))),
             ),
             (
                 "curve_alias".to_string(),
@@ -1763,10 +1723,9 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
                 )
                 .with_protocol_system("curve"),
             ),
-        ]));
-        let registry = default_family_runtime_registry();
+        ]), registry);
         let runtime_targets = extractors
-            .resolved_indexer_runtime_plan_with_registry(registry)
+            .resolved_indexer_runtime_plan()
             .expect("runtime plan should resolve mixed family + standalone startup")
             .into_runtime_targets();
 
@@ -1789,38 +1748,25 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
             .expect("mixed runtime targets should prepare one family startup plus one standalone startup");
 
         assert_eq!(
-            prepared_startup.prepared_targets.len(),
+            prepared_startup.total_targets(),
             2,
             "expected exactly two prepared startup artifacts"
         );
-        assert_eq!(
-            prepared_startup
-                .prepared_targets
-                .iter()
-                .filter(|startup| startup.kind() == PreparedRuntimeTargetKind::Family)
-                .count(),
-            1,
-            "expected exactly one prepared family startup"
-        );
-        assert_eq!(
-            prepared_startup
-                .prepared_targets
-                .iter()
-                .filter(|startup| startup.kind() == PreparedRuntimeTargetKind::Standalone)
-                .count(),
-            1,
-            "expected exactly one prepared standalone startup"
-        );
-
-        let (runners, handles) = prepared_startup
-            .build_managed_runners()
+        assert_eq!(prepared_startup.family_targets.len(), 1);
+        assert_eq!(prepared_startup.standalone_targets.len(), 1);
+        let managed_runners = prepared_startup
+            .build_managed_runners_batch()
             .expect("prepared mixed runtime targets should build one family runner plus one standalone runner");
+        assert_eq!(managed_runners.total_runners(), 2);
+        assert_eq!(managed_runners.family_runners.len(), 1);
+        assert_eq!(managed_runners.standalone_runners.len(), 1);
+        let (runners, handles) = managed_runners.into_flattened();
 
         assert_eq!(runners.len(), 2, "expected exactly two managed runners");
         assert_eq!(
             runners
                 .iter()
-                .filter(|runner| runner.kind() == ManagedRunnerKind::Family)
+                .filter(|runner| matches!(runner, ManagedRunner::Family(_)))
                 .count(),
             1,
             "expected exactly one managed family runner from prepared startup"
@@ -1828,7 +1774,7 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
         assert_eq!(
             runners
                 .iter()
-                .filter(|runner| runner.kind() == ManagedRunnerKind::Single)
+                .filter(|runner| matches!(runner, ManagedRunner::Single(_)))
                 .count(),
             1,
             "expected exactly one managed standalone runner from prepared startup"
@@ -1837,6 +1783,143 @@ async fn test_resolved_runtime_targets_prepare_startup_prepares_family_and_stand
 
         let _ = std::fs::remove_file(&shared_spkg_path);
         let _ = std::fs::remove_file(&standalone_spkg_path);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_resolved_runtime_targets_prepare_startup_collapses_combined_uniswap_family_to_one_family_target(
+) {
+    use alloy::primitives::Address as AlloyAddress;
+    use tycho_ethereum::services::token_pre_processor::EthereumTokenPreProcessor;
+    use tycho_storage::postgres::{builder::GatewayBuilder, testing::run_against_db};
+
+    use crate::{
+        config::ExtractorConfigs,
+        extractor::{
+            chain_state::ChainState, family_registry::default_family_runtime_registry,
+            startup::ResolvedRuntimeTargetsBuildContext,
+        },
+        testing::{uniswap_family_swap_extractors_for_tests, write_temp_substreams_package_for_tests},
+    };
+
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:mypassword@localhost:5431/tycho_indexer_0".to_string()
+    });
+    std::env::set_var("DATABASE_URL", &db_url);
+
+    run_against_db(|_| async move {
+        let chain = Chain::Ethereum;
+        let shared_spkg_path =
+            write_temp_substreams_package_for_tests("combined-family-prepare-startup");
+        let missing_member_v2_spkg = std::env::temp_dir()
+            .join(format!(
+                "missing-member-v2-combined-family-{}-{}.spkg",
+                std::process::id(),
+                "prepare-startup"
+            ))
+            .to_string_lossy()
+            .to_string();
+        let missing_member_v3_spkg = std::env::temp_dir()
+            .join(format!(
+                "missing-member-v3-combined-family-{}-{}.spkg",
+                std::process::id(),
+                "prepare-startup"
+            ))
+            .to_string_lossy()
+            .to_string();
+
+        let (cached_gw, _) = GatewayBuilder::new(db_url.as_str())
+            .set_chains(&[chain])
+            .set_protocol_systems(&["uniswap_v2".to_string(), "uniswap_v3".to_string()])
+            .build()
+            .await
+            .expect("Failed to create cached gateway");
+
+        let rpc = EthereumRpcClient::new("http://localhost:0000")
+            .expect("Failed to create stub RPC client");
+        let token_processor = EthereumTokenPreProcessor::new(&rpc, chain, AlloyAddress::ZERO);
+
+        let registry = default_family_runtime_registry();
+        let extractors = ExtractorConfigs::new_with_registry(
+            uniswap_family_swap_extractors_for_tests(
+                chain,
+                42,
+                shared_spkg_path.clone(),
+                missing_member_v2_spkg,
+                missing_member_v3_spkg,
+            ),
+            registry,
+        );
+        let runtime_targets = extractors
+            .resolved_indexer_runtime_plan()
+            .expect("runtime plan should resolve one combined family target")
+            .into_runtime_targets();
+
+        assert_eq!(runtime_targets.len(), 1, "expected exactly one resolved runtime target");
+
+        let prepared_startup = runtime_targets
+            .prepare_startup(&ResolvedRuntimeTargetsBuildContext {
+                chain_state: ChainState::default(),
+                endpoint_url: "https://mainnet.eth.streamingfast.io",
+                s3_bucket: None,
+                substreams_api_token: "",
+                cached_gw: &cached_gw,
+                database_insert_batch_size: 1000,
+                token_pre_processor: &token_processor,
+                rpc_client: &rpc,
+                runtime: None,
+                final_block_only: false,
+                partial_blocks: false,
+                family_runtime_registry: registry,
+            })
+            .await
+            .expect("combined-family runtime targets should prepare one family startup");
+
+        assert_eq!(
+            prepared_startup.total_targets(),
+            1,
+            "expected exactly one prepared startup artifact"
+        );
+        assert_eq!(prepared_startup.family_targets.len(), 1);
+        assert_eq!(prepared_startup.standalone_targets.len(), 0);
+        let managed_runners = prepared_startup
+            .build_managed_runners_batch()
+            .expect("combined-family prepared startup should build one managed family runner");
+        assert_eq!(managed_runners.total_runners(), 1);
+        assert_eq!(managed_runners.family_runners.len(), 1);
+        assert_eq!(managed_runners.standalone_runners.len(), 0);
+        let (runners, handles) = managed_runners.into_flattened();
+
+        assert_eq!(runners.len(), 1, "expected exactly one managed runner");
+        assert_eq!(
+            runners
+                .iter()
+                .filter(|runner| matches!(runner, ManagedRunner::Family(_)))
+                .count(),
+            1,
+            "expected the managed runner to stay on the family path"
+        );
+        assert_eq!(handles.len(), 2, "expected one handle per family member");
+
+        let family_runner = runners
+            .iter()
+            .find_map(|runner| match runner {
+                ManagedRunner::Family(runner) => Some(runner),
+                ManagedRunner::Single(_) => None,
+            })
+            .expect("family runner should be present");
+        assert_eq!(
+            family_runner
+                .extractors
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from(["uniswap_v2".to_string(), "uniswap_v3".to_string()]),
+            "family runner should remain keyed by protocol_system after startup collapse"
+        );
+
+        let _ = std::fs::remove_file(&shared_spkg_path);
     })
     .await;
 }

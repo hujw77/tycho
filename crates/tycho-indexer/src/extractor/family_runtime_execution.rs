@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::{collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use tokio::{
     runtime::Handle,
@@ -28,7 +28,7 @@ use crate::{
         },
         family_dispatch::FamilyBlockChangesDispatcher,
         family_runner_wiring::FamilyBranchSubscriptionIndex,
-        family_runtime_planning::ResolvedFamilyRuntimeContract,
+        family_runtime_resolution::ResolvedFamilyRuntimeContract,
         protocol_cache::ProtocolMemoryCache,
         ExtractionError, Extractor, ExtractorMsg,
     },
@@ -47,11 +47,13 @@ pub struct FamilyExtractorRunner {
     pub(crate) runtime_state: FamilyRuntimeState,
 }
 
+#[derive(Clone)]
 pub(crate) struct FamilyRuntimeState {
     pub(crate) branch_subscription_index: FamilyBranchSubscriptionIndex,
     pub(crate) next_subscriber_id: u64,
     pub(crate) dispatcher: FamilyBlockChangesDispatcher,
     pub(crate) protocol_cache: ProtocolMemoryCache,
+    pub(crate) shared_progress_owner_protocol_system: String,
 }
 
 impl FamilyRuntimeState {
@@ -71,6 +73,9 @@ impl FamilyRuntimeState {
             next_subscriber_id: 0,
             dispatcher,
             protocol_cache,
+            shared_progress_owner_protocol_system: contract
+                .shared_progress_owner_protocol_system()
+                .to_string(),
         }
     }
 }
@@ -92,7 +97,6 @@ impl FamilyExtractorRunner {
             &mut self
                 .runtime_state
                 .branch_subscription_index,
-            &self.extractors,
             &self.subscriptions,
             extractor_id,
             sender,
@@ -150,11 +154,10 @@ impl crate::extractor::execution_loop::ManagedRuntimeLoop for FamilyRuntimeLoopR
             &mut step_context,
             control_rx.recv(),
             substreams.next().instrument(info_span!("substreams_waiting")),
-            |(runtime_state, extractors, subscriptions, _, _), ctrl| {
+            |(runtime_state, _, subscriptions, _, _), ctrl| {
                 Box::pin(async move {
                     handle_family_control_message(
                         runtime_state,
-                        extractors,
                         subscriptions,
                         ctrl,
                     )
@@ -185,7 +188,6 @@ impl crate::extractor::execution_loop::ManagedRuntimeLoop for FamilyRuntimeLoopR
 
 pub(crate) async fn handle_family_control_message(
     runtime_state: &mut FamilyRuntimeState,
-    extractors: &HashMap<String, Arc<dyn Extractor>>,
     subscriptions: &BranchSubscriptionsMap,
     control_message: ControlMessage,
 ) -> Result<RuntimeLoopControlFlow, ExtractionError> {
@@ -199,7 +201,6 @@ pub(crate) async fn handle_family_control_message(
             subscribe_family_branch(
                 &mut runtime_state.next_subscriber_id,
                 &mut runtime_state.branch_subscription_index,
-                extractors,
                 subscriptions,
                 extractor_id,
                 sender,
@@ -214,6 +215,7 @@ pub(crate) async fn handle_family_control_message(
 pub(crate) async fn handle_family_block_response(
     dispatcher: &mut FamilyBlockChangesDispatcher,
     protocol_cache: &ProtocolMemoryCache,
+    shared_progress_owner_protocol_system: &str,
     extractors: &HashMap<String, Arc<dyn Extractor>>,
     subscriptions: &BranchSubscriptionsMap,
     partial_blocks: bool,
@@ -228,6 +230,7 @@ pub(crate) async fn handle_family_block_response(
             handle_family_new_block(
                 dispatcher,
                 protocol_cache,
+                shared_progress_owner_protocol_system,
                 extractors,
                 subscriptions,
                 partial_blocks,
@@ -266,6 +269,9 @@ pub(crate) async fn handle_family_stream_item(
             handle_family_block_response(
                 &mut runtime_state.dispatcher,
                 &runtime_state.protocol_cache,
+                runtime_state
+                    .shared_progress_owner_protocol_system
+                    .as_str(),
                 extractors,
                 subscriptions,
                 partial_blocks,
@@ -282,6 +288,7 @@ pub(crate) async fn handle_family_stream_item(
 pub(crate) async fn handle_family_new_block(
     dispatcher: &mut FamilyBlockChangesDispatcher,
     protocol_cache: &ProtocolMemoryCache,
+    shared_progress_owner_protocol_system: &str,
     extractors: &HashMap<String, Arc<dyn Extractor>>,
     subscriptions: &BranchSubscriptionsMap,
     partial_blocks: bool,
@@ -293,7 +300,10 @@ pub(crate) async fn handle_family_new_block(
     let mut branch_payloads = dispatched
         .into_iter()
         .collect::<Vec<_>>();
-    branch_payloads.sort_by(|(left, _), (right, _)| left.cmp(right));
+    sort_branch_payloads_with_shared_progress_owner_last(
+        branch_payloads.as_mut_slice(),
+        shared_progress_owner_protocol_system,
+    );
     let pending_msgs = process_branch_payloads_for_extractors(
         extractors,
         subscriptions,
@@ -304,10 +314,58 @@ pub(crate) async fn handle_family_new_block(
     propagate_pending_subscription_messages(pending_msgs).await;
     Ok(())
 }
+
+fn sort_branch_payloads_with_shared_progress_owner_last(
+    branch_payloads: &mut [(String, BlockScopedData)],
+    shared_progress_owner_protocol_system: &str,
+) {
+    branch_payloads.sort_by(|(left, _), (right, _)| {
+        match (
+            left == shared_progress_owner_protocol_system,
+            right == shared_progress_owner_protocol_system,
+        ) {
+            (true, true) | (false, false) => left.cmp(right),
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_branch_payloads_with_shared_progress_owner_last;
+    use crate::pb::sf::substreams::rpc::v2::BlockScopedData;
+
+    #[test]
+    fn sorts_shared_progress_owner_last() {
+        let mut branch_payloads = vec![
+            ("uniswap_v3".to_string(), BlockScopedData::default()),
+            ("uniswap_v2".to_string(), BlockScopedData::default()),
+            ("ambient".to_string(), BlockScopedData::default()),
+        ];
+
+        sort_branch_payloads_with_shared_progress_owner_last(
+            &mut branch_payloads,
+            "uniswap_v2",
+        );
+
+        let ordered_protocol_systems = branch_payloads
+            .into_iter()
+            .map(|(protocol_system, _)| protocol_system)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_protocol_systems,
+            vec![
+                "ambient".to_string(),
+                "uniswap_v3".to_string(),
+                "uniswap_v2".to_string(),
+            ]
+        );
+    }
+}
 pub(crate) async fn subscribe_family_branch(
     next_subscriber_id: &mut u64,
     branch_subscription_index: &mut FamilyBranchSubscriptionIndex,
-    extractors: &HashMap<String, Arc<dyn Extractor>>,
     subscriptions: &BranchSubscriptionsMap,
     extractor_id: ExtractorIdentity,
     sender: Sender<ExtractorMsg>,
@@ -318,7 +376,7 @@ pub(crate) async fn subscribe_family_branch(
         "New family branch subscription",
     );
 
-    let subscription_key = branch_subscription_index.resolve_or_learn(&extractor_id, extractors);
+    let subscription_key = branch_subscription_index.resolve(&extractor_id);
 
     if let Some(subscription_key) = subscription_key {
         let subscribers = subscriptions

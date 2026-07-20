@@ -6,20 +6,24 @@ use std::{
 #[cfg(test)]
 use crate::config::ExtractorConfigs;
 #[cfg(test)]
+use tycho_indexer::{
+    canonical_shared_family_runtime_spec_with_explicit_owner,
+};
+#[cfg(test)]
 use crate::extractor::chain_state::ChainState;
 #[cfg(test)]
 use crate::extractor::family_bootstrap_registry::SharedBootstrapParamsParser;
 #[cfg(test)]
 use crate::extractor::family_registry::{
     default_family_runtime_registry, shared_bootstrap_member_runtime, shared_family_member_spec,
-    shared_family_runtime_spec, FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec,
+    FamilyMemberSpec, FamilyRuntimeRegistry, FamilyRuntimeSpec,
 };
 #[cfg(test)]
 use crate::extractor::family_runtime_metadata::FamilyRuntimeConfig;
 #[cfg(test)]
 use crate::extractor::family_runtime_metadata::ResolvedSharedFamilyStream;
 #[cfg(test)]
-use crate::extractor::family_runtime_planning::DetectedFamilyRuntime;
+use crate::extractor::family_runtime::DetectedFamilyRuntime;
 #[cfg(test)]
 use crate::extractor::runtime_target_planning::ResolvedRuntimeTarget;
 #[cfg(test)]
@@ -831,7 +835,12 @@ pub fn family_resolved_shared_stream_for_tests(
     chain: Chain,
     shared_spkg: impl Into<String>,
 ) -> ResolvedSharedFamilyStream {
-    family_detected_runtime_for_tests(family_name, chain, shared_spkg).resolved_shared_stream()
+    let registry = default_family_runtime_registry();
+    family_detected_runtime_for_tests(family_name, chain, shared_spkg)
+        .resolved_shared_stream_with_registry(registry)
+        .unwrap_or_else(|_| {
+            panic!("family `{family_name}` must resolve a shared stream in the registry")
+        })
 }
 
 #[cfg(test)]
@@ -1008,6 +1017,60 @@ family_runtimes:
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct UniswapFamilyTestMemberSpec<'a> {
+    extractor_name: &'a str,
+    protocol_system: &'static str,
+    protocol_type_name: &'static str,
+    module_name: &'static str,
+    substreams_module_name: &'static str,
+}
+
+#[cfg(test)]
+fn uniswap_family_test_members<'a>(
+    v2_name: &'a str,
+    v3_name: &'a str,
+) -> [UniswapFamilyTestMemberSpec<'a>; 2] {
+    [
+        UniswapFamilyTestMemberSpec {
+            extractor_name: v2_name,
+            protocol_system: "uniswap_v2",
+            protocol_type_name: "uniswap_v2_pool",
+            module_name: "v2_map_pool_events",
+            substreams_module_name: "v2_map_pool_events",
+        },
+        UniswapFamilyTestMemberSpec {
+            extractor_name: v3_name,
+            protocol_system: "uniswap_v3",
+            protocol_type_name: "uniswap_v3_pool",
+            module_name: "v3_map_protocol_changes",
+            substreams_module_name: "v3_map_events",
+        },
+    ]
+}
+
+#[cfg(test)]
+fn uniswap_family_fixture_members<'a>(
+    start_block: i64,
+    v2_name: &'a str,
+    v3_name: &'a str,
+    v2_substreams_params: Option<&'a str>,
+    v3_substreams_params: Option<&'a str>,
+) -> [FamilyDefaultsFixtureMemberSpec<'a>; 2] {
+    let member_specs = uniswap_family_test_members(v2_name, v3_name);
+    let member_params = [v2_substreams_params, v3_substreams_params];
+    std::array::from_fn(|index| FamilyDefaultsFixtureMemberSpec {
+        extractor_name: member_specs[index].extractor_name,
+        protocol_system: member_specs[index].protocol_system,
+        protocol_type_name: member_specs[index].protocol_type_name,
+        module_name: member_specs[index].module_name,
+        start_block,
+        substreams_module_name: member_params[index].map(|_| member_specs[index].substreams_module_name),
+        substreams_params: member_params[index],
+    })
+}
+
+#[cfg(test)]
 pub fn write_uniswap_family_defaults_config_with_member_names(
     file_prefix: &str,
     unique: &str,
@@ -1017,6 +1080,7 @@ pub fn write_uniswap_family_defaults_config_with_member_names(
     v2_name: &str,
     v3_name: &str,
 ) -> std::path::PathBuf {
+    let members = uniswap_family_fixture_members(start_block, v2_name, v3_name, None, None);
     write_family_defaults_config_with_shared_bootstrap_for_tests(
         file_prefix,
         unique,
@@ -1025,26 +1089,7 @@ pub fn write_uniswap_family_defaults_config_with_member_names(
         None,
         None,
         stop_block,
-        &[
-            FamilyDefaultsFixtureMemberSpec {
-                extractor_name: v2_name,
-                protocol_system: "uniswap_v2",
-                protocol_type_name: "uniswap_v2_pool",
-                module_name: "v2_map_pool_events",
-                start_block,
-                substreams_module_name: None,
-                substreams_params: None,
-            },
-            FamilyDefaultsFixtureMemberSpec {
-                extractor_name: v3_name,
-                protocol_system: "uniswap_v3",
-                protocol_type_name: "uniswap_v3_pool",
-                module_name: "v3_map_protocol_changes",
-                start_block,
-                substreams_module_name: None,
-                substreams_params: None,
-            },
-        ],
+        &members,
     )
 }
 
@@ -1060,6 +1105,7 @@ pub fn write_uniswap_family_defaults_config_with_member_names_and_runtime_overri
     v2_name: &str,
     v3_name: &str,
 ) -> std::path::PathBuf {
+    let members = uniswap_family_fixture_members(start_block, v2_name, v3_name, None, None);
     write_family_defaults_config_with_shared_bootstrap_for_tests(
         file_prefix,
         unique,
@@ -1068,26 +1114,7 @@ pub fn write_uniswap_family_defaults_config_with_member_names_and_runtime_overri
         bootstrap_path,
         durability_scope,
         stop_block,
-        &[
-            FamilyDefaultsFixtureMemberSpec {
-                extractor_name: v2_name,
-                protocol_system: "uniswap_v2",
-                protocol_type_name: "uniswap_v2_pool",
-                module_name: "v2_map_pool_events",
-                start_block,
-                substreams_module_name: None,
-                substreams_params: None,
-            },
-            FamilyDefaultsFixtureMemberSpec {
-                extractor_name: v3_name,
-                protocol_system: "uniswap_v3",
-                protocol_type_name: "uniswap_v3_pool",
-                module_name: "v3_map_protocol_changes",
-                start_block,
-                substreams_module_name: None,
-                substreams_params: None,
-            },
-        ],
+        &members,
     )
 }
 
@@ -1102,6 +1129,13 @@ pub fn write_uniswap_family_defaults_config_with_shared_bootstrap(
     v2_substreams_params: Option<&str>,
     v3_substreams_params: Option<&str>,
 ) -> std::path::PathBuf {
+    let members = uniswap_family_fixture_members(
+        start_block,
+        "uniswap_v2",
+        "uniswap_v3",
+        v2_substreams_params,
+        v3_substreams_params,
+    );
     write_family_defaults_config_with_shared_bootstrap_for_tests(
         file_prefix,
         unique,
@@ -1110,26 +1144,7 @@ pub fn write_uniswap_family_defaults_config_with_shared_bootstrap(
         Some(bootstrap_path),
         None,
         stop_block,
-        &[
-            FamilyDefaultsFixtureMemberSpec {
-                extractor_name: "uniswap_v2",
-                protocol_system: "uniswap_v2",
-                protocol_type_name: "uniswap_v2_pool",
-                module_name: "v2_map_pool_events",
-                start_block,
-                substreams_module_name: Some("v2_map_pool_events"),
-                substreams_params: v2_substreams_params,
-            },
-            FamilyDefaultsFixtureMemberSpec {
-                extractor_name: "uniswap_v3",
-                protocol_system: "uniswap_v3",
-                protocol_type_name: "uniswap_v3_pool",
-                module_name: "v3_map_protocol_changes",
-                start_block,
-                substreams_module_name: Some("v3_map_events"),
-                substreams_params: v3_substreams_params,
-            },
-        ],
+        &members,
     )
 }
 
@@ -1143,12 +1158,21 @@ pub fn family_runtime_config_for_tests(
     family_name: &str,
     shared_spkg: impl Into<String>,
 ) -> FamilyRuntimeConfig {
-    FamilyRuntimeConfig {
-        family: family_name.to_string(),
-        shared_spkg: Some(shared_spkg.into()),
-        shared_module: Some(family_shared_module_for_tests(family_name)),
-        durability_scope: Some(family_durability_scope_for_tests(family_name)),
-    }
+    FamilyRuntimeConfig::from_resolved_shared_stream(
+        family_name,
+        family_resolved_shared_stream_for_tests(family_name, Chain::Ethereum, shared_spkg),
+    )
+}
+
+#[cfg(test)]
+pub fn family_runtime_config_for_tests_with_durability_scope(
+    family_name: &str,
+    shared_spkg: impl Into<String>,
+    durability_scope: impl Into<String>,
+) -> FamilyRuntimeConfig {
+    let mut runtime = family_runtime_config_for_tests(family_name, shared_spkg);
+    runtime.durability_scope = Some(durability_scope.into());
+    runtime
 }
 
 #[cfg(test)]
@@ -1161,6 +1185,18 @@ pub fn uniswap_family_runtime_config_for_tests(
     shared_spkg: impl Into<String>,
 ) -> FamilyRuntimeConfig {
     family_runtime_config_for_tests("uniswap", shared_spkg)
+}
+
+#[cfg(test)]
+pub fn uniswap_family_runtime_config_for_tests_with_durability_scope(
+    shared_spkg: impl Into<String>,
+    durability_scope: impl Into<String>,
+) -> FamilyRuntimeConfig {
+    family_runtime_config_for_tests_with_durability_scope(
+        "uniswap",
+        shared_spkg,
+        durability_scope,
+    )
 }
 
 #[cfg(test)]
@@ -1243,53 +1279,14 @@ pub fn write_temp_substreams_package_for_tests(label: &str) -> String {
 }
 
 #[cfg(test)]
-#[derive(Clone)]
-#[allow(dead_code)]
-pub(crate) struct BuildExtractorsTestContext<'a> {
-    pub chain_state: ChainState,
-    pub endpoint_url: &'a str,
-    pub s3_bucket: Option<&'a str>,
-    pub substreams_api_token: &'a str,
-    pub cached_gw: &'a CachedGateway,
-    pub database_insert_batch_size: usize,
-    pub token_pre_processor: &'a EthereumTokenPreProcessor,
-    pub rpc_client: &'a EthereumRpcClient,
-    pub runtime: Option<&'a tokio::runtime::Handle>,
-    pub partial_blocks: bool,
-    pub family_runtime_registry: FamilyRuntimeRegistry<'static>,
-}
-
-#[cfg(test)]
-impl<'a> BuildExtractorsTestContext<'a> {
-    pub(crate) fn runtime_targets_build_context<'b>(
-        &'b self,
-    ) -> ResolvedRuntimeTargetsBuildContext<'b> {
-        ResolvedRuntimeTargetsBuildContext::new(
-            self.chain_state,
-            self.endpoint_url,
-            self.s3_bucket,
-            self.substreams_api_token,
-            self.cached_gw,
-            self.database_insert_batch_size,
-            self.token_pre_processor,
-            self.rpc_client,
-            self.runtime.cloned(),
-            false,
-            self.partial_blocks,
-            self.family_runtime_registry,
-        )
-    }
-}
-
-#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) async fn build_all_extractors_for_tests(
     config: &ExtractorConfigs,
-    context: BuildExtractorsTestContext<'_>,
+    context: ResolvedRuntimeTargetsBuildContext<'_>,
 ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
     config
-        .resolved_indexer_runtime_plan_with_registry(context.family_runtime_registry)?
-        .build_managed_runners(context.runtime_targets_build_context())
+        .resolved_indexer_runtime_plan()?
+        .build_managed_runners(context)
         .await
 }
 
@@ -1297,7 +1294,7 @@ pub(crate) async fn build_all_extractors_for_tests(
 #[allow(dead_code)]
 pub(crate) async fn build_all_extractors_from_config_path_with_registry_for_tests(
     config_path: &std::path::Path,
-    context: BuildExtractorsTestContext<'_>,
+    context: ResolvedRuntimeTargetsBuildContext<'_>,
 ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
     let loaded_runtime_plan = crate::config::LoadedIndexerRuntimePlan::from_yaml_with_registry(
         config_path
@@ -1307,7 +1304,7 @@ pub(crate) async fn build_all_extractors_from_config_path_with_registry_for_test
     )?;
     loaded_runtime_plan
         .resolved_runtime_plan()?
-        .build_managed_runners(context.runtime_targets_build_context())
+        .build_managed_runners(context)
         .await
 }
 
@@ -1329,7 +1326,7 @@ pub(crate) async fn build_all_extractors_from_config_path_with_default_family_re
 ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
     build_all_extractors_from_config_path_with_registry_for_tests(
         config_path,
-        BuildExtractorsTestContext {
+        ResolvedRuntimeTargetsBuildContext::new(
             chain_state,
             endpoint_url,
             s3_bucket,
@@ -1338,10 +1335,11 @@ pub(crate) async fn build_all_extractors_from_config_path_with_default_family_re
             database_insert_batch_size,
             token_pre_processor,
             rpc_client,
-            runtime,
+            runtime.cloned(),
+            false,
             partial_blocks,
-            family_runtime_registry: default_family_runtime_registry(),
-        },
+            default_family_runtime_registry(),
+        ),
     )
     .await
 }
@@ -1364,7 +1362,7 @@ pub(crate) async fn build_all_extractors_with_default_family_registry_for_tests(
 ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
     build_all_extractors_for_tests(
         config,
-        BuildExtractorsTestContext {
+        ResolvedRuntimeTargetsBuildContext::new(
             chain_state,
             endpoint_url,
             s3_bucket,
@@ -1373,10 +1371,11 @@ pub(crate) async fn build_all_extractors_with_default_family_registry_for_tests(
             database_insert_batch_size,
             token_pre_processor,
             rpc_client,
-            runtime,
+            runtime.cloned(),
+            false,
             partial_blocks,
-            family_runtime_registry: default_family_runtime_registry(),
-        },
+            default_family_runtime_registry(),
+        ),
     )
     .await
 }
@@ -1419,6 +1418,40 @@ pub fn swap_extractor_config_for_tests(
 }
 
 #[cfg(test)]
+pub fn uniswap_family_swap_extractors_for_tests(
+    chain: Chain,
+    start_block: i64,
+    shared_spkg: impl Into<String>,
+    v2_member_spkg: impl Into<String>,
+    v3_member_spkg: impl Into<String>,
+) -> HashMap<String, crate::extractor::extractor_config::ExtractorConfig> {
+    let shared_spkg = shared_spkg.into();
+    let member_spkgs = [v2_member_spkg.into(), v3_member_spkg.into()];
+    let member_specs = uniswap_family_test_members("uniswap_v2", "uniswap_v3");
+
+    member_specs
+        .into_iter()
+        .zip(member_spkgs)
+        .map(|(member, spkg)| {
+            (
+                member.protocol_system.to_string(),
+                swap_extractor_config_for_tests(
+                    member.extractor_name,
+                    member.protocol_system,
+                    chain,
+                    ImplementationType::Custom,
+                    start_block,
+                    member.protocol_type_name,
+                    spkg,
+                    member.module_name,
+                    Some(family_runtime_config_for_tests("uniswap", shared_spkg.clone())),
+                ),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct RecordSubstreamsFixtureMemberSpec<'a> {
     protocol_system: &'a str,
@@ -1437,6 +1470,32 @@ struct RecordSubstreamsFixtureFamilySpec<'a> {
     family_name: &'a str,
     shared_bootstrap_body: &'a str,
     members: &'a [RecordSubstreamsFixtureMemberSpec<'a>],
+}
+
+#[cfg(test)]
+fn uniswap_record_substreams_fixture_members<'a>(
+    v2_substreams_body: &'a str,
+    v3_substreams_body: &'a str,
+) -> [RecordSubstreamsFixtureMemberSpec<'a>; 2] {
+    let member_specs = uniswap_family_test_members("uniswap_v2", "uniswap_v3");
+    [
+        RecordSubstreamsFixtureMemberSpec {
+            protocol_system: member_specs[0].protocol_system,
+            protocol_type_name: member_specs[0].protocol_type_name,
+            module_name: member_specs[0].module_name,
+            substreams_module_name: member_specs[0].substreams_module_name,
+            substreams_file_name: "uniswap_v2_substreams.yaml",
+            substreams_body: v2_substreams_body,
+        },
+        RecordSubstreamsFixtureMemberSpec {
+            protocol_system: member_specs[1].protocol_system,
+            protocol_type_name: member_specs[1].protocol_type_name,
+            module_name: member_specs[1].module_name,
+            substreams_module_name: member_specs[1].substreams_module_name,
+            substreams_file_name: "uniswap_v3_substreams.yaml",
+            substreams_body: v3_substreams_body,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -1537,34 +1596,20 @@ fn write_record_substreams_combined_family_fixture_inputs(
 pub fn write_record_substreams_family_fixture_inputs(
     shared_spkg_path: &std::path::Path,
 ) -> std::path::PathBuf {
-    const MEMBERS: &[RecordSubstreamsFixtureMemberSpec<'_>] = &[
-        RecordSubstreamsFixtureMemberSpec {
-            protocol_system: "uniswap_v2",
-            protocol_type_name: "uniswap_v2_pool",
-            module_name: "v2_map_pool_events",
-            substreams_module_name: "v2_map_pool_events",
-            substreams_file_name: "uniswap_v2_substreams.yaml",
-            substreams_body: r#"includes:
+    let members = uniswap_record_substreams_fixture_members(
+        r#"includes:
   - "shared_bootstrap.yaml"
 params:
   pools:
     - "0x1111111111111111111111111111111111111111"
 "#,
-        },
-        RecordSubstreamsFixtureMemberSpec {
-            protocol_system: "uniswap_v3",
-            protocol_type_name: "uniswap_v3_pool",
-            module_name: "v3_map_protocol_changes",
-            substreams_module_name: "v3_map_events",
-            substreams_file_name: "uniswap_v3_substreams.yaml",
-            substreams_body: r#"includes:
+        r#"includes:
   - "shared_bootstrap.yaml"
 params:
   pools:
     - "0x2222222222222222222222222222222222222222"
 "#,
-        },
-    ];
+    );
     write_record_substreams_combined_family_fixture_inputs(
         shared_spkg_path,
         RecordSubstreamsFixtureFamilySpec {
@@ -1577,7 +1622,7 @@ params:
     - "0x1111111111111111111111111111111111111111"
     - "0x2222222222222222222222222222222222222222"
 "#,
-            members: MEMBERS,
+            members: &members,
         },
         default_family_runtime_registry(),
     )
@@ -1694,33 +1739,32 @@ fn future_family_branch_materializer<'a>(
 }
 
 #[cfg(test)]
-const FUTURE_FAMILY_RUNTIME_SPEC: FamilyRuntimeSpec = shared_family_runtime_spec(
-    "future_swap",
-    &[
-        shared_family_member_spec(
-            "future_v1",
-            &["futurev1"],
-            Some(shared_bootstrap_member_runtime(
-                BootstrapStrategy::UniswapV2Rpc,
-                SharedBootstrapParamsParser::PoolList,
-                future_family_branch_materializer,
-            )),
-        ),
-        shared_family_member_spec(
-            "future_v2",
-            &["futurev2"],
-            Some(shared_bootstrap_member_runtime(
-                BootstrapStrategy::UniswapV2Rpc,
-                SharedBootstrapParamsParser::PoolList,
-                future_family_branch_materializer,
-            )),
-        ),
-    ],
-    "map_future_swap_family_protocol_changes",
-    "future_swap_family",
-    "family::future_swap",
-    None,
-);
+const FUTURE_FAMILY_RUNTIME_SPEC: FamilyRuntimeSpec =
+    canonical_shared_family_runtime_spec_with_explicit_owner!(
+        "future_swap",
+        &[
+            shared_family_member_spec(
+                "future_v1",
+                &["futurev1"],
+                Some(shared_bootstrap_member_runtime(
+                    BootstrapStrategy::UniswapV2Rpc,
+                    SharedBootstrapParamsParser::PoolList,
+                    future_family_branch_materializer,
+                )),
+            ),
+            shared_family_member_spec(
+                "future_v2",
+                &["futurev2"],
+                Some(shared_bootstrap_member_runtime(
+                    BootstrapStrategy::UniswapV2Rpc,
+                    SharedBootstrapParamsParser::PoolList,
+                    future_family_branch_materializer,
+                )),
+            ),
+        ],
+        None,
+        "future_v1",
+    );
 
 #[cfg(test)]
 pub fn future_family_runtime_registry_for_record_substreams_tests() -> FamilyRuntimeRegistry<'static>
@@ -1757,14 +1801,14 @@ pub fn future_family_runtime_registry_for_record_substreams_tests_with_durabilit
             )),
         ),
     ]));
-    let specs: &'static [FamilyRuntimeSpec] = Box::leak(Box::new([shared_family_runtime_spec(
-        "future_swap",
-        members,
-        "map_future_swap_family_protocol_changes",
-        "future_swap_family",
-        leaked_scope,
-        None,
-    )]));
+    let specs: &'static [FamilyRuntimeSpec] =
+        Box::leak(Box::new([canonical_shared_family_runtime_spec_with_explicit_owner!(
+            "future_swap",
+            members,
+            None,
+            "future_v1",
+            durability_scope: leaked_scope,
+        )]));
 
     FamilyRuntimeRegistry::new(specs)
 }
@@ -2056,9 +2100,10 @@ pub fn shared_bootstrap_seed_universe_spec_from_runtime_target_for_tests(
                     || bootstrap_params.contains("includes:")
                 {
                     Some(
-                        crate::extractor::shared_config::parse_substreams_params_yaml(
+                        crate::extractor::shared_config::parse_substreams_params_yaml_with_registry(
                             &protocol_system,
                             &bootstrap_params,
+                            crate::extractor::family_registry::default_family_runtime_registry(),
                         )
                         .unwrap_or_else(|err| {
                             panic!(

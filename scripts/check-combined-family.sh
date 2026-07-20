@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/combined-family-common.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
   scripts/check-combined-family.sh doctor [--strict]
-  scripts/check-combined-family.sh command [acceptance|repo|live|live-managed|full|full-managed|all]
+  scripts/check-combined-family.sh command [acceptance|acceptance-managed|repo|live|live-managed|full|full-managed|all]
   scripts/check-combined-family.sh run-acceptance
+  scripts/check-combined-family.sh run-acceptance-managed
   scripts/check-combined-family.sh run-repo
   scripts/check-combined-family.sh run-live
   scripts/check-combined-family.sh run-live-managed
@@ -20,24 +24,26 @@ Modes:
   command   Print the exact command for the selected validation mode.
             `acceptance` runs the repo-local extensibility contract gate, the repo-local Fynd
             replay contract gate, and the DB-backed shared-runtime acceptance gate.
+            `acceptance-managed` runs `acceptance` first, then `live-managed`.
             `repo` runs the repo-local DB-backed regression gate.
             `live` runs the live combined-family Fynd E2E gate.
             `live-managed` starts the combined-family indexer, waits for health, then runs the
             live Fynd E2E gate.
             `full` runs `acceptance` first, then `live`.
-            `full-managed` runs `acceptance` first, then `live-managed`.
+            `full-managed` is a compatibility alias for `acceptance-managed`.
             `all` runs `repo` first, then `live`.
   run-acceptance Execute the repo-local extensibility contract gate, the repo-local Fynd replay
                  contract gate, then the DB-backed shared-runtime acceptance gate.
+  run-acceptance-managed Execute the repo-local extensibility contract gate, the repo-local Fynd replay
+                         contract gate, then the DB-backed shared-runtime acceptance gate, then the
+                         managed live Fynd E2E gate.
   run-repo  Execute the repo-local DB-backed regression gate.
   run-live  Execute the live combined-family Fynd E2E gate.
   run-live-managed Start the combined-family indexer, then execute the live Fynd E2E gate.
   run-full  Execute the repo-local extensibility contract gate, the repo-local Fynd replay
             contract gate, then the DB-backed shared-runtime acceptance gate, then the live
             Fynd E2E gate.
-  run-full-managed Execute the repo-local extensibility contract gate, the repo-local Fynd replay
-                   contract gate, then the DB-backed shared-runtime acceptance gate, then the
-                   managed live Fynd E2E gate.
+  run-full-managed Compatibility alias for `run-acceptance-managed`.
   run-all   Execute the repo-local DB gate, then the live Fynd E2E gate.
 
 Environment:
@@ -79,22 +85,12 @@ Environment:
                          Forwarded to `check-combined-family-fynd-live-e2e.sh`
   TYCHO_COMBINED_FAMILY_MANAGED_HEALTH_TIMEOUT_SECS
                          Default: FYND_E2E_HEALTH_TIMEOUT_SECS or 300
-                         Used by `run-live-managed` and `run-full-managed`
+                         Used by `run-live-managed`, `run-acceptance-managed`, and `run-full-managed`
   TYCHO_COMBINED_FAMILY_MANAGED_INDEXER_LOG
                          Optional fixed log file for the managed indexer process
 EOF
 }
 
-shell_escape() {
-  local arg="$1"
-  if [[ "${arg}" =~ ^[A-Za-z0-9_./:+=,-]+$ ]]; then
-    printf '%s' "${arg}"
-    return
-  fi
-  printf "'%s'" "${arg//\'/\'\"\'\"\'}"
-}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-db.sh"
 EXTENSIBILITY_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-extensibility.sh"
 FYND_REPLAY_GATE_SCRIPT="${SCRIPT_DIR}/check-combined-family-fynd-replay.sh"
@@ -300,7 +296,16 @@ doctor() {
   local live_fynd_test_exists
   local live_test_mapping_ready
   local live_curl_available
+  local extensibility_test_manifest
+  local extensibility_test_count
+  local fynd_replay_test_manifest
+  local fynd_replay_test_count
+  local repo_test_manifest
+  local repo_test_count
+  local live_test_manifest
+  local live_test_count
   local managed_live_ready
+  local acceptance_managed_ready
   local managed_full_ready
   local ready="true"
 
@@ -318,6 +323,14 @@ doctor() {
   live_fynd_test_exists="$(field_from_output "${live_output}" "fynd_test_exists")"
   live_test_mapping_ready="$(field_from_output "${live_output}" "live_test_mapping_ready")"
   live_curl_available="$(field_from_output "${live_output}" "curl_available")"
+  extensibility_test_manifest="$(field_from_output "${extensibility_output}" "test_manifest")"
+  extensibility_test_count="$(field_from_output "${extensibility_output}" "test_count")"
+  fynd_replay_test_manifest="$(field_from_output "${fynd_replay_output}" "test_manifest")"
+  fynd_replay_test_count="$(field_from_output "${fynd_replay_output}" "test_count")"
+  repo_test_manifest="$(field_from_output "${repo_output}" "test_manifest")"
+  repo_test_count="$(field_from_output "${repo_output}" "test_count")"
+  live_test_manifest="$(field_from_output "${live_output}" "test_manifest")"
+  live_test_count="$(field_from_output "${live_output}" "test_count")"
 
   if [[ "${extensibility_ready}" != "true" || "${fynd_replay_ready}" != "true" || "${repo_ready}" != "true" || "${live_ready}" != "true" ]]; then
     ready="false"
@@ -332,8 +345,13 @@ doctor() {
     managed_live_ready="true"
   fi
 
-  managed_full_ready="false"
+  acceptance_managed_ready="false"
   if [[ "${extensibility_ready}" == "true" && "${fynd_replay_ready}" == "true" && "${repo_ready}" == "true" && "${managed_live_ready}" == "true" ]]; then
+    acceptance_managed_ready="true"
+  fi
+
+  managed_full_ready="false"
+  if [[ "${acceptance_managed_ready}" == "true" ]]; then
     managed_full_ready="true"
   fi
 
@@ -347,21 +365,30 @@ repo_ready=${repo_ready}
 live_ready=${live_ready}
 operator_ready=${operator_ready}
 managed_live_ready=${managed_live_ready}
+acceptance_managed_ready=${acceptance_managed_ready}
 managed_full_ready=${managed_full_ready}
 live_fynd_repo_exists=${live_fynd_repo_exists}
 live_fynd_test_exists=${live_fynd_test_exists}
 live_test_mapping_ready=${live_test_mapping_ready}
 live_curl_available=${live_curl_available}
+extensibility_test_manifest=${extensibility_test_manifest}
+extensibility_test_count=${extensibility_test_count}
+fynd_replay_test_manifest=${fynd_replay_test_manifest}
+fynd_replay_test_count=${fynd_replay_test_count}
+repo_test_manifest=${repo_test_manifest}
+repo_test_count=${repo_test_count}
+live_test_manifest=${live_test_manifest}
+live_test_count=${live_test_count}
 extensibility_gate_script=${EXTENSIBILITY_GATE_SCRIPT}
 fynd_replay_gate_script=${FYND_REPLAY_GATE_SCRIPT}
 db_gate_script=${DB_GATE_SCRIPT}
 live_gate_script=${LIVE_GATE_SCRIPT}
 indexer_run_script=${INDEXER_RUN_SCRIPT}
-extensibility_doctor_command=$(printf '%s doctor' "$(shell_escape "${EXTENSIBILITY_GATE_SCRIPT}")")
-fynd_replay_doctor_command=$(printf '%s doctor' "$(shell_escape "${FYND_REPLAY_GATE_SCRIPT}")")
-repo_doctor_command=$(printf '%s doctor' "$(shell_escape "${DB_GATE_SCRIPT}")")
-live_doctor_command=$(printf '%s doctor' "$(shell_escape "${LIVE_GATE_SCRIPT}")")
-operator_doctor_command=$(printf '%s doctor' "$(shell_escape "${INDEXER_RUN_SCRIPT}")")
+extensibility_doctor_command=$(printf '%s doctor' "$(tycho_combined_family_shell_escape "${EXTENSIBILITY_GATE_SCRIPT}")")
+fynd_replay_doctor_command=$(printf '%s doctor' "$(tycho_combined_family_shell_escape "${FYND_REPLAY_GATE_SCRIPT}")")
+repo_doctor_command=$(printf '%s doctor' "$(tycho_combined_family_shell_escape "${DB_GATE_SCRIPT}")")
+live_doctor_command=$(printf '%s doctor' "$(tycho_combined_family_shell_escape "${LIVE_GATE_SCRIPT}")")
+operator_doctor_command=$(printf '%s doctor' "$(tycho_combined_family_shell_escape "${INDEXER_RUN_SCRIPT}")")
 acceptance_run_command=$(
   {
     "${EXTENSIBILITY_GATE_SCRIPT}" command
@@ -371,7 +398,8 @@ acceptance_run_command=$(
 )
 repo_run_command=$("${DB_GATE_SCRIPT}" command | flatten_output)
 live_run_command=$("${LIVE_GATE_SCRIPT}" command "${LIVE_SELECTION}" | flatten_output)
-managed_live_run_command=$(printf '%s run-live-managed' "$(shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
+managed_live_run_command=$(printf '%s run-live-managed' "$(tycho_combined_family_shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
+acceptance_managed_run_command=$(printf '%s run-acceptance-managed' "$(tycho_combined_family_shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
 operator_run_command=$("${INDEXER_RUN_SCRIPT}" command | flatten_output)
 full_run_command=$(
   {
@@ -381,7 +409,7 @@ full_run_command=$(
     "${LIVE_GATE_SCRIPT}" command "${LIVE_SELECTION}"
   } | flatten_output
 )
-managed_full_run_command=$(printf '%s run-full-managed' "$(shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
+managed_full_run_command=$(printf '%s run-full-managed' "$(tycho_combined_family_shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
 EOF
 
   if [[ "${strict}" == "true" && "${ready}" != "true" ]]; then
@@ -400,6 +428,11 @@ $("${FYND_REPLAY_GATE_SCRIPT}" command)
 $("${DB_GATE_SCRIPT}" command)
 EOF
       ;;
+    acceptance-managed)
+      cat <<EOF
+$(printf '%s run-acceptance-managed' "$(tycho_combined_family_shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
+EOF
+      ;;
     repo)
       "${DB_GATE_SCRIPT}" command
       ;;
@@ -408,7 +441,7 @@ EOF
       ;;
     live-managed)
       cat <<EOF
-$(printf '%s run-live-managed' "$(shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
+$(printf '%s run-live-managed' "$(tycho_combined_family_shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
 EOF
       ;;
     full)
@@ -421,7 +454,7 @@ EOF
       ;;
     full-managed)
       cat <<EOF
-$(printf '%s run-full-managed' "$(shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
+$(printf '%s run-full-managed' "$(tycho_combined_family_shell_escape "${SCRIPT_DIR}/check-combined-family.sh")")
 EOF
       ;;
     all)
@@ -471,6 +504,11 @@ run_full_managed() {
   run_live_managed
 }
 
+run_acceptance_managed() {
+  run_acceptance
+  run_live_managed
+}
+
 run_all() {
   run_repo
   run_live
@@ -486,6 +524,9 @@ case "${mode}" in
   run-acceptance)
     run_acceptance
     ;;
+  run-acceptance-managed)
+    run_acceptance_managed
+    ;;
   run-repo)
     run_repo
     ;;
@@ -499,7 +540,7 @@ case "${mode}" in
     run_full
     ;;
   run-full-managed)
-    run_full_managed
+    run_acceptance_managed
     ;;
   run-all)
     run_all

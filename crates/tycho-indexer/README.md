@@ -93,7 +93,9 @@ Tycho utilises several special attributes to support specific functionality. Som
 
 The indexer services can be run using any of the following commands:
 
-- `index` : Run the indexer service for every extractor set in `./extractors.yaml`
+- `index` : Run the indexer service for the configured extractor entrypoint.
+  The binary default is `./crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml`, and
+  `--extractors-config` can still be used to point at a different config explicitly.
 - `run` : Run the indexer service for a single extractor
 - `analyze-tokens` : Run the token analyzer cronjob
 - `rpc` : Run only the http RPC server

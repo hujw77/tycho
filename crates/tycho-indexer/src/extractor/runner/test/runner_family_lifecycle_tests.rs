@@ -1,9 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::*;
-use crate::extractor::managed_stream_startup::build_substreams_stream_from_prepared_request;
 use crate::extractor::managed_substreams_request::{
-    prepare_substreams_request_for_runtime_target, FamilyPreparedRequestContext,
+    prepare_substreams_request_for_runtime_target,
     PreparedSubstreamsRequest,
 };
 use crate::extractor::runtime_target_planning::ResolvedRuntimeTarget;
@@ -774,7 +773,10 @@ async fn test_run_family_bootstrap_if_needed_rejects_mixed_progress_before_boots
 fn fail_if_shared_bootstrap_materialized<'a>(
     _rpc_client: &'a EthereumRpcClient,
     _plan: &'a SharedBootstrapPlan,
-    _branches: &'a [ResolvedSharedBootstrapBranchRuntime],
+    _branch_materializers: &'a std::collections::HashMap<
+        String,
+        crate::extractor::family_bootstrap_registry::MaterializeBootstrapBranchFn,
+    >,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -825,7 +827,9 @@ async fn test_run_family_bootstrap_if_needed_skips_materialization_when_shared_c
     let mut resolved_family =
         resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
     resolved_family
-        .shared_bootstrap_execution_mut()
+        .shared_bootstrap_runtime_mut()
+        .expect("family bootstrap runtime should be present")
+        .execution
         .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
@@ -875,7 +879,9 @@ async fn test_run_family_bootstrap_if_needed_rejects_misaligned_completed_bootst
     let mut resolved_family =
         resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
     resolved_family
-        .shared_bootstrap_execution_mut()
+        .shared_bootstrap_runtime_mut()
+        .expect("family bootstrap runtime should be present")
+        .execution
         .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
@@ -934,7 +940,9 @@ async fn test_run_family_bootstrap_if_needed_rejects_legacy_fallback_bootstrap_s
     let mut resolved_family =
         resolved_family_runtime_from_configs_for_tests(&config_refs, "/tmp/test-family.spkg");
     resolved_family
-        .shared_bootstrap_execution_mut()
+        .shared_bootstrap_runtime_mut()
+        .expect("family bootstrap runtime should be present")
+        .execution
         .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
@@ -953,30 +961,30 @@ async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_af
 ) {
     let mut v2 = MockExtractor::new();
     v2.expect_get_last_processed_block()
-        .times(2)
+        .times(1)
         .returning(|| None);
     v2.expect_supports_persisted_state_scope()
-        .times(2)
+        .times(1)
         .return_const(false);
     v2.expect_get_cursor()
-        .times(2)
+        .times(1)
         .returning(String::new);
     v2.expect_get_completed_bootstrap_block()
-        .times(2)
+        .times(1)
         .returning(|| Ok(Some(42)));
 
     let mut v3 = MockExtractor::new();
     v3.expect_get_last_processed_block()
-        .times(2)
+        .times(1)
         .returning(|| None);
     v3.expect_supports_persisted_state_scope()
-        .times(2)
+        .times(1)
         .return_const(false);
     v3.expect_get_cursor()
-        .times(2)
+        .times(1)
         .returning(String::new);
     v3.expect_get_completed_bootstrap_block()
-        .times(2)
+        .times(1)
         .returning(|| Ok(Some(42)));
 
     let extractors: HashMap<String, Arc<dyn Extractor>> = HashMap::from([
@@ -989,25 +997,19 @@ async fn test_prepare_family_substreams_request_uses_bootstrap_adjusted_start_af
         resolved_family_runtime_from_configs_for_tests(&config_refs, "test-shared.spkg");
     let rpc_client =
         EthereumRpcClient::new("http://localhost:0000").expect("build stub rpc client");
-    let bootstrap_commit_wiring =
-        crate::extractor::family_runner_wiring::FamilyBootstrapCommitWiring::from_runtime_contract(
-            &resolved_family.runtime_contract(),
-            &extractors,
-        )
-        .expect("resolved family bootstrap commit wiring");
+    let request_context = resolved_family
+        .prepared_request_context(&extractors)
+        .expect("resolved family prepared request context");
 
     let prepared_request = prepare_substreams_request_for_runtime_target(
         &resolved_family,
-        &FamilyPreparedRequestContext {
-            extractors: extractors.clone(),
-            bootstrap_commit_wiring,
-        },
+        &request_context,
         &rpc_client,
     )
     .await
     .expect("completed shared bootstrap should shape request without rerunning bootstrap");
 
-    assert_eq!(prepared_request.request.spkg, resolved_family.family.shared_spkg());
+    assert_eq!(prepared_request.request.spkg, resolved_family.shared_spkg());
     assert_eq!(prepared_request.request.module, family_output_module_for_tests("uniswap"));
     assert_eq!(prepared_request.request.start_block, 43);
     assert_eq!(prepared_request.cursor, None);
@@ -1057,7 +1059,9 @@ async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
     let mut resolved_family =
         resolved_family_runtime_from_configs_for_tests(&config_refs, "test-family.spkg");
     resolved_family
-        .shared_bootstrap_execution_mut()
+        .shared_bootstrap_runtime_mut()
+        .expect("family bootstrap runtime should be present")
+        .execution
         .plan_materializer = fail_if_shared_bootstrap_materialized;
 
     let rpc_client =
@@ -1083,8 +1087,8 @@ async fn test_family_stream_request_starts_after_completed_shared_bootstrap() {
                 .expect("mock substreams endpoint builds"),
         ),
     };
-    let mut stream = build_substreams_stream_from_prepared_request(
-        &PreparedSubstreamsRequest { request, cursor: stream_position.cursor },
+    let mut stream = PreparedSubstreamsRequest { request, cursor: stream_position.cursor }
+        .build_stream(
         loaded_substreams,
         false,
         false,

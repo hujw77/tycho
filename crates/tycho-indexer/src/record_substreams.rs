@@ -4,9 +4,10 @@ use tracing::info;
 use tycho_indexer::{
     cli::{GlobalArgs, RecordSubstreamsArgs},
     extractor::{
-        family_registry::{default_family_runtime_registry, FamilyRuntimeRegistry},
+        family_registry::FamilyRuntimeRegistry,
         runtime_target_planning::{
-            ResolvedRuntimeTargetSelector, ResolvedSubstreamsExecutionRequest,
+            ResolvedRuntimeTargetSelector, ResolvedRuntimeTargets,
+            ResolvedSubstreamsExecutionRequest,
         },
         substreams_package_loader::load_substreams_package,
         ExtractionError,
@@ -65,17 +66,10 @@ pub(crate) fn render_record_substreams_request_json(
 }
 
 fn resolve_loaded_record_substreams_request(
+    runtime_targets: &ResolvedRuntimeTargets<'_>,
     extractors_config_path: &str,
     record_args: &RecordSubstreamsArgs,
     override_params: &HashMap<String, String>,
-    resolve_request: impl FnOnce(
-        Option<ResolvedRuntimeTargetSelector<'_>>,
-        &str,
-        &str,
-        Option<i64>,
-        Option<i64>,
-        &HashMap<String, String>,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError>,
 ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
     let selector = match (record_args.family.as_deref(), record_args.protocol_system.as_deref()) {
         (None, None) => None,
@@ -84,45 +78,22 @@ fn resolve_loaded_record_substreams_request(
     let unique_context = format!(
         "record-substreams derived mode requires exactly one of `--family` or `--protocol-system` unless `{extractors_config_path}` resolves exactly one runtime target"
     );
-    let mut resolved = resolve_request(
+    let selected_target = runtime_targets.resolve_target(
+        selector,
+        &unique_context,
+        extractors_config_path,
+    )?;
+    let effective_start_block = selected_target.effective_substreams_start_block(
+        record_args.start_block,
+    )?;
+    runtime_targets.resolve_substreams_execution_request(
         selector,
         &unique_context,
         extractors_config_path,
         record_args.start_block,
-        None,
+        record_args.stop_block(effective_start_block),
         override_params,
-    )?;
-    if let Some(stop_block) = record_args.stop_block(resolved.start_block) {
-        resolved.stop_block = stop_block as u64;
-    }
-    Ok(resolved)
-}
-
-pub(crate) fn resolve_record_substreams_request(
-    record_args: &RecordSubstreamsArgs,
-) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-    let override_params = parse_substreams_params(&record_args.params)?;
-
-    if let Some(extractors_config_path) = &record_args.extractors_config {
-        let loaded_runtime_plan = LoadedIndexerRuntimePlan::from_yaml(extractors_config_path)?;
-        return resolve_loaded_record_substreams_request(
-            extractors_config_path,
-            record_args,
-            &override_params,
-            |selector, unique_context, selector_context, start_block, stop_block, params| {
-                loaded_runtime_plan.resolve_substreams_execution_request(
-                    selector,
-                    unique_context,
-                    selector_context,
-                    start_block,
-                    stop_block,
-                    params,
-                )
-            },
-        );
-    }
-
-    resolve_record_substreams_request_with_registry(record_args, default_family_runtime_registry())
+    )
 }
 
 pub(crate) fn resolve_record_substreams_request_with_registry(
@@ -134,20 +105,12 @@ pub(crate) fn resolve_record_substreams_request_with_registry(
     if let Some(extractors_config_path) = &record_args.extractors_config {
         let loaded_runtime_plan =
             LoadedIndexerRuntimePlan::from_yaml_with_registry(extractors_config_path, registry)?;
+        let runtime_targets = loaded_runtime_plan.resolved_runtime_targets()?;
         return resolve_loaded_record_substreams_request(
+            &runtime_targets,
             extractors_config_path,
             record_args,
             &override_params,
-            |selector, unique_context, selector_context, start_block, stop_block, params| {
-                loaded_runtime_plan.resolve_substreams_execution_request(
-                    selector,
-                    unique_context,
-                    selector_context,
-                    start_block,
-                    stop_block,
-                    params,
-                )
-            },
         );
     }
 
@@ -252,38 +215,6 @@ where
     Ok(())
 }
 
-pub(crate) async fn record_substreams_fixture(
-    global_args: &GlobalArgs,
-    record_args: &RecordSubstreamsArgs,
-) -> Result<(), ExtractionError> {
-    let resolved_request = resolve_record_substreams_request(record_args)?;
-    if record_args.print_request {
-        println!("{}", render_record_substreams_request_json(&resolved_request)?);
-        return Ok(());
-    }
-
-    let loaded = load_substreams_package(
-        global_args.s3_bucket.as_deref(),
-        &resolved_request.spkg,
-        &global_args.endpoint_url,
-        Some(
-            record_args
-                .substreams_args
-                .substreams_api_token
-                .clone(),
-        ),
-    )
-    .await?;
-
-    record_substreams_fixture_from_package_and_recorder(
-        loaded.spkg,
-        loaded.endpoint,
-        resolved_request,
-        record_args,
-    )
-    .await
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn record_substreams_fixture_with_registry(
     global_args: &GlobalArgs,
@@ -316,4 +247,135 @@ pub(crate) async fn record_substreams_fixture_with_registry(
         record_args,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tycho_indexer::{
+        cli::{Cli, Command, RecordSubstreamsArgs},
+        extractor::{
+            family_runtime::resolve_runtime_targets_with_registry,
+            family_registry::default_family_runtime_registry,
+        },
+    };
+    use clap::Parser;
+    use tycho_common::models::{Chain, FinancialType, ImplementationType};
+
+    use super::*;
+
+    fn record_args_with_config() -> RecordSubstreamsArgs {
+        let cli = Cli::try_parse_from([
+            "tycho-indexer",
+            "--database-url",
+            "postgres://postgres:mypassword@localhost:5431/tycho_indexer_0",
+            "--endpoint",
+            "http://localhost:9000",
+            "--rpc-url",
+            "http://localhost:8545",
+            "record-substreams",
+            "--substreams-api-token",
+            "token",
+            "--extractors-config",
+            "/tmp/extractors.yaml",
+            "--output",
+            "/tmp/out.json",
+        ])
+        .expect("parse record-substreams test args");
+        match cli.command() {
+            Command::RecordSubstreams(args) => args,
+            other => panic!("expected record-substreams command, got {other:?}"),
+        }
+    }
+
+    fn make_config(name: &str, spkg: &str) -> tycho_indexer::extractor::extractor_config::ExtractorConfig {
+        tycho_indexer::extractor::extractor_config::ExtractorConfig::new(
+            name.to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            42,
+            None,
+            vec![tycho_indexer::extractor::extractor_config::ProtocolTypeConfig::new(
+                format!("{name}_pool"),
+                FinancialType::Swap,
+            )],
+            spkg.to_string(),
+            "map_protocol_changes".to_string(),
+            vec![],
+            0,
+            None,
+            None,
+            HashMap::new(),
+            None,
+        )
+    }
+
+    fn with_resolved_uniswap_family_runtime(
+        config: tycho_indexer::extractor::extractor_config::ExtractorConfig,
+        shared_spkg: &str,
+    ) -> tycho_indexer::extractor::extractor_config::ExtractorConfig {
+        let shared_stream = default_family_runtime_registry()
+            .resolved_shared_stream_for_family(Chain::Ethereum, "uniswap", shared_spkg)
+            .expect("registered uniswap shared stream");
+        config.with_family_runtime(Some(
+            tycho_indexer::extractor::family_runtime_metadata::FamilyRuntimeConfig::from_resolved_shared_stream(
+                "uniswap",
+                shared_stream,
+            ),
+        ))
+    }
+
+    #[test]
+    fn record_substreams_rejects_protocol_system_selector_for_family_member() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    )
+                    .with_protocol_system("uniswap_v2"),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    )
+                    .with_protocol_system("uniswap_v3"),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+        ]);
+        let runtime_targets = resolve_runtime_targets_with_registry(
+            &extractors,
+            default_family_runtime_registry(),
+        )
+        .expect("resolved runtime targets");
+        let mut record_args = record_args_with_config();
+        record_args.protocol_system = Some("uniswap_v2".to_string());
+
+        let err = resolve_loaded_record_substreams_request(
+            &runtime_targets,
+            "/tmp/extractors.yaml",
+            &record_args,
+            &HashMap::new(),
+        )
+        .expect_err("family member protocol system should be rejected");
+
+        assert!(
+            err.to_string().contains("belongs to shared family runtime `uniswap`"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("use the family selector"),
+            "unexpected error: {err}"
+        );
+    }
 }

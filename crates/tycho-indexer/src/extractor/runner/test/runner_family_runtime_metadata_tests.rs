@@ -1,6 +1,13 @@
 use super::*;
 use crate::extractor::family_registry::default_family_runtime_registry;
 
+fn resolved_uniswap_family_runtime_config(shared_spkg: &str) -> FamilyRuntimeConfig {
+    FamilyRuntimeConfig::from_resolved_shared_stream(
+        "uniswap",
+        uniswap_shared_stream_for_tests(shared_spkg),
+    )
+}
+
 #[test]
 fn family_runtime_config_exposes_explicit_durability_scope_only() {
     let runtime = FamilyRuntimeConfig {
@@ -45,12 +52,9 @@ fn extractor_config_exposes_resolved_family_runtime_metadata() {
 
 #[test]
 fn extractor_config_rejects_unresolved_family_durability_scope_for_runtime_build() {
-    let config = ExtractorConfig::default().with_family_runtime(Some(FamilyRuntimeConfig {
-        family: "uniswap".to_string(),
-        shared_spkg: Some("/tmp/family-runtime.spkg".to_string()),
-        shared_module: Some(uniswap_shared_stream_for_tests("/tmp/family-runtime.spkg").module),
-        durability_scope: None,
-    }));
+    let mut runtime = resolved_uniswap_family_runtime_config("/tmp/family-runtime.spkg");
+    runtime.durability_scope = None;
+    let config = ExtractorConfig::default().with_family_runtime(Some(runtime));
 
     let err = config
         .require_resolved_family_runtime_metadata()
@@ -80,11 +84,11 @@ fn extractor_config_exposes_resolved_family_shared_spkg() {
         HashMap::new(),
         None,
     )
-    .with_family_runtime(Some(FamilyRuntimeConfig {
-        family: "uniswap".to_string(),
-        shared_spkg: Some("/tmp/family-runtime.spkg".to_string()),
-        shared_module: None,
-        durability_scope: None,
+    .with_family_runtime(Some({
+        let mut runtime = resolved_uniswap_family_runtime_config("/tmp/family-runtime.spkg");
+        runtime.shared_module = None;
+        runtime.durability_scope = None;
+        runtime
     }));
 
     let target = config
@@ -114,11 +118,11 @@ fn extractor_config_exposes_resolved_family_shared_module() {
         HashMap::new(),
         None,
     )
-    .with_family_runtime(Some(FamilyRuntimeConfig {
-        family: "uniswap".to_string(),
-        shared_spkg: None,
-        shared_module: Some(uniswap_shared_stream_for_tests("/tmp/family-runtime.spkg").module),
-        durability_scope: None,
+    .with_family_runtime(Some({
+        let mut runtime = resolved_uniswap_family_runtime_config("/tmp/family-runtime.spkg");
+        runtime.shared_spkg = None;
+        runtime.durability_scope = None;
+        runtime
     }));
 
     let err = config
@@ -149,20 +153,13 @@ fn extractor_config_accepts_resolved_family_shared_stream_target_for_runtime_bui
         HashMap::new(),
         None,
     )
-    .with_family_runtime(Some(FamilyRuntimeConfig {
-        family: "uniswap".to_string(),
-        shared_spkg: Some("/tmp/family-runtime.spkg".to_string()),
-        shared_module: Some(expected_shared_stream.module.clone()),
-        durability_scope: Some(
-            expected_shared_stream
-                .durability_scope
-                .clone(),
-        ),
-    }));
+    .with_family_runtime(Some(resolved_uniswap_family_runtime_config(
+        "/tmp/family-runtime.spkg",
+    )));
 
     let target = config
-        .require_resolved_family_runtime_metadata()
-        .expect("resolved family target should be accepted")
+        .resolve_family_runtime_metadata(Some(default_family_runtime_registry()))
+        .expect("registry-backed resolved family target should be accepted")
         .expect("family runtime target should be present");
     assert_eq!(target.family, "uniswap");
     assert_eq!(target.shared_stream.spkg, "/tmp/family-runtime.spkg");
@@ -190,11 +187,11 @@ fn extractor_config_resolves_missing_family_runtime_fields_from_registry() {
         HashMap::new(),
         None,
     )
-    .with_family_runtime(Some(FamilyRuntimeConfig {
-        family: "uniswap".to_string(),
-        shared_spkg: Some("/tmp/family-runtime.spkg".to_string()),
-        shared_module: None,
-        durability_scope: None,
+    .with_family_runtime(Some({
+        let mut runtime = resolved_uniswap_family_runtime_config("/tmp/family-runtime.spkg");
+        runtime.shared_module = None;
+        runtime.durability_scope = None;
+        runtime
     }));
 
     let target = config

@@ -1,6 +1,3 @@
-#[cfg(test)]
-use std::any::Any;
-
 use async_trait::async_trait;
 use tokio::runtime::Handle;
 use tracing::info;
@@ -13,7 +10,6 @@ use crate::extractor::{
     chain_state::ChainState, control::ExtractorHandle,
     family_registry::FamilyRuntimeRegistry,
     managed_extractor_initialization::ManagedExtractorBuildContext,
-    managed_stream_startup::load_stream_for_prepared_request,
     managed_substreams_request::{
         prepare_substreams_request_for_runtime_target, PreparedSubstreamsRequest,
         PreparedSubstreamsRequestLifecycleView,
@@ -24,58 +20,59 @@ use crate::extractor::{
     startup::initialize_runtime_target_accounts,
     ExtractionError,
 };
+use crate::substreams::stream::SubstreamsStream;
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PreparedRuntimeTargetKind {
-    Family,
-    Standalone,
-}
-
-pub(crate) struct PreparedRuntimeTargetStartup {
-    startup: Box<dyn PreparedManagedRunnerStartup>,
-}
-
-pub(crate) trait PreparedManagedRunnerStartup: Send {
-    fn build_managed_runner(
+pub(crate) trait ManagedRunnerFactory: Send + 'static {
+    fn into_managed_runner(
         self: Box<Self>,
+        stream: SubstreamsStream,
         runtime: Option<Handle>,
         partial_blocks: bool,
     ) -> Result<(ManagedRunner, Vec<ExtractorHandle>), ExtractionError>;
+}
 
-    #[cfg(test)]
-    fn kind(&self) -> PreparedRuntimeTargetKind;
+pub(crate) struct PreparedManagedRuntimeOwner<S, C> {
+    runner_factory: S,
+    prepared_request_context: C,
+}
 
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn Any;
+impl<S, C> PreparedManagedRuntimeOwner<S, C> {
+    pub(crate) fn new(runner_factory: S, prepared_request_context: C) -> Self {
+        Self { runner_factory, prepared_request_context }
+    }
 
-    #[cfg(test)]
-    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+    pub(crate) fn prepared_request_context_mut(&mut self) -> &mut C {
+        &mut self.prepared_request_context
+    }
+}
+
+impl<S, C> ManagedRunnerFactory for PreparedManagedRuntimeOwner<S, C>
+where
+    S: ManagedRunnerFactory,
+    C: Send + Sync + 'static,
+{
+    fn into_managed_runner(
+        self: Box<Self>,
+        stream: SubstreamsStream,
+        runtime: Option<Handle>,
+        partial_blocks: bool,
+    ) -> Result<(ManagedRunner, Vec<ExtractorHandle>), ExtractionError> {
+        Box::new(self.runner_factory)
+            .into_managed_runner(stream, runtime, partial_blocks)
+    }
+}
+
+pub(crate) struct PreparedRuntimeTargetStartup {
+    runner_factory: Box<dyn ManagedRunnerFactory>,
+    stream: SubstreamsStream,
 }
 
 impl PreparedRuntimeTargetStartup {
-    #[cfg(test)]
-    pub(crate) fn new(startup: impl Into<Self>) -> Self {
-        startup.into()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn kind(&self) -> PreparedRuntimeTargetKind {
-        self.startup.kind()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.startup.as_any().downcast_ref::<T>()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_typed<T: 'static>(self) -> T {
-        *self
-            .startup
-            .into_any()
-            .downcast::<T>()
-            .expect("prepared runtime target startup should contain the requested concrete type")
+    pub(crate) fn new<O>(runner_factory: O, stream: SubstreamsStream) -> Self
+    where
+        O: ManagedRunnerFactory,
+    {
+        Self { runner_factory: Box::new(runner_factory), stream }
     }
 
     pub(crate) fn build_managed_runner(
@@ -83,17 +80,36 @@ impl PreparedRuntimeTargetStartup {
         runtime: Option<Handle>,
         partial_blocks: bool,
     ) -> Result<(ManagedRunner, Vec<ExtractorHandle>), ExtractionError> {
-        self.startup
-            .build_managed_runner(runtime, partial_blocks)
+        self.runner_factory
+            .into_managed_runner(self.stream, runtime, partial_blocks)
     }
 }
 
-impl<T> From<T> for PreparedRuntimeTargetStartup
-where
-    T: PreparedManagedRunnerStartup + 'static,
-{
-    fn from(startup: T) -> Self {
-        Self { startup: Box::new(startup) }
+#[async_trait]
+pub(crate) trait PreparedRuntimeTargetDraftOwner: Send + 'static {
+    async fn into_prepared_startup(
+        self: Box<Self>,
+        context: &ResolvedRuntimeTargetsBuildContext<'_>,
+    ) -> Result<PreparedRuntimeTargetStartup, ExtractionError>;
+}
+
+pub(crate) struct PreparedRuntimeTargetDraft {
+    inner: Box<dyn PreparedRuntimeTargetDraftOwner>,
+}
+
+impl PreparedRuntimeTargetDraft {
+    pub(crate) fn new<D>(draft: D) -> Self
+    where
+        D: PreparedRuntimeTargetDraftOwner,
+    {
+        Self { inner: Box::new(draft) }
+    }
+
+    pub(crate) async fn into_prepared_startup(
+        self,
+        context: &ResolvedRuntimeTargetsBuildContext<'_>,
+    ) -> Result<PreparedRuntimeTargetStartup, ExtractionError> {
+        self.inner.into_prepared_startup(context).await
     }
 }
 
@@ -147,36 +163,91 @@ impl<'a> ResolvedRuntimeTargetsBuildContext<'a> {
 }
 
 pub(crate) struct PreparedRuntimeTargetsStartup {
-    pub(crate) prepared_targets: Vec<PreparedRuntimeTargetStartup>,
+    pub(crate) family_targets: Vec<PreparedRuntimeTargetStartup>,
+    pub(crate) standalone_targets: Vec<PreparedRuntimeTargetStartup>,
     runtime: Option<Handle>,
     partial_blocks: bool,
 }
 
+pub struct BuiltManagedRunnersBatch {
+    pub(crate) family_runners: Vec<ManagedRunner>,
+    pub(crate) standalone_runners: Vec<ManagedRunner>,
+    pub(crate) extractor_handles: Vec<ExtractorHandle>,
+}
+
+impl BuiltManagedRunnersBatch {
+    pub(crate) fn new(
+        family_runners: Vec<ManagedRunner>,
+        standalone_runners: Vec<ManagedRunner>,
+        extractor_handles: Vec<ExtractorHandle>,
+    ) -> Self {
+        Self { family_runners, standalone_runners, extractor_handles }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn total_runners(&self) -> usize {
+        self.family_runners.len() + self.standalone_runners.len()
+    }
+
+    pub fn into_parts(self) -> (Vec<ManagedRunner>, Vec<ManagedRunner>, Vec<ExtractorHandle>) {
+        (self.family_runners, self.standalone_runners, self.extractor_handles)
+    }
+
+    pub(crate) fn into_flattened(self) -> (Vec<ManagedRunner>, Vec<ExtractorHandle>) {
+        let mut runners = self.family_runners;
+        runners.extend(self.standalone_runners);
+        (runners, self.extractor_handles)
+    }
+}
+
 impl PreparedRuntimeTargetsStartup {
     pub(crate) fn new(
-        prepared_targets: Vec<PreparedRuntimeTargetStartup>,
+        family_targets: Vec<PreparedRuntimeTargetStartup>,
+        standalone_targets: Vec<PreparedRuntimeTargetStartup>,
         runtime: Option<Handle>,
         partial_blocks: bool,
     ) -> Self {
-        Self { prepared_targets, runtime, partial_blocks }
+        Self { family_targets, standalone_targets, runtime, partial_blocks }
+    }
+
+    pub(crate) fn total_targets(&self) -> usize {
+        self.family_targets.len() + self.standalone_targets.len()
     }
 
     pub(crate) fn build_managed_runners(
         self,
     ) -> Result<(Vec<ManagedRunner>, Vec<ExtractorHandle>), ExtractionError> {
-        let mut runners = Vec::new();
+        self.build_managed_runners_batch()
+            .map(BuiltManagedRunnersBatch::into_flattened)
+    }
+
+    pub(crate) fn build_managed_runners_batch(
+        self,
+    ) -> Result<BuiltManagedRunnersBatch, ExtractionError> {
+        let mut family_runners = Vec::new();
+        let mut standalone_runners = Vec::new();
         let mut extractor_handles = Vec::new();
 
         let runtime = self.runtime;
         let partial_blocks = self.partial_blocks;
-        for prepared_target in self.prepared_targets {
+        for prepared_target in self.family_targets {
             let (runner, handles) =
                 prepared_target.build_managed_runner(runtime.clone(), partial_blocks)?;
-            runners.push(runner);
+            family_runners.push(runner);
+            extractor_handles.extend(handles);
+        }
+        for prepared_target in self.standalone_targets {
+            let (runner, handles) =
+                prepared_target.build_managed_runner(runtime.clone(), partial_blocks)?;
+            standalone_runners.push(runner);
             extractor_handles.extend(handles);
         }
 
-        Ok((runners, extractor_handles))
+        Ok(BuiltManagedRunnersBatch::new(
+            family_runners,
+            standalone_runners,
+            extractor_handles,
+        ))
     }
 }
 
@@ -242,17 +313,23 @@ impl ResolvedRuntimeTargetsBuildContext<'_> {
         self.initialize_runtime_target_accounts(runtime_targets)
             .await;
 
-        let mut prepared_targets = Vec::new();
+        let mut family_targets = Vec::new();
+        let mut standalone_targets = Vec::new();
         for target in runtime_targets.as_slice().iter().cloned() {
-            prepared_targets.push(
-                target
-                    .prepare_managed_startup(self, &protocol_cache)
-                    .await?,
-            );
+            let is_family = matches!(target, ResolvedRuntimeTarget::Family(_));
+            let prepared_target = target
+                .prepare_managed_startup(self, &protocol_cache)
+                .await?;
+            if is_family {
+                family_targets.push(prepared_target);
+            } else {
+                standalone_targets.push(prepared_target);
+            }
         }
 
         Ok(PreparedRuntimeTargetsStartup::new(
-            prepared_targets,
+            family_targets,
+            standalone_targets,
             self.runtime.clone(),
             self.partial_blocks,
         ))
@@ -264,17 +341,23 @@ impl<'a> ResolvedRuntimeTarget<'a> {
         self,
         context: &ResolvedRuntimeTargetsBuildContext<'_>,
         protocol_cache: &ProtocolMemoryCache,
-    ) -> Result<Box<dyn PreparedRuntimeTargetDraft>, ExtractionError> {
+    ) -> Result<PreparedRuntimeTargetDraft, ExtractionError> {
         let extractor_build = context.extractor_build_context(protocol_cache);
         match self {
-            Self::Family(family) => family
-                .prepare_managed_startup_draft(extractor_build)
+            Self::Family(family) =>
+                <crate::extractor::family_runtime::ResolvedFamilyRuntime<'_> as ManagedStartupLifecycleView>::prepare_managed_startup_draft(
+                    &family,
+                    extractor_build,
+                )
                 .await
-                .map(|draft| Box::new(draft) as Box<dyn PreparedRuntimeTargetDraft>),
-            Self::Standalone(standalone) => standalone
-                .prepare_managed_startup_draft(extractor_build)
+                .map(PreparedRuntimeTargetDraft::new),
+            Self::Standalone(standalone) =>
+                <crate::extractor::runtime_target_planning::ResolvedStandaloneRuntime<'_> as ManagedStartupLifecycleView>::prepare_managed_startup_draft(
+                    &standalone,
+                    extractor_build,
+                )
                 .await
-                .map(|draft| Box::new(draft) as Box<dyn PreparedRuntimeTargetDraft>),
+                .map(PreparedRuntimeTargetDraft::new),
         }
     }
 
@@ -286,123 +369,116 @@ impl<'a> ResolvedRuntimeTarget<'a> {
         let draft = self
             .prepare_managed_startup_draft(context, protocol_cache)
             .await?;
-        prepare_runtime_target_startup_from_draft(draft, context)
-            .await
-            .map(Into::into)
+        draft.into_prepared_startup(context).await
     }
-}
-
-pub(crate) trait PreparedRuntimeTargetDraft: Send {
-    fn prepared_request(&self) -> &PreparedSubstreamsRequest;
-
-    fn into_prepared_startup(
-        self: Box<Self>,
-        stream: crate::substreams::stream::SubstreamsStream,
-    ) -> PreparedRuntimeTargetStartup;
-}
-
-pub(crate) trait PreparedManagedStartupPayload: Sized {
-    type PreparedStartup: PreparedManagedRunnerStartup + 'static;
-
-    fn into_prepared_startup(
-        self,
-        stream: crate::substreams::stream::SubstreamsStream,
-    ) -> Self::PreparedStartup;
-}
-
-pub(crate) trait ManagedStartupPreparedRequestPayload: PreparedManagedStartupPayload {
-    type PreparedRequestContext: Send + Sync;
-
-    fn prepared_request_context(
-        &self,
-        extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Self::PreparedRequestContext;
 }
 
 #[async_trait]
 pub(crate) trait ManagedStartupLifecycleView<'a>: Sized + Sync {
-    type Payload: PreparedManagedStartupPayload + Send + Sync + 'static;
+    type RuntimeOwner: ManagedRunnerFactory + ManagedStartupPreparedRequestContext + Send + Sync + 'static;
 
-    async fn build_managed_startup_payload(
+    async fn build_managed_runtime_owner(
         &self,
         extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Result<Self::Payload, ExtractionError>;
+    ) -> Result<Self::RuntimeOwner, ExtractionError>;
 
     async fn prepare_substreams_request_for_managed_startup(
         &self,
-        payload: &Self::Payload,
+        runtime_owner: &Self::RuntimeOwner,
         extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Result<PreparedSubstreamsRequest, ExtractionError>;
+    ) -> Result<PreparedSubstreamsRequest, ExtractionError>
+    where
+        Self:
+            PreparedSubstreamsRequestLifecycleView<
+                <Self::RuntimeOwner as ManagedStartupPreparedRequestContext>::PreparedRequestContext,
+            >,
+    {
+        prepare_managed_startup_request_from_owner(self, runtime_owner, extractor_build).await
+    }
 
     async fn prepare_managed_startup_draft(
         &self,
         extractor_build: ManagedExtractorBuildContext<'_>,
-    ) -> Result<PreparedManagedStartupDraft<Self::Payload>, ExtractionError> {
-        let payload = self
-            .build_managed_startup_payload(extractor_build.clone())
+    ) -> Result<PreparedManagedStartupDraft<Self::RuntimeOwner>, ExtractionError>
+    where
+        Self:
+            PreparedSubstreamsRequestLifecycleView<
+                <Self::RuntimeOwner as ManagedStartupPreparedRequestContext>::PreparedRequestContext,
+            >,
+    {
+        let runtime_owner = self
+            .build_managed_runtime_owner(extractor_build.clone())
             .await?;
         let prepared_request = self
-            .prepare_substreams_request_for_managed_startup(&payload, extractor_build)
+            .prepare_substreams_request_for_managed_startup(&runtime_owner, extractor_build)
             .await?;
-        Ok(PreparedManagedStartupDraft::new(payload, prepared_request))
+        Ok(PreparedManagedStartupDraft::new(runtime_owner, prepared_request))
     }
 }
 
-pub(crate) struct PreparedManagedStartupDraft<P> {
-    pub(crate) payload: P,
+pub(crate) struct PreparedManagedStartupDraft<O> {
+    pub(crate) runtime_owner: O,
     pub(crate) prepared_request: PreparedSubstreamsRequest,
 }
 
-impl<P> PreparedManagedStartupDraft<P> {
-    pub(crate) fn new(payload: P, prepared_request: PreparedSubstreamsRequest) -> Self {
-        Self { payload, prepared_request }
+impl<O> PreparedManagedStartupDraft<O>
+where
+    O: ManagedRunnerFactory,
+{
+    pub(crate) fn new(runtime_owner: O, prepared_request: PreparedSubstreamsRequest) -> Self {
+        Self { runtime_owner, prepared_request }
     }
 }
 
-pub(crate) async fn prepare_managed_startup_request_from_payload<R, P>(
+pub(crate) async fn prepare_managed_startup_request_from_owner<R, O>(
     runtime: &R,
-    payload: &P,
+    runtime_owner: &O,
     extractor_build: ManagedExtractorBuildContext<'_>,
 ) -> Result<PreparedSubstreamsRequest, ExtractionError>
 where
-    R: PreparedSubstreamsRequestLifecycleView<P::PreparedRequestContext>,
-    P: ManagedStartupPreparedRequestPayload,
+    R: PreparedSubstreamsRequestLifecycleView<O::PreparedRequestContext>,
+    O: ManagedStartupPreparedRequestContext,
 {
-    let context = payload.prepared_request_context(extractor_build);
-    prepare_substreams_request_for_runtime_target(runtime, &context, extractor_build.rpc_client)
+    let context = runtime_owner.prepared_request_context();
+    prepare_substreams_request_for_runtime_target(runtime, context, extractor_build.rpc_client)
         .await
 }
 
-impl<P> PreparedRuntimeTargetDraft for PreparedManagedStartupDraft<P>
-where
-    P: PreparedManagedStartupPayload + Send,
-{
-    fn prepared_request(&self) -> &PreparedSubstreamsRequest {
-        &self.prepared_request
-    }
+pub(crate) trait ManagedStartupPreparedRequestContext {
+    type PreparedRequestContext: Send + Sync;
 
-    fn into_prepared_startup(
-        self: Box<Self>,
-        stream: crate::substreams::stream::SubstreamsStream,
-    ) -> PreparedRuntimeTargetStartup {
-        let this = *self;
-        let prepared_startup = this.payload.into_prepared_startup(stream);
-        prepared_startup.into()
+    fn prepared_request_context(&self) -> &Self::PreparedRequestContext;
+}
+
+impl<S, C> ManagedStartupPreparedRequestContext for PreparedManagedRuntimeOwner<S, C>
+where
+    S: ManagedRunnerFactory,
+    C: Send + Sync + 'static,
+{
+    type PreparedRequestContext = C;
+
+    fn prepared_request_context(&self) -> &Self::PreparedRequestContext {
+        &self.prepared_request_context
     }
 }
 
-pub(crate) async fn prepare_runtime_target_startup_from_draft(
-    draft: Box<dyn PreparedRuntimeTargetDraft>,
-    context: &ResolvedRuntimeTargetsBuildContext<'_>,
-) -> Result<PreparedRuntimeTargetStartup, ExtractionError> {
-    let stream = load_stream_for_prepared_request(
-        draft.prepared_request(),
-        context.s3_bucket,
-        context.endpoint_url,
-        context.substreams_api_token,
-        context.final_block_only,
-        context.partial_blocks,
-    )
-    .await?;
-    Ok(draft.into_prepared_startup(stream))
+#[async_trait]
+impl<O> PreparedRuntimeTargetDraftOwner for PreparedManagedStartupDraft<O>
+where
+    O: ManagedRunnerFactory,
+{
+    async fn into_prepared_startup(
+        self: Box<Self>,
+        context: &ResolvedRuntimeTargetsBuildContext<'_>,
+    ) -> Result<PreparedRuntimeTargetStartup, ExtractionError> {
+        let stream = self.prepared_request.load_stream(
+            context.s3_bucket,
+            context.endpoint_url,
+            context.substreams_api_token,
+            context.final_block_only,
+            context.partial_blocks,
+        )
+        .await?;
+        Ok(PreparedRuntimeTargetStartup::new(self.runtime_owner, stream))
+    }
 }

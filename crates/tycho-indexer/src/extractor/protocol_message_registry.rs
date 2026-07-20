@@ -85,6 +85,12 @@ pub(crate) struct AuxiliaryProtocolStateHydrator {
     ) -> AuxiliaryProtocolStateHydrationFuture<'a>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProtocolSystemAuxiliaryRuntimeHooks {
+    pub message_decoders: Vec<AuxiliaryProtocolMessageDecoder>,
+    pub state_hydrators: Vec<AuxiliaryProtocolStateHydrator>,
+}
+
 pub(crate) fn auxiliary_protocol_message_decoder_for(
     decoders: &[AuxiliaryProtocolMessageDecoder],
     protocol_system: &str,
@@ -125,6 +131,22 @@ pub(crate) fn default_auxiliary_protocol_state_hydrators_for_protocol_system(
                 .to_vec()
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn default_auxiliary_runtime_hooks_for_protocol_system(
+    protocol_system: &str,
+    registry: FamilyRuntimeRegistry<'_>,
+) -> ProtocolSystemAuxiliaryRuntimeHooks {
+    ProtocolSystemAuxiliaryRuntimeHooks {
+        message_decoders: default_auxiliary_protocol_message_decoders_for_protocol_system(
+            protocol_system,
+            registry,
+        ),
+        state_hydrators: default_auxiliary_protocol_state_hydrators_for_protocol_system(
+            protocol_system,
+            registry,
+        ),
+    }
 }
 
 #[cfg(test)]

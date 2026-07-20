@@ -5,6 +5,9 @@ use tycho_ethereum::rpc::{
     EthereumRpcClient,
 };
 
+use crate::extractor::family_registry::{
+    default_family_runtime_registry, FamilyRuntimeRegistry,
+};
 use crate::extractor::ExtractionError;
 
 /// Tycho Indexer using Substreams
@@ -27,6 +30,10 @@ impl Cli {
 
     pub fn command(&self) -> Command {
         self.command.clone()
+    }
+
+    pub fn family_runtime_registry(&self) -> FamilyRuntimeRegistry<'static> {
+        default_family_runtime_registry()
     }
 }
 
@@ -162,7 +169,11 @@ pub struct IndexArgs {
     pub substreams_args: SubstreamsArgs,
 
     /// Extractors configuration file
-    #[clap(long, env, default_value = "./extractors.yaml")]
+    #[clap(
+        long,
+        env,
+        default_value = "./crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml"
+    )]
     pub extractors_config: String,
 
     /// A comma separated list of blockchains to index on
@@ -567,6 +578,59 @@ mod cli_tests {
                 },
                 chains: vec!["ethereum".to_string()],
                 extractors_config: "/opt/extractors.yaml".to_string(),
+                retention_horizon: "2024-01-01T00:00:00".to_string(),
+                settlement_contract: "0xc9f2e6ea1637E499406986ac50ddC92401ce1f58"
+                    .parse()
+                    .unwrap(),
+            }),
+        };
+
+        assert_eq!(cli, expected_args);
+    }
+
+    #[tokio::test]
+    async fn test_arg_parsing_index_cmd_uses_canonical_combined_default_extractors_config() {
+        let cli = Cli::try_parse_from(vec![
+            "tycho-indexer",
+            "--endpoint",
+            "http://example.com",
+            "--database-url",
+            "my_db",
+            "--rpc-url",
+            "http://example.com",
+            "index",
+            "--api_token",
+            "your_api_token",
+        ])
+        .expect("parse errored");
+
+        let expected_args = Cli {
+            global_args: GlobalArgs {
+                endpoint_url: "http://example.com".to_string(),
+                database_url: "my_db".to_string(),
+                database_insert_batch_size: 0,
+                s3_bucket: Some("repo.propellerheads-propellerheads".to_string()),
+                server_ip: "0.0.0.0".to_string(),
+                server_port: 4242,
+                server_version_prefix: "v1".to_string(),
+                rpc: RPCArgs {
+                    url: "http://example.com".to_string(),
+                    max_retries: 5,
+                    initial_backoff_ms: 150,
+                    max_backoff_ms: 5000,
+                    max_batch_size: None,
+                    storage_slot_max_batch_size: None,
+                },
+            },
+            command: Command::Index(IndexArgs {
+                substreams_args: SubstreamsArgs {
+                    substreams_api_token: "your_api_token".to_string(),
+                    enable_partial_blocks: false,
+                },
+                extractors_config:
+                    "./crates/tycho-indexer/extractors.uniswap_v2_v3.combined.yaml"
+                        .to_string(),
+                chains: vec!["ethereum".to_string()],
                 retention_horizon: "2024-01-01T00:00:00".to_string(),
                 settlement_contract: "0xc9f2e6ea1637E499406986ac50ddC92401ce1f58"
                     .parse()

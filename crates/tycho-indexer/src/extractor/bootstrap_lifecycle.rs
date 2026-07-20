@@ -1,4 +1,5 @@
 use crate::extractor::{
+    managed_substreams_request::{PreparedBootstrapContextView, PreparedBootstrapExecution},
     shared_bootstrap::{
         decide_bootstrap_completion, BootstrapCompletionDecision, BootstrapCompletionPolicy,
         BootstrapCompletionSnapshot,
@@ -6,6 +7,7 @@ use crate::extractor::{
     ExtractionError,
 };
 use std::future::Future;
+use tycho_ethereum::rpc::EthereumRpcClient;
 use tracing::{info, warn};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +148,279 @@ where
     }
 }
 
+pub(crate) async fn execute_bootstrap_run_decision_and_resolve_with_progress_reload<
+    Progress,
+    Output,
+    LoadProgress,
+    LoadProgressFut,
+    RunBootstrap,
+    RunBootstrapFut,
+    ResolveOutput,
+>(
+    progress: Progress,
+    decision: BootstrapRunDecision,
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    load_progress: LoadProgress,
+    run_bootstrap: RunBootstrap,
+    resolve_output: ResolveOutput,
+) -> Result<(Progress, Output), ExtractionError>
+where
+    LoadProgress: FnOnce() -> LoadProgressFut,
+    LoadProgressFut: Future<Output = Result<Progress, ExtractionError>>,
+    RunBootstrap: FnOnce(u64) -> RunBootstrapFut,
+    RunBootstrapFut: Future<Output = Result<(), ExtractionError>>,
+    ResolveOutput: FnOnce(&Progress) -> Result<Output, ExtractionError>,
+{
+    let progress = execute_bootstrap_run_decision_with_progress_reload(
+        progress,
+        decision,
+        startup_scope_id,
+        startup_scope_kind,
+        load_progress,
+        run_bootstrap,
+    )
+    .await?;
+    let output = resolve_output(&progress)?;
+    Ok((progress, output))
+}
+
+pub(crate) async fn execute_optional_bootstrap_run_and_resolve_with_progress_reload<
+    Progress,
+    Output,
+    LoadProgress,
+    LoadProgressFut,
+    RunBootstrap,
+    RunBootstrapFut,
+    ResolveOutput,
+>(
+    progress: Progress,
+    decision: Option<BootstrapRunDecision>,
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    load_progress: LoadProgress,
+    run_bootstrap: RunBootstrap,
+    resolve_output: ResolveOutput,
+) -> Result<(Progress, Output), ExtractionError>
+where
+    LoadProgress: FnOnce() -> LoadProgressFut,
+    LoadProgressFut: Future<Output = Result<Progress, ExtractionError>>,
+    RunBootstrap: FnOnce(u64) -> RunBootstrapFut,
+    RunBootstrapFut: Future<Output = Result<(), ExtractionError>>,
+    ResolveOutput: FnOnce(&Progress) -> Result<Output, ExtractionError>,
+{
+    match decision {
+        Some(decision) => {
+            execute_bootstrap_run_decision_and_resolve_with_progress_reload(
+                progress,
+                decision,
+                startup_scope_id,
+                startup_scope_kind,
+                load_progress,
+                run_bootstrap,
+                resolve_output,
+            )
+            .await
+        }
+        None => {
+            let output = resolve_output(&progress)?;
+            Ok((progress, output))
+        }
+    }
+}
+
+pub(crate) async fn load_and_execute_optional_bootstrap_run_and_resolve<
+    Progress,
+    Output,
+    LoadProgress,
+    LoadProgressFut,
+    ValidateInitial,
+    DecideRun,
+    RunBootstrap,
+    RunBootstrapFut,
+    ResolveOutput,
+>(
+    load_progress: LoadProgress,
+    validate_initial: ValidateInitial,
+    decide_run: DecideRun,
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    run_bootstrap: RunBootstrap,
+    resolve_output: ResolveOutput,
+) -> Result<(Progress, Output), ExtractionError>
+where
+    LoadProgress: Fn() -> LoadProgressFut + Copy,
+    LoadProgressFut: Future<Output = Result<Progress, ExtractionError>>,
+    ValidateInitial: FnOnce(&Progress) -> Result<(), ExtractionError>,
+    DecideRun: FnOnce(&Progress) -> Result<Option<BootstrapRunDecision>, ExtractionError>,
+    RunBootstrap: FnOnce(u64) -> RunBootstrapFut,
+    RunBootstrapFut: Future<Output = Result<(), ExtractionError>>,
+    ResolveOutput: FnOnce(&Progress) -> Result<Output, ExtractionError>,
+{
+    let progress = load_progress().await?;
+    validate_initial(&progress)?;
+    let decision = decide_run(&progress)?;
+    execute_optional_bootstrap_run_and_resolve_with_progress_reload(
+        progress,
+        decision,
+        startup_scope_id,
+        startup_scope_kind,
+        load_progress,
+        run_bootstrap,
+        resolve_output,
+    )
+    .await
+}
+
+pub(crate) async fn load_and_execute_optional_prepared_bootstrap_run_and_resolve<
+    Progress,
+    Output,
+    LoadProgress,
+    LoadProgressFut,
+    ValidateInitial,
+    DecideRun,
+    ResolveOutput,
+    B,
+>(
+    load_progress: LoadProgress,
+    validate_initial: ValidateInitial,
+    decide_run: DecideRun,
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    prepared_bootstrap: Option<&B>,
+    rpc_client: &EthereumRpcClient,
+    resolve_output: ResolveOutput,
+) -> Result<(Progress, Output), ExtractionError>
+where
+    LoadProgress: Fn() -> LoadProgressFut + Copy,
+    LoadProgressFut: Future<Output = Result<Progress, ExtractionError>>,
+    ValidateInitial: FnOnce(&Progress) -> Result<(), ExtractionError>,
+    DecideRun: FnOnce(&Progress) -> Result<Option<BootstrapRunDecision>, ExtractionError>,
+    ResolveOutput: FnOnce(&Progress) -> Result<Output, ExtractionError>,
+    B: PreparedBootstrapExecution,
+{
+    load_and_execute_optional_bootstrap_run_and_resolve(
+        load_progress,
+        validate_initial,
+        decide_run,
+        startup_scope_id,
+        startup_scope_kind,
+        |_| async move {
+            run_logged_optional_prepared_bootstrap_execution(
+                startup_scope_id,
+                startup_scope_kind,
+                prepared_bootstrap,
+                rpc_client,
+            )
+            .await
+        },
+        resolve_output,
+    )
+    .await
+}
+
+pub(crate) async fn load_and_execute_context_prepared_bootstrap_run_and_resolve<
+    Context,
+    Progress,
+    Output,
+    LoadProgress,
+    LoadProgressFut,
+    ValidateInitial,
+    DecideRun,
+    ResolveOutput,
+>(
+    context: &Context,
+    load_progress: LoadProgress,
+    validate_initial: ValidateInitial,
+    decide_run: DecideRun,
+    rpc_client: &EthereumRpcClient,
+    resolve_output: ResolveOutput,
+) -> Result<(Progress, Output), ExtractionError>
+where
+    Context: PreparedBootstrapContextView,
+    LoadProgress: Fn() -> LoadProgressFut + Copy,
+    LoadProgressFut: Future<Output = Result<Progress, ExtractionError>>,
+    ValidateInitial: FnOnce(&Progress) -> Result<(), ExtractionError>,
+    DecideRun: FnOnce(&Progress) -> Result<Option<BootstrapRunDecision>, ExtractionError>,
+    ResolveOutput: FnOnce(&Progress) -> Result<Output, ExtractionError>,
+{
+    load_and_execute_optional_prepared_bootstrap_run_and_resolve(
+        load_progress,
+        validate_initial,
+        decide_run,
+        context.startup_scope_id(),
+        context.startup_scope_kind(),
+        context.prepared_bootstrap_execution(),
+        rpc_client,
+        resolve_output,
+    )
+    .await
+}
+
+pub(crate) async fn run_logged_prepared_bootstrap_execution<B>(
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    prepared_bootstrap: &B,
+    rpc_client: &EthereumRpcClient,
+) -> Result<(), ExtractionError>
+where
+    B: PreparedBootstrapExecution,
+{
+    info!(
+        startup_scope_kind,
+        startup_scope_id = %startup_scope_id,
+        branches = prepared_bootstrap.branches().len(),
+        bootstrap_block = prepared_bootstrap.bootstrap_block(),
+        "BootstrapExecutorInit"
+    );
+
+    for branch in prepared_bootstrap.branches() {
+        info!(
+            startup_scope_kind,
+            startup_scope_id = %startup_scope_id,
+            strategy = ?branch.strategy,
+            protocol_system = branch.protocol_system,
+            pools = branch.params.pools.len(),
+            "BootstrapExecutorBranch"
+        );
+    }
+
+    prepared_bootstrap.execute(rpc_client).await?;
+
+    info!(
+        startup_scope_kind,
+        startup_scope_id = %startup_scope_id,
+        bootstrap_block = prepared_bootstrap.bootstrap_block(),
+        "BootstrapExecutorCompleted"
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn run_logged_optional_prepared_bootstrap_execution<B>(
+    startup_scope_id: &str,
+    startup_scope_kind: &'static str,
+    prepared_bootstrap: Option<&B>,
+    rpc_client: &EthereumRpcClient,
+) -> Result<(), ExtractionError>
+where
+    B: PreparedBootstrapExecution,
+{
+    let prepared_bootstrap = prepared_bootstrap.ok_or_else(|| {
+        ExtractionError::Setup(format!(
+            "missing prepared bootstrap runtime for {startup_scope_kind} `{startup_scope_id}`"
+        ))
+    })?;
+
+    run_logged_prepared_bootstrap_execution(
+        startup_scope_id,
+        startup_scope_kind,
+        prepared_bootstrap,
+        rpc_client,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::extractor::shared_bootstrap::BootstrapCompletionSnapshot;
@@ -255,6 +530,25 @@ mod tests {
         .expect("skip should succeed");
 
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn run_logged_optional_prepared_bootstrap_execution_rejects_missing_runtime() {
+        let err = run_logged_optional_prepared_bootstrap_execution::<
+            crate::extractor::managed_substreams_request::PreparedSharedBootstrap,
+        >("uniswap_family", "family", None, &stub_rpc_client())
+        .await
+        .expect_err("missing prepared bootstrap should fail");
+
+        assert!(
+            err.to_string()
+                .contains("missing prepared bootstrap runtime for family `uniswap_family`")
+        );
+    }
+
+    fn stub_rpc_client() -> EthereumRpcClient {
+        EthereumRpcClient::new("http://localhost:0000")
+            .expect("build stub rpc client for bootstrap lifecycle tests")
     }
 
     #[tokio::test]

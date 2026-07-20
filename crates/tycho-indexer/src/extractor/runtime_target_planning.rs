@@ -6,9 +6,14 @@ use tycho_common::models::{Chain, ExtractorIdentity};
 
 use crate::extractor::{
     extractor_config::configured_stream_start_block, extractor_config::ExtractorConfig,
-    family_runtime_planning::ResolvedFamilyRuntime,
+    family_bootstrap_registry::ResolvedSharedBootstrapRuntime,
+    family_registry::FamilyRuntimeRegistry,
+    family_runtime::ResolvedFamilyRuntime,
     managed_substreams_request::PreparedSubstreamsRequest, ExtractionError,
 };
+
+#[cfg(test)]
+use crate::extractor::family_registry::default_family_runtime_registry;
 
 #[derive(Clone, Debug)]
 pub struct ResolvedRuntimeTargets<'a> {
@@ -19,6 +24,9 @@ pub struct ResolvedRuntimeTargets<'a> {
 pub struct ResolvedStandaloneRuntime<'a> {
     pub protocol_system: &'a str,
     pub extractor_config: &'a ExtractorConfig,
+    request: PlannedSubstreamsRequestTemplate,
+    configured_start_block: i64,
+    bootstrap_runtime: Option<ResolvedSharedBootstrapRuntime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -38,6 +46,47 @@ pub struct ResolvedInitializedAccountsRequest {
     pub block_id: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedSubstreamsRequestTemplate {
+    spkg: String,
+    module: String,
+    stop_block: u64,
+    params: HashMap<String, String>,
+    extractor_id: String,
+}
+
+impl PlannedSubstreamsRequestTemplate {
+    pub(crate) fn new(
+        spkg: impl Into<String>,
+        module: impl Into<String>,
+        stop_block: u64,
+        params: HashMap<String, String>,
+        extractor_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            spkg: spkg.into(),
+            module: module.into(),
+            stop_block,
+            params,
+            extractor_id: extractor_id.into(),
+        }
+    }
+
+    pub(crate) fn with_start_block(
+        &self,
+        start_block: i64,
+    ) -> ResolvedSubstreamsExecutionRequest {
+        ResolvedSubstreamsExecutionRequest {
+            spkg: self.spkg.clone(),
+            module: self.module.clone(),
+            start_block,
+            stop_block: self.stop_block,
+            params: self.params.clone(),
+            extractor_id: self.extractor_id.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ResolvedRuntimeTarget<'a> {
     Family(ResolvedFamilyRuntime<'a>),
@@ -55,18 +104,26 @@ trait RuntimeTargetPlanningView<'a> {
 
     fn chain(&self) -> Chain;
 
+    fn configured_start_block(&self) -> i64;
+
+    fn request_template(&self) -> PlannedSubstreamsRequestTemplate;
+
     fn extractor_configs(&self) -> Vec<&'a ExtractorConfig>;
 
     fn protocol_systems(&self) -> Vec<&'a str>;
 
     fn substreams_execution_request(
         &self,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError>;
+    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
+        self.substreams_execution_request_with_start_block(self.configured_start_block())
+    }
 
     fn substreams_execution_request_with_start_block(
         &self,
         start_block: i64,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError>;
+    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
+        Ok(self.request_template().with_start_block(start_block))
+    }
 
     fn prepared_substreams_request_with_stream_position(
         &self,
@@ -120,14 +177,17 @@ impl<'a> ResolvedFamilyRuntime<'a> {
     pub fn substreams_execution_request(
         &self,
     ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        self.substreams_execution_request_with_start_block(self.configured_start_block())
+        <Self as RuntimeTargetPlanningView>::substreams_execution_request(self)
     }
 
     pub fn substreams_execution_request_with_start_block(
         &self,
         start_block: i64,
     ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        Ok(self.shared_stream_runtime.request.with_start_block(start_block))
+        <Self as RuntimeTargetPlanningView>::substreams_execution_request_with_start_block(
+            self,
+            start_block,
+        )
     }
 
     pub fn prepared_substreams_request_with_stream_position(
@@ -144,38 +204,28 @@ impl<'a> ResolvedFamilyRuntime<'a> {
 }
 
 impl<'a> ResolvedStandaloneRuntime<'a> {
+    pub fn configured_start_block(&self) -> i64 {
+        self.configured_start_block
+    }
+
+    pub(crate) fn bootstrap_runtime(&self) -> Option<&ResolvedSharedBootstrapRuntime> {
+        self.bootstrap_runtime.as_ref()
+    }
+
     pub fn substreams_execution_request(
         &self,
     ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        let start_block = configured_stream_start_block(self.extractor_config)?;
-        self.substreams_execution_request_with_start_block(start_block)
+        <Self as RuntimeTargetPlanningView>::substreams_execution_request(self)
     }
 
     pub fn substreams_execution_request_with_start_block(
         &self,
         start_block: i64,
     ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        Ok(ResolvedSubstreamsExecutionRequest {
-            spkg: self.extractor_config.spkg().to_string(),
-            module: self
-                .extractor_config
-                .module_name()
-                .to_string(),
+        <Self as RuntimeTargetPlanningView>::substreams_execution_request_with_start_block(
+            self,
             start_block,
-            stop_block: self
-                .extractor_config
-                .stop_block()
-                .unwrap_or_default() as u64,
-            params: self
-                .extractor_config
-                .substreams_params
-                .clone(),
-            extractor_id: ExtractorIdentity::new(
-                self.extractor_config.chain(),
-                self.extractor_config.name(),
-            )
-            .to_string(),
-        })
+        )
     }
 
     pub fn prepared_substreams_request_with_stream_position(
@@ -191,13 +241,126 @@ impl<'a> ResolvedStandaloneRuntime<'a> {
     }
 }
 
+impl<'a> ResolvedStandaloneRuntime<'a> {
+    fn resolve_bootstrap_runtime_for_config(
+        extractor_config: &ExtractorConfig,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<Option<ResolvedSharedBootstrapRuntime>, ExtractionError> {
+        if extractor_config.bootstrap.is_none() {
+            return Ok(None);
+        }
+
+        if extractor_config.family_runtime.is_some()
+            || registry
+                .family_name_for_protocol_system(extractor_config.protocol_system())
+                .is_some()
+        {
+            registry.resolve_optional_shared_bootstrap_runtime([extractor_config])
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn reject_family_managed_standalone_runtime(
+        extractor_config: &ExtractorConfig,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<(), ExtractionError> {
+        let Some(family_name) =
+            registry.family_name_for_protocol_system(extractor_config.protocol_system())
+        else {
+            return Ok(());
+        };
+
+        let config_context = if extractor_config.family_runtime.is_some() {
+            "is configured for shared family runtime"
+        } else {
+            "belongs to registered family runtime"
+        };
+
+        Err(ExtractionError::Setup(format!(
+            "protocol system `{}` {config_context} `{family_name}` and cannot be resolved as a standalone runtime",
+            extractor_config.protocol_system()
+        )))
+    }
+
+    pub fn from_extractor_config_with_registry(
+        extractor_config: &'a ExtractorConfig,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<Self, ExtractionError> {
+        Self::reject_family_managed_standalone_runtime(extractor_config, registry)?;
+        Ok(Self {
+            protocol_system: extractor_config.protocol_system(),
+            extractor_config,
+            request: PlannedSubstreamsRequestTemplate::new(
+                extractor_config.spkg(),
+                extractor_config.module_name(),
+                extractor_config.stop_block().unwrap_or_default() as u64,
+                extractor_config.substreams_params.clone(),
+                ExtractorIdentity::new(
+                    extractor_config.chain(),
+                    extractor_config.name(),
+                )
+                .to_string(),
+            ),
+            configured_start_block: configured_stream_start_block(extractor_config)?,
+            bootstrap_runtime: Self::resolve_bootstrap_runtime_for_config(
+                extractor_config,
+                registry,
+            )?,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn from_extractor_config(
+        extractor_config: &'a ExtractorConfig,
+    ) -> Result<Self, ExtractionError> {
+        Self::from_extractor_config_with_registry(extractor_config, default_family_runtime_registry())
+    }
+
+    #[cfg(test)]
+    pub fn from_family_member_extractor_config_with_registry_for_tests(
+        extractor_config: &'a ExtractorConfig,
+        registry: FamilyRuntimeRegistry<'_>,
+    ) -> Result<Self, ExtractionError> {
+        Ok(Self {
+            protocol_system: extractor_config.protocol_system(),
+            extractor_config,
+            request: PlannedSubstreamsRequestTemplate::new(
+                extractor_config.spkg(),
+                extractor_config.module_name(),
+                extractor_config.stop_block().unwrap_or_default() as u64,
+                extractor_config.substreams_params.clone(),
+                ExtractorIdentity::new(
+                    extractor_config.chain(),
+                    extractor_config.name(),
+                )
+                .to_string(),
+            ),
+            configured_start_block: configured_stream_start_block(extractor_config)?,
+            bootstrap_runtime: Self::resolve_bootstrap_runtime_for_config(
+                extractor_config,
+                registry,
+            )?,
+        })
+    }
+}
+
 impl<'a> RuntimeTargetPlanningView<'a> for ResolvedFamilyRuntime<'a> {
     fn selector_label(&self) -> String {
-        format!("family:{}", self.family.family_name)
+        format!("family:{}", self.family_name())
     }
 
     fn chain(&self) -> Chain {
-        self.family.chain
+        ResolvedFamilyRuntime::chain(self)
+    }
+
+    fn configured_start_block(&self) -> i64 {
+        ResolvedFamilyRuntime::configured_start_block(self)
+    }
+
+    fn request_template(&self) -> PlannedSubstreamsRequestTemplate {
+        self.shared_runtime
+            .request_template(self.runtime_contract().resolved_shared_stream())
     }
 
     fn extractor_configs(&self) -> Vec<&'a ExtractorConfig> {
@@ -211,18 +374,6 @@ impl<'a> RuntimeTargetPlanningView<'a> for ResolvedFamilyRuntime<'a> {
             .collect()
     }
 
-    fn substreams_execution_request(
-        &self,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        ResolvedFamilyRuntime::substreams_execution_request(self)
-    }
-
-    fn substreams_execution_request_with_start_block(
-        &self,
-        start_block: i64,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        ResolvedFamilyRuntime::substreams_execution_request_with_start_block(self, start_block)
-    }
 }
 
 impl<'a> RuntimeTargetPlanningView<'a> for ResolvedStandaloneRuntime<'a> {
@@ -234,25 +385,20 @@ impl<'a> RuntimeTargetPlanningView<'a> for ResolvedStandaloneRuntime<'a> {
         self.extractor_config.chain()
     }
 
+    fn configured_start_block(&self) -> i64 {
+        self.configured_start_block
+    }
+
+    fn request_template(&self) -> PlannedSubstreamsRequestTemplate {
+        self.request.clone()
+    }
+
     fn extractor_configs(&self) -> Vec<&'a ExtractorConfig> {
         vec![self.extractor_config]
     }
 
     fn protocol_systems(&self) -> Vec<&'a str> {
         vec![self.protocol_system]
-    }
-
-    fn substreams_execution_request(
-        &self,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        ResolvedStandaloneRuntime::substreams_execution_request(self)
-    }
-
-    fn substreams_execution_request_with_start_block(
-        &self,
-        start_block: i64,
-    ) -> Result<ResolvedSubstreamsExecutionRequest, ExtractionError> {
-        ResolvedStandaloneRuntime::substreams_execution_request_with_start_block(self, start_block)
     }
 }
 
@@ -303,6 +449,12 @@ impl<'a> ResolvedRuntimeTarget<'a> {
         self.planning_view().protocol_systems()
     }
 
+    pub fn contains_protocol_system(&self, protocol_system: &str) -> bool {
+        self.protocol_systems()
+            .into_iter()
+            .any(|candidate| candidate == protocol_system)
+    }
+
     pub fn initialized_accounts_requests(&self) -> Vec<ResolvedInitializedAccountsRequest> {
         self.planning_view()
             .initialized_accounts_requests()
@@ -311,7 +463,7 @@ impl<'a> ResolvedRuntimeTarget<'a> {
     pub fn matches_selector(&self, selector: ResolvedRuntimeTargetSelector<'_>) -> bool {
         match (selector, self) {
             (ResolvedRuntimeTargetSelector::Family(family_name), Self::Family(family)) => {
-                family.family.family_name == family_name
+                family.family_name() == family_name
             }
             (
                 ResolvedRuntimeTargetSelector::StandaloneProtocolSystem(protocol_system),
@@ -429,7 +581,7 @@ impl<'a> ResolvedRuntimeTargets<'a> {
         self.targets
             .iter()
             .find(|target| target.matches_selector(selector))
-            .ok_or_else(|| selector.not_found_error(selector_context))
+            .ok_or_else(|| self.selector_resolution_error(selector, selector_context))
     }
 
     pub fn resolve_target(
@@ -489,6 +641,21 @@ impl<'a> ResolvedRuntimeTargets<'a> {
         )))
     }
 
+    pub fn into_resolved_target(
+        self,
+        selector: Option<ResolvedRuntimeTargetSelector<'_>>,
+        unique_context: &str,
+        selector_context: &str,
+    ) -> Result<ResolvedRuntimeTarget<'a>, ExtractionError> {
+        match selector {
+            Some(selector) => {
+                let err = self.selector_resolution_error(selector, selector_context);
+                self.into_selected(selector).ok_or(err)
+            }
+            None => self.into_unique(unique_context),
+        }
+    }
+
     pub fn coalesced_initialized_accounts_requests(
         &self,
     ) -> Vec<ResolvedInitializedAccountsRequest> {
@@ -524,6 +691,38 @@ impl<'a> ResolvedRuntimeTargets<'a> {
             .collect()
     }
 
+    pub fn family_name_for_protocol_system(
+        &self,
+        protocol_system: &str,
+    ) -> Option<&str> {
+        self.targets.iter().find_map(|target| match target {
+            ResolvedRuntimeTarget::Family(family)
+                if target.contains_protocol_system(protocol_system) =>
+            {
+                Some(family.family_name())
+            }
+            _ => None,
+        })
+    }
+
+    fn selector_resolution_error(
+        &self,
+        selector: ResolvedRuntimeTargetSelector<'_>,
+        selector_context: &str,
+    ) -> ExtractionError {
+        match selector {
+            ResolvedRuntimeTargetSelector::StandaloneProtocolSystem(protocol_system) => {
+                if let Some(family_name) = self.family_name_for_protocol_system(protocol_system) {
+                    return ExtractionError::Setup(format!(
+                        "protocol system `{protocol_system}` belongs to shared family runtime `{family_name}` and cannot be selected through the standalone protocol-system selector in `{selector_context}`; use the family selector for the canonical shared-stream runtime"
+                    ));
+                }
+                selector.not_found_error(selector_context)
+            }
+            _ => selector.not_found_error(selector_context),
+        }
+    }
+
     pub fn dci_protocol_systems(&self) -> Vec<String> {
         self.targets
             .iter()
@@ -549,6 +748,15 @@ impl<'a> ResolvedRuntimeTargets<'a> {
     }
 }
 
+impl<'a> IntoIterator for ResolvedRuntimeTargets<'a> {
+    type Item = ResolvedRuntimeTarget<'a>;
+    type IntoIter = std::vec::IntoIter<ResolvedRuntimeTarget<'a>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_inner().into_iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -561,8 +769,12 @@ mod tests {
             BootstrapConfig, BootstrapStrategy, ExtractorConfig, ProtocolTypeConfig,
         },
         family_registry::default_family_runtime_registry,
+        family_runtime::resolve_runtime_targets as build_resolved_runtime_targets,
         family_runtime_metadata::{FamilyRuntimeConfig, ResolvedSharedFamilyStream},
-        family_runtime_planning::build_resolved_runtime_targets,
+        test_support::{
+            future_family_runtime_config_for_tests,
+            future_family_runtime_registry_with_explicit_progress_owner_for_tests,
+        },
     };
 
     use super::{
@@ -590,13 +802,10 @@ mod tests {
         family_name: &str,
         shared_spkg: &str,
     ) -> ExtractorConfig {
-        let shared_stream = family_shared_stream(chain, family_name, shared_spkg);
-        config.with_family_runtime(Some(FamilyRuntimeConfig {
-            family: family_name.to_string(),
-            shared_spkg: Some(shared_spkg.to_string()),
-            shared_module: Some(shared_stream.module),
-            durability_scope: Some(shared_stream.durability_scope),
-        }))
+        config.with_family_runtime(Some(FamilyRuntimeConfig::from_resolved_shared_stream(
+            family_name,
+            family_shared_stream(chain, family_name, shared_spkg),
+        )))
     }
 
     fn make_config(name: &str, spkg: &str) -> ExtractorConfig {
@@ -748,10 +957,10 @@ mod tests {
                 params: "bootstrap_block=100&pools=0x03".to_string(),
             }),
         );
-        let target = ResolvedRuntimeTarget::Standalone(ResolvedStandaloneRuntime {
-            protocol_system: "curve",
-            extractor_config: &curve,
-        });
+        let target = ResolvedRuntimeTarget::Standalone(
+            ResolvedStandaloneRuntime::from_extractor_config(&curve)
+                .expect("standalone runtime resolves from config"),
+        );
 
         let execution = target
             .substreams_execution_request()
@@ -765,6 +974,142 @@ mod tests {
         assert_eq!(
             execution.params,
             HashMap::from([("curve_events".to_string(), "factory=0x03".to_string())])
+        );
+    }
+
+    #[test]
+    fn resolved_standalone_runtime_precomputes_bootstrap_runtime_with_custom_registry() {
+        let registry = future_family_runtime_registry_with_explicit_progress_owner_for_tests(
+            &["future_v1"],
+            "future_v1",
+            "family::future_swap",
+        );
+        let config = ExtractorConfig::new(
+            "future_v1_alias".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            42,
+            Some(120),
+            vec![ProtocolTypeConfig::new("future_pool".to_string(), FinancialType::Swap)],
+            "protocols/substreams/future/test.spkg".to_string(),
+            "map_future".to_string(),
+            vec![],
+            0,
+            None,
+            None,
+            HashMap::new(),
+            Some(BootstrapConfig {
+                strategy: BootstrapStrategy::UniswapV2Rpc,
+                start_block: 42,
+                params: "bootstrap_block=42&pools=0x03".to_string(),
+            }),
+        )
+        .with_protocol_system("future_v1")
+        .with_family_runtime(Some(future_family_runtime_config_for_tests(
+            "protocols/substreams/future/test.spkg",
+            "family::future_swap",
+        )));
+
+        let runtime =
+            ResolvedStandaloneRuntime::from_family_member_extractor_config_with_registry_for_tests(
+            &config, registry,
+        )
+        .expect("standalone runtime should resolve from custom registry");
+        let bootstrap_runtime = runtime
+            .bootstrap_runtime()
+            .expect("standalone runtime should precompute bootstrap runtime");
+
+        assert_eq!(bootstrap_runtime.plan.family_name, "future_swap");
+        assert_eq!(bootstrap_runtime.plan.bootstrap_block, 42);
+        assert_eq!(bootstrap_runtime.execution.branch_materializers.len(), 1);
+        assert_eq!(
+            bootstrap_runtime
+                .execution
+                .branch_materializers
+                .keys()
+                .next()
+                .map(String::as_str),
+            Some("future_v1")
+        );
+    }
+
+    #[test]
+    fn resolved_standalone_runtime_rejects_family_managed_config() {
+        let registry = future_family_runtime_registry_with_explicit_progress_owner_for_tests(
+            &["future_v1"],
+            "future_v1",
+            "family::future_swap",
+        );
+        let config = ExtractorConfig::new(
+            "future_v1_alias".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            42,
+            Some(120),
+            vec![ProtocolTypeConfig::new("future_pool".to_string(), FinancialType::Swap)],
+            "protocols/substreams/future/test.spkg".to_string(),
+            "map_future".to_string(),
+            vec![],
+            0,
+            None,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .with_protocol_system("future_v1")
+        .with_family_runtime(Some(future_family_runtime_config_for_tests(
+            "protocols/substreams/future/test.spkg",
+            "family::future_swap",
+        )));
+
+        let err = ResolvedStandaloneRuntime::from_extractor_config_with_registry(&config, registry)
+            .expect_err("family-managed config should not resolve as standalone runtime");
+
+        assert!(
+            err.to_string().contains("cannot be resolved as a standalone runtime"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn standalone_runtime_rejects_registered_family_member_without_explicit_family_runtime() {
+        let registry =
+            future_family_runtime_registry_with_explicit_progress_owner_for_tests(
+            &["future_v1"],
+            "future_v1",
+            "family::future_swap",
+        );
+        let config = ExtractorConfig::new(
+            "future_v1_alias".to_string(),
+            Chain::Ethereum,
+            ImplementationType::Custom,
+            1000,
+            42,
+            Some(120),
+            vec![ProtocolTypeConfig::new("future_pool".to_string(), FinancialType::Swap)],
+            "protocols/substreams/future/test.spkg".to_string(),
+            "map_future".to_string(),
+            vec![],
+            0,
+            None,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .with_protocol_system("future_v1");
+
+        let err = ResolvedStandaloneRuntime::from_extractor_config_with_registry(&config, registry)
+            .expect_err("registered family member should not resolve as production standalone runtime");
+
+        assert!(
+            err.to_string().contains("belongs to registered family runtime"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("cannot be resolved as a standalone runtime"),
+            "unexpected error: {err}"
         );
     }
 
@@ -937,10 +1282,10 @@ mod tests {
                 params: "bootstrap_block=100&pools=0x03".to_string(),
             }),
         );
-        let target = ResolvedRuntimeTarget::Standalone(ResolvedStandaloneRuntime {
-            protocol_system: "curve",
-            extractor_config: &curve,
-        });
+        let target = ResolvedRuntimeTarget::Standalone(
+            ResolvedStandaloneRuntime::from_extractor_config(&curve)
+                .expect("standalone runtime resolves from config"),
+        );
 
         let prepared_request = target
             .prepared_substreams_request_with_stream_position(111, Some("cursor:curve".to_string()))
@@ -1034,16 +1379,14 @@ mod tests {
             ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let selected = targets
             .into_selected(ResolvedRuntimeTargetSelector::Family("uniswap"))
             .expect("family target selected");
 
         match selected {
             ResolvedRuntimeTarget::Family(family) => {
-                assert_eq!(family.family.family_name, "uniswap");
+                assert_eq!(family.family_name(), "uniswap");
                 assert_eq!(family.extractor_configs.len(), 2);
             }
             ResolvedRuntimeTarget::Standalone(_) => panic!("expected family target"),
@@ -1076,9 +1419,7 @@ mod tests {
             ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let selected = targets
             .into_selected(ResolvedRuntimeTargetSelector::StandaloneProtocolSystem("curve"))
             .expect("standalone target selected");
@@ -1118,9 +1459,7 @@ mod tests {
             ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let selected = targets
             .require_by_selector(
                 ResolvedRuntimeTargetSelector::Family("uniswap"),
@@ -1130,7 +1469,7 @@ mod tests {
 
         match selected {
             ResolvedRuntimeTarget::Family(family) => {
-                assert_eq!(family.family.family_name, "uniswap");
+                assert_eq!(family.family_name(), "uniswap");
                 assert_eq!(family.extractor_configs.len(), 2);
             }
             ResolvedRuntimeTarget::Standalone(_) => panic!("expected family target"),
@@ -1162,9 +1501,7 @@ mod tests {
             ),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let err = targets
             .require_by_selector(
                 ResolvedRuntimeTargetSelector::StandaloneProtocolSystem("curve"),
@@ -1176,6 +1513,49 @@ mod tests {
             err.to_string()
                 .contains("No standalone protocol system `curve` found in `test-runtime-targets`"),
             "missing selector should reuse the shared selector not-found error surface"
+        );
+    }
+
+    #[test]
+    fn require_resolved_runtime_target_by_selector_rejects_family_member_standalone_selector() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let err = targets
+            .require_by_selector(
+                ResolvedRuntimeTargetSelector::StandaloneProtocolSystem("uniswap_v2"),
+                "test-runtime-targets",
+            )
+            .expect_err("family member protocol selector should be rejected");
+
+        assert!(
+            err.to_string().contains("belongs to shared family runtime `uniswap`"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("use the family selector"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1204,9 +1584,7 @@ mod tests {
             ),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let family = targets
             .resolve_target(
                 Some(ResolvedRuntimeTargetSelector::Family("uniswap")),
@@ -1249,9 +1627,7 @@ mod tests {
             ),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let override_params = HashMap::from([("extra_flag".to_string(), "enabled".to_string())]);
 
         let request = targets
@@ -1279,9 +1655,7 @@ mod tests {
             make_config("curve", "protocols/substreams/curve/curve.spkg"),
         )]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let selected = targets
             .into_unique("test-runtime-targets should contain exactly one target")
             .expect("single target should be selected");
@@ -1291,6 +1665,49 @@ mod tests {
                 assert_eq!(standalone.protocol_system, "curve");
             }
             ResolvedRuntimeTarget::Family(_) => panic!("expected standalone target"),
+        }
+    }
+
+    #[test]
+    fn resolved_runtime_targets_wrapper_into_resolved_target_selects_family_target() {
+        let extractors = HashMap::from([
+            (
+                "uniswap_v2".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v2",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            (
+                "uniswap_v3".to_string(),
+                with_resolved_uniswap_family_runtime(
+                    make_config(
+                        "uniswap_v3",
+                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                    ),
+                    "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg",
+                ),
+            ),
+            ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
+        ]);
+
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
+        let selected = targets
+            .into_resolved_target(
+                Some(ResolvedRuntimeTargetSelector::Family("uniswap")),
+                "single target required",
+                "test-runtime-targets",
+            )
+            .expect("family target should be selected");
+
+        match selected {
+            ResolvedRuntimeTarget::Family(family) => {
+                assert_eq!(family.family_name(), "uniswap");
+            }
+            ResolvedRuntimeTarget::Standalone(_) => panic!("expected family target"),
         }
     }
 
@@ -1320,9 +1737,7 @@ mod tests {
             ("curve".to_string(), make_config("curve", "protocols/substreams/curve/curve.spkg")),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let err = targets
             .into_unique("test-runtime-targets should contain exactly one target")
             .expect_err("multiple targets should fail unique selection");
@@ -1592,9 +2007,7 @@ mod tests {
             ("balancer".to_string(), standalone_balancer),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let requests = targets.coalesced_initialized_accounts_requests();
 
         assert_eq!(
@@ -1707,9 +2120,7 @@ mod tests {
             ("balancer".to_string(), standalone_balancer),
         ]);
 
-        let targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
         let requests = targets.coalesced_initialized_accounts_requests();
 
         assert_eq!(
@@ -1736,8 +2147,10 @@ mod tests {
 
     #[test]
     fn runtime_target_protocol_projections_cover_family_and_standalone_members() {
-        let shared_stream =
-            uniswap_shared_stream("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg");
+        let family_runtime = FamilyRuntimeConfig::from_resolved_shared_stream(
+            "uniswap",
+            uniswap_shared_stream("protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"),
+        );
         let extractors = HashMap::from([
             (
                 "uniswap_v2_alias".to_string(),
@@ -1759,15 +2172,7 @@ mod tests {
                     None,
                 )
                 .with_protocol_system("uniswap_v2")
-                .with_family_runtime(Some(FamilyRuntimeConfig {
-                    family: "uniswap".to_string(),
-                    shared_spkg: Some(
-                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
-                            .to_string(),
-                    ),
-                    shared_module: Some(shared_stream.module.clone()),
-                    durability_scope: Some(shared_stream.durability_scope.clone()),
-                })),
+                .with_family_runtime(Some(family_runtime.clone())),
             ),
             (
                 "uniswap_v3_alias".to_string(),
@@ -1789,15 +2194,7 @@ mod tests {
                     None,
                 )
                 .with_protocol_system("uniswap_v3")
-                .with_family_runtime(Some(FamilyRuntimeConfig {
-                    family: "uniswap".to_string(),
-                    shared_spkg: Some(
-                        "protocols/substreams/ethereum-uniswap-v2-v3-combined/test.spkg"
-                            .to_string(),
-                    ),
-                    shared_module: Some(shared_stream.module.clone()),
-                    durability_scope: Some(shared_stream.durability_scope.clone()),
-                })),
+                .with_family_runtime(Some(family_runtime)),
             ),
             (
                 "curve_alias".to_string(),
@@ -1822,9 +2219,7 @@ mod tests {
             ),
         ]);
 
-        let runtime_targets = ResolvedRuntimeTargets::new(
-            build_resolved_runtime_targets(&extractors).expect("resolved targets"),
-        );
+        let runtime_targets = build_resolved_runtime_targets(&extractors).expect("resolved targets");
 
         assert_eq!(
             runtime_targets.protocol_systems(),
